@@ -28,9 +28,10 @@ use super::frame::{
 };
 use super::guard::AbortGuard;
 use super::submit::submit;
-use crate::message::{
-    EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams, ids::Rid,
-};
+use crate::message::egress::EgressItem;
+use crate::message::ids::Rid;
+use crate::message::request::{GenerateBody, GenerateRequest, RequestKind};
+use crate::message::sampling::SamplingParams;
 use crate::utils::{
     environ,
     response::{error_response, error_value},
@@ -419,7 +420,7 @@ fn generation_event_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::ChunkEvent;
+    use crate::message::egress::ChunkEvent;
     use crate::tokenizer_manager::Senders;
     use crate::utils::error::Error;
     use futures::StreamExt;
