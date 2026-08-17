@@ -421,7 +421,7 @@ fn generation_event_stream(
 mod tests {
     use super::*;
     use crate::message::egress::ChunkEvent;
-    use crate::tokenizer_manager::Senders;
+    use crate::tokenizer_manager::wiring::Senders;
     use crate::utils::error::Error;
     use futures::StreamExt;
     fn senders() -> Senders {
