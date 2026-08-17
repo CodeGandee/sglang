@@ -28,9 +28,9 @@ use super::frame::{
 };
 use super::guard::AbortGuard;
 use super::submit::submit;
-use crate::message::egress::EgressItem;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateBody, GenerateRequest, RequestKind};
+use crate::message::response::ResponseItem;
 use crate::message::sampling::SamplingParams;
 use crate::utils::{
     environ,
@@ -230,14 +230,14 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
 /// Fold a unary request to its terminal → (HTTP status, result/`error` JSON, saw-terminal);
 /// `false` = truncation, caller keeps the abort guard armed. Shared by single + batch.
 async fn drain_unary(
-    rx: &mut mpsc::Receiver<EgressItem>,
+    rx: &mut mpsc::Receiver<ResponseItem>,
     rid_str: &str,
 ) -> (StatusCode, serde_json::Value, bool) {
     let mut acc = OutputAccumulator::default();
     while let Some(item) = rx.recv().await {
         match item {
-            EgressItem::Frame(out) => acc.fold(&out),
-            EgressItem::Done(out) => {
+            ResponseItem::Frame(out) => acc.fold(&out),
+            ResponseItem::Done(out) => {
                 acc.fold(&out);
                 let final_out = acc.into_output();
                 // A validation abort carries its own HTTP status + diagnostic.
@@ -252,13 +252,13 @@ async fn drain_unary(
                 }
                 return (StatusCode::OK, frame_value(&final_out, rid_str), true);
             }
-            EgressItem::Error(e) => {
+            ResponseItem::Error(e) => {
                 let code = e.http_status();
                 let status =
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, error_value(code, &e.to_string()), true);
             }
-            EgressItem::Control(_) | EgressItem::Data(_) => continue, // never on `/generate`
+            ResponseItem::Control(_) | ResponseItem::Data(_) => continue, // never on `/generate`
         }
     }
     // Sender dropped without a terminal item: the shard dropped this request (a
@@ -322,8 +322,8 @@ async fn generate_batch(
 /// back for `FuturesUnordered` to re-poll. Empty result = channel closed.
 async fn recv_indexed(
     index: usize,
-    mut rx: mpsc::Receiver<EgressItem>,
-) -> (usize, mpsc::Receiver<EgressItem>, Vec<EgressItem>) {
+    mut rx: mpsc::Receiver<ResponseItem>,
+) -> (usize, mpsc::Receiver<ResponseItem>, Vec<ResponseItem>) {
     let mut items = Vec::new();
     match rx.recv().await {
         Some(item) => items.push(item),
@@ -339,7 +339,7 @@ async fn recv_indexed(
 /// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
 /// `guard` aborts unfinished on drop.
 fn generation_event_stream(
-    receivers: Vec<(Rid, mpsc::Receiver<EgressItem>)>,
+    receivers: Vec<(Rid, mpsc::Receiver<ResponseItem>)>,
     mut guard: AbortGuard,
     incremental: bool,
     with_index: bool,
@@ -378,7 +378,7 @@ fn generation_event_stream(
 
             for item in items {
                 match item {
-                    EgressItem::Frame(out) => {
+                    ResponseItem::Frame(out) => {
                         accs[i].fold(&out);
                         if incremental {
                             yield stream_frame_string(out, &accs[i], true, rid_strs[i].client_facing(), idx(i));
@@ -386,12 +386,12 @@ fn generation_event_stream(
                             coalesced = true;
                         }
                     }
-                    EgressItem::Done(out) => {
+                    ResponseItem::Done(out) => {
                         accs[i].fold(&out);
                         terminal = Some(out);
                     }
-                    EgressItem::Error(e) => failed = Some(e),
-                    EgressItem::Control(_) | EgressItem::Data(_) => {} // never on /generate
+                    ResponseItem::Error(e) => failed = Some(e),
+                    ResponseItem::Control(_) | ResponseItem::Data(_) => {} // never on /generate
                 }
             }
 
@@ -420,7 +420,7 @@ fn generation_event_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::egress::ChunkEvent;
+    use crate::message::response::ChunkEvent;
     use crate::tokenizer_manager::wiring::Senders;
     use crate::utils::error::Error;
     use futures::StreamExt;
@@ -433,16 +433,16 @@ mod tests {
         }
     }
 
-    fn frame(rid: u64, text: &str) -> EgressItem {
-        EgressItem::Frame(ChunkEvent {
+    fn frame(rid: u64, text: &str) -> ResponseItem {
+        ResponseItem::Frame(ChunkEvent {
             rid: Rid::from(rid.to_string()),
             text: text.into(),
             completion_tokens: 1,
             ..Default::default()
         })
     }
-    fn done(rid: u64, text: &str) -> EgressItem {
-        EgressItem::Done(ChunkEvent {
+    fn done(rid: u64, text: &str) -> ResponseItem {
+        ResponseItem::Done(ChunkEvent {
             rid: Rid::from(rid.to_string()),
             text: text.into(),
             completion_tokens: 1,
@@ -507,7 +507,7 @@ mod tests {
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
 
-        tx0.send(EgressItem::Error(Error::Validation("bad".into())))
+        tx0.send(ResponseItem::Error(Error::Validation("bad".into())))
             .await
             .unwrap();
         let v = parse(&stream.next().await.unwrap());
