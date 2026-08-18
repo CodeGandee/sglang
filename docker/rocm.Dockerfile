@@ -152,31 +152,54 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
         > /etc/apt/apt.conf.d/80-net-hardening
 
-# Fix hipDeviceGetName returning empty string in ROCm 7.0 docker images.
-# The ROCm 7.0 base image is missing libdrm-amdgpu-common which provides the
-# amdgpu.ids device-ID-to-marketing-name mapping file.
-# ROCm 7.2 base images already ship these packages, so this step is skipped.
-# See https://github.com/ROCm/ROCm/issues/5992
+# ROCm maps a PCI device ID to a marketing name through libdrm's amdgpu.ids
+# table, so hipDeviceGetName (torch.cuda.get_device_name) returns an empty string
+# on an image whose only amdgpu.ids is the distro's: neither Ubuntu 22.04's nor
+# 24.04's lists MI300X or MI355X. Every tuned config keyed on the device name
+# then silently misses. See https://github.com/ROCm/ROCm/issues/5992
+#
+# Whether the base image already carries AMD's libdrm depends on how it installed
+# ROCm, not on the ROCm version: the rocm/pytorch images built with
+# amdgpu-install (ROCm 7.2.0) have it, the ones that install the `rocm` apt
+# metapackage alone (ROCm 7.0, ROCm 7.2.4) do not. Key off the file.
+#
+# AMDGPU_GRAPHICS_VERSION overrides the graphics repo to install from; it is
+# derived from the image's ROCm version when left empty.
+ARG AMDGPU_GRAPHICS_VERSION=
 RUN set -eux; \
-    case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
-        ;; \
-      *) \
-        echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
-        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
-          | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
-        && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.0/ubuntu jammy main' \
-          > /etc/apt/sources.list.d/amdgpu-graphics.list \
-        && apt-get update \
-        && apt-get install -y --no-install-recommends \
-             libdrm-amdgpu-common \
-             libdrm-amdgpu-amdgpu1 \
-             libdrm2-amdgpu \
-        && rm -rf /var/lib/apt/lists/* \
-        && cp /opt/amdgpu/share/libdrm/amdgpu.ids /usr/share/libdrm/amdgpu.ids; \
-        ;; \
-    esac
+    if [ -f /opt/amdgpu/share/libdrm/amdgpu.ids ]; then \
+      echo "libdrm-amdgpu already present (GPU_ARCH=${GPU_ARCH}), skipping"; \
+    else \
+      codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"; \
+      version="${AMDGPU_GRAPHICS_VERSION}"; \
+      if [ -z "${version}" ]; then \
+        rocm_version="$(cut -d- -f1 /opt/rocm/.info/version 2>/dev/null || true)"; \
+        for candidate in "${rocm_version}" "$(echo "${rocm_version}" | cut -d. -f1,2)"; do \
+          [ -n "${candidate}" ] || continue; \
+          if curl -fsIo /dev/null "https://repo.radeon.com/graphics/${candidate}/ubuntu/dists/${codename}/Release"; then \
+            version="${candidate}"; \
+            break; \
+          fi; \
+        done; \
+      fi; \
+      if [ -z "${version}" ]; then \
+        echo "ERROR: no amdgpu graphics repo for ROCm '${rocm_version}' on ${codename}; pass --build-arg AMDGPU_GRAPHICS_VERSION=<x.y[.z]>" >&2; \
+        exit 1; \
+      fi; \
+      echo "installing libdrm-amdgpu from graphics/${version} (${codename})"; \
+      install -m 0755 -d /etc/apt/keyrings; \
+      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg; \
+      echo "deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/${version}/ubuntu ${codename} main" \
+        > /etc/apt/sources.list.d/amdgpu-graphics.list; \
+      apt-get update; \
+      apt-get install -y --no-install-recommends \
+        libdrm-amdgpu-common \
+        libdrm-amdgpu-amdgpu1 \
+        libdrm2-amdgpu; \
+      rm -rf /var/lib/apt/lists/*; \
+      cp /opt/amdgpu/share/libdrm/amdgpu.ids /usr/share/libdrm/amdgpu.ids; \
+    fi
 
 
 # Install some basic utilities
