@@ -88,7 +88,7 @@ const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
 /// ack are irrelevant here: this single-process server owns the egress ring.
 async fn health_generate(State(state): State<AppState>, timeout: std::time::Duration) -> Response {
     let baseline = state
-        .egress_activity
+        .response_activity
         .load(std::sync::atomic::Ordering::Relaxed);
 
     // Fire the probe (the heartbeat is the signal, not its own response). A busy
@@ -127,7 +127,7 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if state
-            .egress_activity
+            .response_activity
             .load(std::sync::atomic::Ordering::Relaxed)
             != baseline
         {
@@ -426,10 +426,10 @@ mod tests {
     use futures::StreamExt;
     fn senders() -> Senders {
         Senders {
-            tm: flume::unbounded().0,
-            abort: flume::unbounded().0,
-            tok: flume::unbounded().0,
-            detok: vec![],
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![],
         }
     }
 
