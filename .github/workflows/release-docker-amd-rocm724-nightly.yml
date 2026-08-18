@@ -12,6 +12,15 @@ on:
         required: false
         type: string
         default: ''
+      probe_arch:
+        description: 'Which flavor to qualify. Pick one when probe_image names a single-flavor image, so an mi30x image is not probed on MI355X.'
+        required: false
+        type: choice
+        default: both
+        options:
+          - both
+          - gfx942-rocm724
+          - gfx950-rocm724
   schedule:
     - cron: '0 14 * * *'
 
@@ -132,12 +141,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - gpu_arch: gfx942-rocm724
-            runner: linux-mi300-1gpu-sglang
-          - gpu_arch: gfx950-rocm724
-            runner: linux-mi35x-gpu-1
-    runs-on: ${{ matrix.runner }}
+        # Both flavors unless a dispatch picked one; inputs are empty on schedule.
+        gpu_arch: >-
+          ${{ inputs.probe_arch == 'gfx942-rocm724' && fromJson('["gfx942-rocm724"]')
+              || inputs.probe_arch == 'gfx950-rocm724' && fromJson('["gfx950-rocm724"]')
+              || fromJson('["gfx942-rocm724","gfx950-rocm724"]') }}
+    runs-on: ${{ matrix.gpu_arch == 'gfx942-rocm724' && 'linux-mi300-1gpu-sglang' || 'linux-mi35x-gpu-1' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -186,7 +195,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### ${{ matrix.gpu_arch }} on ${{ matrix.runner }}"
+            echo "### ${{ matrix.gpu_arch }} on ${{ runner.name }}"
             echo "- **Image:** \`${IMAGE}\`"
             echo ""
             echo '```'
@@ -194,10 +203,12 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Only images whose profiler works reach the daily repo users pull from.
+  # Only images whose profiler works reach the daily repo users pull from, so a
+  # dispatch that probed a single flavor promotes neither.
   promote:
     if: |
       github.repository == 'sgl-project/sglang' && inputs.probe_image == '' &&
+      (inputs.probe_arch == '' || inputs.probe_arch == 'both') &&
       needs.publish.result == 'success' && needs.probe.result == 'success'
     needs: [publish, probe]
     runs-on: amd-docker-scale
