@@ -103,7 +103,7 @@ pub struct ServerArgs {
     pub tokenizer_worker_num: usize,
     pub detokenizer_worker_num: usize,
     /// Token-ids-in / token-ids-out mode: no tokenizer load, raw `output_ids`
-    /// frames (drives the `Skip` detok backend and the ingress branch).
+    /// frames.
     pub skip_tokenizer_init: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
@@ -270,11 +270,11 @@ pub struct ModelConfig {
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
-    /// Bounds client-supplied token ids — ingress 400s out-of-vocab ids before
+    /// Bounds client-supplied token ids — return 400s out-of-vocab ids before
     /// they crash the scheduler's embedding lookup.
     pub vocab_size: u64,
     /// Whether the model accepts multimodal inputs. Gates the MM Encoding branch
-    /// in tm-ingress; `false` silently ignores mm fields, as the Python
+    /// in to-scheduler; `false` silently ignores mm fields, as the Python
     /// `TokenizerManager` does with `mm_processor is None`.
     pub is_multimodal: bool,
     /// Resolved default sampling parameters, from Python's

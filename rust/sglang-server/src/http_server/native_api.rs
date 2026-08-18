@@ -8,6 +8,7 @@
 //! parent `api_server` module.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -38,7 +39,7 @@ use crate::utils::{
 };
 
 /// The routes this module owns, mounted by `api_server::serve`.
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/generate", post(generate))
         .merge(health_routes())
@@ -57,10 +58,10 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 /// always; `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true, mirroring
 /// Python) decides whether `/health` shares it or is a plain 200 (routing the
 /// request already proves the frontend is up).
-fn health_routes() -> Router<AppState> {
+fn health_routes() -> Router<Arc<AppState>> {
     let timeout =
         std::time::Duration::from_secs(environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20));
-    let probe = get(move |state: State<AppState>| health_generate(state, timeout));
+    let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout));
     let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
         probe.clone()
     } else {
@@ -86,7 +87,10 @@ const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
 /// server passes immediately and a backlog never false-503s (the analogue of
 /// Python's `last_receive_tstamp`). The `HEALTH_CHECK` skip + `http_worker_ipc`
 /// ack are irrelevant here: this single-process server owns the egress ring.
-async fn health_generate(State(state): State<AppState>, timeout: std::time::Duration) -> Response {
+async fn health_generate(
+    State(state): State<Arc<AppState>>,
+    timeout: std::time::Duration,
+) -> Response {
     let baseline = state
         .response_activity
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -149,7 +153,7 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
 /// with **400** (Python's status for a bad request) carrying serde's field-level
 /// message, instead of axum's default 422.
 async fn generate(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     body: Result<Json<GenerateBody>, JsonRejection>,
 ) -> Response {
     let body = match body {
