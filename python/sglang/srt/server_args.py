@@ -4206,6 +4206,7 @@ class ServerArgs:
             enable_flashinfer_allreduce_fusion=False,
         )
         # Deprecated attention-backend alias: "compressed" -> "dsv4".
+        renamed = {}
         for attr in (
             "attention_backend",
             "decode_attention_backend",
@@ -4217,7 +4218,9 @@ class ServerArgs:
                     "--%s=compressed is deprecated; use 'dsv4' instead.",
                     attr.replace("_", "-"),
                 )
-                setattr(self, attr, "dsv4")
+                renamed[attr] = "dsv4"
+        if renamed:
+            self._declare("_handle_deprecated_args", **renamed)
 
         # --grpc-mode is a deprecated alias for --smg-grpc-mode.
         if self.grpc_mode and not self.smg_grpc_mode:
