@@ -559,68 +559,24 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 
 # -----------------------
 # Hot patch: torch-ROCm
-# The artifact hardcoded the supported triton version to be 3.5.1.
-# Rewrite the restriction directly.
-ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN mkdir /tmp/whl && cd /tmp/whl \
-     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
-     && cat > hack.py <<"PY"
-import zipfile, csv, os, re
-from pathlib import Path
-
-fname = os.environ["TORCH_ROCM_FILE"]
-in_whl  = Path("/")   / fname
-out_whl = Path("/tmp")/ fname
-work = Path("/tmp/whl")
-
-# 1) Extract
-with zipfile.ZipFile(in_whl, "r") as z:
-    z.extractall(work)
-
-# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
-dist_info = next(work.glob("*.dist-info"))
-meta = dist_info / "METADATA"
-txt = meta.read_text(encoding="utf-8")
-
-# Example: replace one exact requirement form.
-# Adjust the string to match what you actually see.
-pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
-txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
-if txt2 == txt:
-    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
-meta.write_text(txt2, encoding="utf-8")
-
-# 3) Hacky step: blank hash/size columns in RECORD
-record = dist_info / "RECORD"
-rows = []
-with record.open(newline="", encoding="utf-8") as f:
-    for r in csv.reader(f):
-        if not r:
-            continue
-        # keep filename, blank out hash and size
-        rows.append([r[0], "", ""])
-with record.open("w", newline="", encoding="utf-8") as f:
-    csv.writer(f).writerows(rows)
-
-# 4) Re-zip as a wheel
-with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for p in work.rglob("*"):
-        if p.is_file():
-            z.write(p, p.relative_to(work).as_posix())
-
-print("Wrote", out_whl)
-PY
-
-RUN cd /tmp/whl \
-    && case "${GPU_ARCH}" in \
-      *rocm720*) \
+# The ROCm torch wheels pin the exact Triton they were built against, which the
+# AITER Triton install at the end of this file replaces. Drop that pin so the
+# shipped image does not record a requirement no longer installed, which a later
+# `pip install` would either fail to resolve (the pinned distribution lives only
+# on repo.radeon.com) or "repair" with the CUDA torch from PyPI.
+#
+# This edits the installed dist-info. The predecessor repacked and reinstalled
+# the wheel the base image left in /, which only exists on bases whose torch came
+# from AMD's .sh installer; every rocm7.2.4 base pip-installs torch from the
+# wheel index and leaves nothing behind.
+RUN set -eux; \
+    case "${GPU_ARCH}" in \
+      *rocm72*) \
         echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
-        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
+        python3 /sgl-workspace/sglang/scripts/ci/amd/relax_torch_triton_pin.py; \
         ;; \
       *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
+        echo "Not a ROCm 7.2 flavor (GPU_ARCH=${GPU_ARCH}), skip patch"; \
         ;; \
     esac
 
