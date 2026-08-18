@@ -3567,6 +3567,23 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
+        self.resolve_once()
+
+    def resolve_once(self) -> None:
+        """Resolve this record, unless it already has been.
+
+        Resolution is a deterministic function of the raw inputs -- two records
+        built from the same arguments declare the same things -- but the
+        handlers are not written to survive a second pass over their own
+        output. So a record that has been through the pipeline must not go
+        through it again, and this is where that is decided.
+
+        The publishing entry of every process calls this. In a child the record
+        arrived by pickle and brought its declarations along, so the child has
+        nothing left to derive and projects what the parent decided.
+        """
+        if getattr(self, "_declarations_materialized", False):
+            return
         self._run_resolution_pipeline()
 
     def _declare(self, source: str, **fields: Any) -> None:

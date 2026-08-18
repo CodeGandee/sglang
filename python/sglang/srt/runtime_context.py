@@ -1323,6 +1323,13 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
             "its namespace set (None for the full tree)."
         )
+    # Resolve before projecting: the bags are the resolution result, so the
+    # pipeline has to have run. A record that already carries its declarations
+    # -- one this process resolved, or one a parent resolved before pickling it
+    # here -- is left alone.
+    resolve_once = getattr(server_args, "resolve_once", None)
+    if resolve_once is not None:
+        resolve_once()
     _CONTEXT.set_server_args(server_args)
     _CONTEXT._publish_role = role
     if _ROLE_NS_MODE == "record":
