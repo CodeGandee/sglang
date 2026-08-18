@@ -18,14 +18,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=3600,
-    suite="nightly-8-gpu-mi35x-qwen3-235b-mxfp4",
-    nightly=True,
-    disabled="MXFP4 on Qwen3MoeForCausalLM is gated per-commit by "
-    "test/registered/quant/test_quark_mxfp4.py (Qwen3-30B-A3B-Instruct-2507, "
-    "gsm8k >= 0.89 on linux-mi35x-gpu-1), and serialized Quark MXFP4 "
-    "checkpoint loading by the Qwen3.8, DeepSeek-R1, GLM-5 and Kimi-K3 "
-    "nightlies. Re-add the job to the AMD nightlies to bring this back.",
+    est_time=3600, suite="nightly-8-gpu-mi35x-qwen3-235b-mxfp4", nightly=True
 )
 
 QWEN3_MODEL_PATH = "amd/Qwen3-235B-A22B-Instruct-2507-mxfp4"

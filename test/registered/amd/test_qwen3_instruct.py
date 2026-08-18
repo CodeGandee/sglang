@@ -17,15 +17,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(
-    est_time=3600,
-    suite="nightly-8-gpu-qwen3-235b",
-    nightly=True,
-    disabled="Qwen3MoeForCausalLM is gated per-commit by "
-    "test/registered/quant/test_quark_mxfp4.py (Qwen3-30B-A3B-Instruct-2507) and "
-    "runs nightly at 30B-A3B scale; the 235B MI30x job was retired to free "
-    "8-GPU mi300 time. Re-add the job to the AMD nightlies to bring this back.",
-)
+register_amd_ci(est_time=3600, suite="nightly-8-gpu-qwen3-235b", nightly=True)
 
 QWEN3_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 SERVER_LAUNCH_TIMEOUT = 3600
