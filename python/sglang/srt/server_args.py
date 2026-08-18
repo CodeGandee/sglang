@@ -3603,6 +3603,14 @@ class ServerArgs:
            belong in the helper or signal that the helper should be split.
         """
 
+        # What the caller asked for, before any handler runs. Every resolution
+        # write is declared, so this plus the stash is the resolution result --
+        # which is what the config projection reads, rather than the fields it
+        # happens to find afterwards.
+        self._raw_input = {
+            field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+        }
+
         # Declaration stash for the override/post-process passes. Set before any
         # short-circuit (none/dummy model paths) so run_post_process_pass and
         # direct handler invocations can rely on it even when

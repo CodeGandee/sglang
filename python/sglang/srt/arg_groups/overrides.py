@@ -305,6 +305,27 @@ def materialize_declarations(server_args: Any) -> None:
     server_args._declarations_materialized = True
 
 
+def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
+    """What resolution decided for ``field``: the declaration if there is one,
+    otherwise what the caller supplied.
+
+    This is what the config projection reads. Reading the field instead would
+    work only for as long as declarations materialize onto the record -- and
+    the point of declaring is that they will not, so the projection must not
+    depend on it. A config that never ran the pipeline (a mock, a partial
+    fixture) carries no raw snapshot; its fields are all it has.
+    """
+    for _source, declared in reversed(
+        getattr(server_args, "_resolved_overrides", None) or ()
+    ):
+        if field in declared:
+            return declared[field]
+    raw = getattr(server_args, "_raw_input", None)
+    if raw is not None and field in raw:
+        return raw[field]
+    return getattr(server_args, field, default)
+
+
 def resolved_view(server_args: Any) -> ResolvedView:
     """Read-only view of the resolving configuration for mid-resolution code
     that is not a pass (``__post_init__`` handlers and hooks). Internal to

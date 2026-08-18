@@ -2105,6 +2105,23 @@ def server_args_variant(server_args, **fields):
     }
     if unknown:
         raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    # The fixture values have to reach the declaration stash as well as the
+    # fields: the config bags are projected from `raw input + declarations`, so
+    # a value only written onto the copy would leave the bags describing the
+    # config this variant was derived *from*. Written through `object` rather
+    # than declared outright because the copy keeps its read-only guard, and a
+    # variant is a fixture rather than a resolution.
+    stash = getattr(variant, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(variant, "_resolved_overrides", stash)
+    declared = {
+        name: value
+        for name, value in fields.items()
+        if name in cls.__dataclass_fields__
+    }
+    if declared:
+        stash.append(("server_args_variant", dict(declared)))
     for name, value in fields.items():
         object.__setattr__(variant, name, value)
     return variant

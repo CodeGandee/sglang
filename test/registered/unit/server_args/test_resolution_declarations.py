@@ -272,6 +272,37 @@ class TestResolutionDeclarations(CustomTestCase):
             + "\n  ".join(unexplained),
         )
 
+    def test_the_projection_input_is_the_resolved_configuration(self):
+        """What the bags are built from equals what the record ends up holding.
+
+        The projection reads `raw input + declarations` rather than the
+        fields, so that it keeps working when the declarations stop
+        materializing. While they still do, the two have to agree leaf for
+        leaf -- a difference means the projection would publish something the
+        record does not say, which is the failure this whole transition is
+        meant to avoid.
+        """
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+        from sglang.srt.arg_groups.overrides import resolution_result
+
+        differences = []
+        for shape in _SHAPES:
+            server_args = self._resolve(shape)
+            for field in namespace_of(type(server_args)):
+                projected = resolution_result(server_args, field)
+                on_record = getattr(server_args, field)
+                if projected != on_record:
+                    differences.append(
+                        f"{shape} -> {field}: projection={projected!r} "
+                        f"record={on_record!r}"
+                    )
+        self.assertEqual(
+            differences,
+            [],
+            "the projection and the record disagree about a config leaf:\n  "
+            + "\n  ".join(differences),
+        )
+
     def test_the_stash_agrees_with_the_fields_it_declared(self):
         mismatches = []
         for shape in _SHAPES:
