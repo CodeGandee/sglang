@@ -450,7 +450,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._swa_layers_num > 0
         ), "Hybrid SWA model must have at least one SWA layer"
 
-        self._swa_full_tokens_ratio = kvc.server_args.swa_full_tokens_ratio
+        self._swa_full_tokens_ratio = get_schedule().swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
         self._page_size = kvc.page_size
 
@@ -738,7 +738,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
-        self.swa_ratio = kvc.server_args.swa_full_tokens_ratio
+        self.swa_ratio = get_schedule().swa_full_tokens_ratio
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
             kvc.server_args.max_speculative_num_draft_tokens or 0

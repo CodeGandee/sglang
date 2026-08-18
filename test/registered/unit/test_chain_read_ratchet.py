@@ -36,8 +36,8 @@ _OWNERS = ("server_args.py", "runtime_context.py", "arg_groups/")
 _DECLARERS = ("_declare", "declare_resolution", "declare_late_resolution")
 
 
-def _resolution_written():
-    """Fields some resolver declares, collected from the declaration sites."""
+def _declared_by_keyword():
+    """Fields named as a keyword at a declaration site."""
     written = set()
     for path in sorted(_SRT.rglob("*.py")):
         try:
@@ -56,6 +56,65 @@ def _resolution_written():
             if name in _DECLARERS:
                 written |= {kw.arg for kw in node.keywords if kw.arg}
     return written
+
+
+def _declared_by_registry():
+    """Fields the model-override registry writes.
+
+    `MODEL_OVERRIDES` maps arch -> {field: value} and the provider functions
+    build the same shape, so these field names are *data*, not keywords -- a
+    keyword scan misses every one of them (`dtype`, the hybrid-SWA switch, the
+    multi-layer EAGLE flag). They are resolution writes all the same, and a
+    borrowed-record read of one answers with the CLI default just as loudly.
+    """
+    tree = ast.parse((_SRT / "arg_groups/overrides.py").read_text(encoding="utf-8-sig"))
+    fields = set()
+    for node in tree.body:
+        target = None
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            target = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target = node.target.id
+        if target != "MODEL_OVERRIDES" or node.value is None:
+            continue
+        for inner in ast.walk(node.value):
+            if not isinstance(inner, ast.Dict):
+                continue
+            for key, value in zip(inner.keys, inner.values):
+                if isinstance(value, ast.Dict):
+                    continue  # the arch -> {…} outer layer
+                if not isinstance(key, ast.Constant):
+                    raise AssertionError("non-literal override key")
+                fields.add(key.value)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if not any(
+            isinstance(dec, ast.Call)
+            and isinstance(dec.func, ast.Name)
+            and dec.func.id.startswith("register_model_override")
+            for dec in node.decorator_list
+        ):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Assign) and isinstance(
+                inner.targets[0], ast.Subscript
+            ):
+                key = inner.targets[0].slice
+                if not isinstance(key, ast.Constant):
+                    raise AssertionError(f"non-literal override key in {node.name}")
+                fields.add(key.value)
+            if isinstance(inner, ast.Dict):
+                for key in inner.keys:
+                    if not isinstance(key, ast.Constant):
+                        raise AssertionError(f"non-literal override key in {node.name}")
+                    fields.add(key.value)
+    return fields
+
+
+def _resolution_written():
+    """Every field resolution can write, by either mechanism."""
+    return _declared_by_keyword() | _declared_by_registry()
 
 
 def _chain_reads(written):
@@ -92,12 +151,33 @@ def _chain_reads(written):
 
 class TestNoChainReadsOfResolvedConfig(CustomTestCase):
     def test_the_census_has_something_to_count(self):
-        """A written set that collapsed would make the pin vacuous."""
-        written = _resolution_written()
+        """A written set that collapsed would make the pin vacuous.
+
+        Both mechanisms are checked separately: the registry's field names are
+        data rather than keywords, so a keyword-only scan would look healthy
+        while missing every override the registry applies.
+        """
+        by_keyword = _declared_by_keyword()
+        by_registry = _declared_by_registry()
         self.assertGreater(
-            len(written),
+            len(by_keyword),
             100,
-            f"only {len(written)} fields look resolution-written; the scan broke",
+            f"only {len(by_keyword)} fields are declared by keyword; the scan broke",
+        )
+        # The registry's surface is small enough to name, and it should say
+        # something when it grows: a new override needs its borrowed-record
+        # readers checked, which is the whole point of scanning it here.
+        self.assertEqual(
+            sorted(by_registry),
+            [
+                "attention_backend",
+                "disable_hybrid_swa_memory",
+                "dtype",
+                "enable_multi_layer_eagle",
+                "swa_full_tokens_ratio",
+            ],
+            "the model-override registry's written fields changed; check the "
+            "borrowed-record readers of any new one",
         )
 
     def test_nothing_reads_a_resolved_field_off_a_borrowed_record(self):
