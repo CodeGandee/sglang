@@ -2265,13 +2265,13 @@ class ServingChatTestCase(unittest.TestCase):
             "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
         )
 
-    def test_non_streaming_cached_tokens_details_emits_sglext(self):
-        """Test that non-streaming chat responses emit cached token details in sglext."""
-
+    def test_non_streaming_extension_fields_emit_sglext_without_meta_info(self):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             max_tokens=100,
+            return_meta_info=False,
+            return_routed_experts=True,
             return_cached_tokens_details=True,
         )
         ret = [
@@ -2288,6 +2288,7 @@ class ServingChatTestCase(unittest.TestCase):
                         "storage": 1,
                         "storage_backend": "file",
                     },
+                    "routed_experts": "cm91dGUtYQ==",
                     "finish_reason": {"type": "stop", "matched": None},
                     "weight_version": "default",
                 },
@@ -2297,6 +2298,7 @@ class ServingChatTestCase(unittest.TestCase):
         response = self.chat._build_chat_response(req, ret, 1234567890)
 
         self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.routed_experts, "cm91dGUtYQ==")
         self.assertEqual(
             response.sglext.cached_tokens_details.model_dump(exclude_none=True),
             {
@@ -2306,6 +2308,57 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+        self.assertIsNone(response.choices[0].meta_info)
+        dumped_response = response.model_dump()
+        self.assertIn("sglext", dumped_response)
+        self.assertNotIn("meta_info", dumped_response["choices"][0])
+
+    def test_non_streaming_meta_info_omits_sglext_and_preserves_each_choice(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            return_meta_info=True,
+            return_routed_experts=True,
+            return_cached_tokens_details=True,
+        )
+        ret = [
+            {
+                "text": f"Response {index}",
+                "meta_info": {
+                    "id": "chatcmpl-meta-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": index,
+                    "cached_tokens_details": {
+                        "device": 4 - index,
+                        "host": index,
+                    },
+                    "routed_experts": routed_experts,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+            for index, routed_experts in enumerate(["cm91dGUtYQ==", "cm91dGUtYg=="])
+        ]
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        self.assertIsNone(response.sglext)
+        self.assertEqual(
+            [choice.meta_info for choice in response.choices],
+            [ret_item["meta_info"] for ret_item in ret],
+        )
+        dumped_response = response.model_dump()
+        self.assertNotIn("sglext", dumped_response)
+        self.assertEqual(
+            [choice["meta_info"] for choice in dumped_response["choices"]],
+            [ret_item["meta_info"] for ret_item in ret],
+        )
+        serialized_response = json.dumps(dumped_response)
+        self.assertEqual(serialized_response.count('"routed_experts"'), 2)
+        self.assertEqual(serialized_response.count('"cached_tokens_details"'), 2)
 
     def test_non_streaming_chat_response_returns_requested_token_ids_and_meta_info(
         self,

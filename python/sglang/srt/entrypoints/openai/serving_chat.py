@@ -1776,18 +1776,19 @@ class OpenAIServingChat(OpenAIServingBase):
 
         choices = []
 
-        # Build sglext at response level (from first ret_item, as these are per-request)
-        first_ret = ret[0]
-        routed_experts = process_routed_experts_from_ret(first_ret, request)
-        cached_tokens_details = process_cached_tokens_details_from_ret(
-            first_ret, request
-        )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
-            response_sglext = SglExt(
-                routed_experts=routed_experts,
-                cached_tokens_details=cached_tokens_details,
+        if not request.return_meta_info:
+            # Preserve the legacy response-level fields from the first choice.
+            first_ret = ret[0]
+            routed_experts = process_routed_experts_from_ret(first_ret, request)
+            cached_tokens_details = process_cached_tokens_details_from_ret(
+                first_ret, request
             )
+            if routed_experts or cached_tokens_details:
+                response_sglext = SglExt(
+                    routed_experts=routed_experts,
+                    cached_tokens_details=cached_tokens_details,
+                )
 
         for idx, ret_item in enumerate(ret):
             # Process logprobs
