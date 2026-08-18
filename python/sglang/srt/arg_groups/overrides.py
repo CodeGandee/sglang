@@ -35,7 +35,7 @@ import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from sglang.srt.arg_groups.arg_utils import resolvable_fields
+from sglang.srt.arg_groups.arg_utils import field_names, resolvable_fields
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
@@ -217,6 +217,45 @@ def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
             setattr(server_args, field, value)
     finally:
         object.__setattr__(server_args, "_internal_write", False)
+
+
+def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
+    """Record a resolution write in the declaration stash, and apply it now.
+
+    The stash is what the projection reads, so a resolver that only assigns
+    the field leaves that write invisible to it. The immediate write keeps the
+    resolver's successors seeing the value where they read the field directly,
+    so routing a write through here changes nothing about ordering. When the
+    projection replaces field materialization, the immediate write is what
+    goes away -- the stash entry stays.
+
+    For resolvers inside ``__post_init__``: the handlers on ``ServerArgs``
+    (through ``self._declare``) and the ``arg_groups`` hooks and hardware
+    defaults they call. Resolution that has to wait for the launcher stage
+    goes through ``declare_late_resolution`` instead.
+
+    Names arrive as keyword arguments, which accept anything; a misspelled one
+    would otherwise become a new attribute that nothing ever reads, so it is
+    rejected here. This is not the model-override whitelist: that one limits
+    which fields a *registry entry* may reach, while a resolver writing the
+    field it owns is the pipeline resolving by construction.
+    """
+    # Non-dataclass fixtures declare no fields (mirrors the validate_declarations
+    # escape); only a real ServerArgs is checked.
+    if dataclasses.is_dataclass(type(server_args)):
+        unknown = sorted(set(fields) - field_names(type(server_args)))
+        if unknown:
+            raise AttributeError(f"{source}: {unknown} are not ServerArgs fields")
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    stash.append((source, dict(fields)))
+    for name, value in fields.items():
+        # A plain assignment, so the read-only guard applies: this is a
+        # resolution-time mechanism, and a caller reaching for it after
+        # materialization wants declare_late_resolution instead.
+        setattr(server_args, name, value)
 
 
 def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
