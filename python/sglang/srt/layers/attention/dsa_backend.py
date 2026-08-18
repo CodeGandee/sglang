@@ -15,7 +15,11 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_spec,
+)
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
@@ -309,7 +313,7 @@ class DeepseekSparseAttnBackend(
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
@@ -389,7 +393,7 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Speculative decoding
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
