@@ -439,6 +439,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 resolved = ServerArgs(
                     model_path=model_path, device="cuda", random_seed=42, **extra
                 )
+                # Construction is inert; resolution is its own act.
+                resolved.resolve_once()
             except Exception as exc:
                 self.fail(
                     f"the matrix entry {extra} (env={env}) did not resolve in "

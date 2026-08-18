@@ -242,7 +242,10 @@ class TestResolutionIsReproducible(CustomTestCase):
         # get_device() raises.
         kwargs.setdefault("device", "cuda")
         kwargs.setdefault("random_seed", 42)
-        return ServerArgs(model_path=model_path, **kwargs)
+        server_args = ServerArgs(model_path=model_path, **kwargs)
+        # Construction is inert; resolution is its own act.
+        server_args.resolve_once()
+        return server_args
 
     def _comparable(self, server_args: ServerArgs) -> dict:
         """The dataclass fields, and only those.
@@ -479,8 +482,13 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
             f"ServerArgs.resolve_once; found: {callers}",
         )
 
-    def test_the_gate_is_reached_from_construction_and_from_publish(self):
-        """Both entries go through the gate, so neither can resolve twice."""
+    def test_the_gate_is_reached_from_the_launcher_and_from_publish(self):
+        """Both entries go through the gate, so neither can resolve twice.
+
+        The launcher resolves the engine's record before reading any resolved
+        value from it; every publishing process asks the gate on the way in and
+        finds nothing left to do when the record arrived resolved.
+        """
         import ast
         from pathlib import Path
 
@@ -508,7 +516,7 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
                 if called:
                     callers.append(path.relative_to(package_root).as_posix())
         self.assertEqual(
-            ["srt/runtime_context.py", "srt/server_args.py"],
+            ["srt/entrypoints/engine.py", "srt/runtime_context.py"],
             sorted(set(callers)),
             f"the resolution gate grew or lost a caller: {sorted(set(callers))}",
         )

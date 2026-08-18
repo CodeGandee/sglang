@@ -1081,6 +1081,15 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Configure global environment
         configure_logger(server_args)
+        # Resolve the record for this engine. Construction no longer does it,
+        # and everything below -- the environment setup, the validation, the
+        # port arithmetic -- reads resolved configuration. It sits here rather
+        # than in `publish` because the auto-parser detection below is
+        # resolution too and has to run before anything publishes; once that
+        # has a home of its own, `publish` becomes the only resolution point
+        # and this call goes away.
+        server_args.resolve_once()
+
         _set_envs_and_config(server_args)
 
         # Defensive: ensure plugins loaded (may already be loaded by

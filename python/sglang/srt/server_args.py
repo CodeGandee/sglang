@@ -3567,7 +3567,15 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
-        self.resolve_once()
+        """Construction leaves the record at what the caller asked for.
+
+        Resolution is a separate act now, entered through ``resolve_once``: the
+        launcher runs it once per engine, and every publishing process asks the
+        gate on the way in. Which means a record that is only constructed --
+        a fixture, a config being inspected, one being handed to a subprocess
+        that will resolve it itself -- stays raw, and the resolved values live
+        where the resolution put them.
+        """
 
     def resolve_once(self) -> None:
         """Resolve this record, unless it already has been.

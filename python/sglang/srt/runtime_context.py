@@ -1035,6 +1035,10 @@ class _ServerArgsOverride:
         )
 
         server_args = ServerArgs(model_path="dummy")
+        # A dummy config still resolves what it can (construction is inert now),
+        # so the bags a test reads carry the same defaults a real publish would
+        # give it; the overrides then layer on top.
+        server_args.resolve_once()
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
         unknown = {name for name in self._fields if not name.startswith("_")} - set(

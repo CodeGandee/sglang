@@ -44,18 +44,23 @@ _mock_device.start()
 
 class TestPrepareServerArgs(CustomTestCase):
     def test_return_hidden_states_mode_configuration(self):
-        disabled = ServerArgs(model_path="dummy")
+        def _resolved(**kwargs):
+            server_args = ServerArgs(**kwargs)
+            server_args.resolve_once()
+            return server_args
+
+        disabled = _resolved(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)
         self.assertIsNone(disabled.return_hidden_states_mode)
 
-        last = ServerArgs(
+        last = _resolved(
             model_path="dummy",
             return_hidden_states_mode="last",
         )
         self.assertTrue(last.enable_return_hidden_states)
         self.assertEqual(last.return_hidden_states_mode, "last")
 
-        legacy_full = ServerArgs(
+        legacy_full = _resolved(
             model_path="dummy",
             enable_return_hidden_states=True,
         )
@@ -70,14 +75,18 @@ class TestPrepareServerArgs(CustomTestCase):
                 "last",
             ]
         )
+        parsed_last.resolve_once()
         self.assertTrue(parsed_last.enable_return_hidden_states)
         self.assertEqual(parsed_last.return_hidden_states_mode, "last")
 
+        # The rejection is resolution's, not the constructor's: an invalid value
+        # is still an invalid value, it is just refused where the mode is
+        # interpreted.
         with self.assertRaisesRegex(
             ValueError,
             "return_hidden_states_mode must be one of",
         ):
-            ServerArgs(
+            _resolved(
                 model_path="dummy",
                 return_hidden_states_mode="lst",
             )
