@@ -51,7 +51,11 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+    get_parallel,
+)
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -843,7 +847,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
-            if model_runner.server_args.enable_lora:
+            if get_lora().enable_lora:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
 
@@ -918,7 +922,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret._compute_mrope_positions(model_runner, batch)
 
         # Init lora information
-        if model_runner.server_args.enable_lora:
+        if get_lora().enable_lora:
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not model_runner.server_args.enable_lora_overlap_loading:
@@ -1319,7 +1323,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # graph; larger prefills fall back to eager and keep the
         # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
         # (all-gathered), so the decision is consistent cluster-wide.
-        prefill_cg = model_runner.server_args.cuda_graph_config.prefill
+        prefill_cg = get_exec().graph.cuda_graph_config.prefill
         if (
             self.can_run_dp_breakable_cuda_graph
             and self.is_extend_in_batch
