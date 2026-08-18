@@ -1,0 +1,243 @@
+name: Release Docker Images Nightly ROCm7.2.4 (AMD)
+# Publishes the ROCm 7.2.4 flavors to rocm/sgl-dev, qualifies each one on the GPU
+# it targets, and only then promotes it to lmsysorg/sglang-rocm. The gate is the
+# HIP-graph profiling probe: ROCm 7.2.0 loses kernel-dispatch events under
+# hipGraphLaunch, which is the reason these images exist, so a 7.2.4 image that
+# does not trace graph replay is not worth promoting.
+on:
+  workflow_dispatch:
+    inputs:
+      probe_image:
+        description: 'Qualify this image instead of building one (skips publish and promote), e.g. rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260818'
+        required: false
+        type: string
+        default: ''
+  schedule:
+    - cron: '0 14 * * *'
+
+concurrency:
+  # A PR number if a pull request and otherwise the commit hash. This cancels
+  # queued and in-progress runs for the same PR (presubmit) or commit
+  # (postsubmit). The workflow name is prepended to avoid conflicts between
+  # different workflows.
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: True
+
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang' && inputs.probe_image == ''
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu_arch: ['gfx942-rocm724', 'gfx950-rocm724']
+        build_type: ['all']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for git describe to find tags
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: "Set Date"
+        run: |
+          echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          # Use the shared helper so stable/post releases sort above rc tags.
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          # Get short commit hash of current HEAD
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+
+          # Compose pretend version for setuptools_scm: e.g., 0.5.8.post1.dev20260211+g1a2b3c4
+          PRETEND_VERSION="${VERSION}.dev${{ env.DATE }}+g${COMMIT_HASH}"
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "pretend_version=${PRETEND_VERSION}" >> $GITHUB_OUTPUT
+          echo "Detected version: ${VERSION}"
+          echo "Pretend version for pip: ${PRETEND_VERSION}"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Build and Push to rocm/sgl-dev
+        run: |
+          version=${{ steps.version.outputs.version }}
+          pretend_version=${{ steps.version.outputs.pretend_version }}
+          echo "Version: ${version}"
+          echo "Pretend version: ${pretend_version}"
+
+          if [ "${{ matrix.gpu_arch }}" = "gfx942-rocm724" ]; then
+            rocm_tag="rocm724-mi30x"
+          elif [ "${{ matrix.gpu_arch }}" = "gfx950-rocm724" ]; then
+            rocm_tag="rocm724-mi35x"
+          else
+            echo "Unsupported gfx arch"
+            exit 1
+          fi
+
+          tag=v${version}-${rocm_tag}
+          echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
+
+          # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
+          # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
+          # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
+
+      # Persist the tag right after the rocm/sgl-dev push succeeds so the probe
+      # and promote jobs read exactly the tag that landed. By default this step
+      # only runs when the previous step succeeded, so the artifact exists only
+      # when an image was actually pushed.
+      - name: Save published image tag
+        run: |
+          mkdir -p image-tag
+          echo "${{ env.IMAGE_TAG }}" > "image-tag/${{ matrix.gpu_arch }}.txt"
+
+      - name: Upload image tag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag-${{ matrix.gpu_arch }}
+          path: image-tag/${{ matrix.gpu_arch }}.txt
+          retention-days: 1
+
+  # Qualify each published image on its target GPU. gfx942 images run on MI300X,
+  # gfx950 images on MI355X, because the profiling path being checked lives in the
+  # HIP runtime and is worth confirming per device generation.
+  probe:
+    if: |
+      always() && !cancelled() && github.repository == 'sgl-project/sglang' &&
+      (inputs.probe_image != '' || needs.publish.result == 'success')
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu_arch: gfx942-rocm724
+            runner: linux-mi300-1gpu-sglang
+          - gpu_arch: gfx950-rocm724
+            runner: linux-mi35x-gpu-1
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download image tag artifact
+        if: inputs.probe_image == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag-${{ matrix.gpu_arch }}
+
+      - name: Resolve image
+        env:
+          PROBE_IMAGE: ${{ inputs.probe_image }}
+        run: |
+          if [ -n "${PROBE_IMAGE}" ]; then
+            image="${PROBE_IMAGE}"
+          else
+            image_tag=$(tr -d '[:space:]' < "${{ matrix.gpu_arch }}.txt")
+            if [ -z "${image_tag}" ]; then
+              echo "::error::Image tag artifact is empty"
+              exit 1
+            fi
+            image="rocm/sgl-dev:${image_tag}"
+          fi
+          echo "IMAGE=${image}" >> $GITHUB_ENV
+          echo "Qualifying ${image}"
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${IMAGE}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      # No dependency install: the probe needs torch and the HIP runtime only, and
+      # it is the image's stack we are qualifying, not the checkout's.
+      - name: Probe HIP-graph profiling
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          docker exec -w /sglang-checkout ci_sglang \
+            python3 scripts/ci/amd/check_hip_graph_profiling.py 2>&1 | tee probe.log
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.gpu_arch }} on ${{ matrix.runner }}"
+            echo "- **Image:** \`${IMAGE}\`"
+            echo ""
+            echo '```'
+            cat probe.log 2>/dev/null || echo "no probe output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Only images whose profiler works reach the daily repo users pull from.
+  promote:
+    if: |
+      github.repository == 'sgl-project/sglang' && inputs.probe_image == '' &&
+      needs.publish.result == 'success' && needs.probe.result == 'success'
+    needs: [publish, probe]
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu_arch: ['gfx942-rocm724', 'gfx950-rocm724']
+    steps:
+      - name: Download image tag artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag-${{ matrix.gpu_arch }}
+
+      - name: Read image tag
+        run: |
+          image_tag=$(tr -d '[:space:]' < "${{ matrix.gpu_arch }}.txt")
+          if [ -z "${image_tag}" ]; then
+            echo "::error::Image tag artifact is empty"
+            exit 1
+          fi
+          echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
+          echo "Resolved IMAGE_TAG=${image_tag}"
+
+      - name: Login to Docker Hub (AMD)
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Pull qualified image
+        run: docker pull rocm/sgl-dev:${{ env.IMAGE_TAG }}
+
+      - name: Login to Docker Hub (lmsys)
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to lmsysorg/sglang-rocm
+        run: |
+          docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
+          docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
