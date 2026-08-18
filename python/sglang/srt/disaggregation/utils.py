@@ -23,6 +23,9 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import (
+    get_disagg,
+)
 from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -180,7 +183,7 @@ def _poll_with_failure_injection(pollers) -> List[int]:
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
     return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
         req.bootstrap_host is None
-        and server_args.disaggregation_transfer_backend == "fake"
+        and get_disagg().disaggregation_transfer_backend == "fake"
     )
 
 

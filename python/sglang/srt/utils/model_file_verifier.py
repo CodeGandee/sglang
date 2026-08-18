@@ -20,6 +20,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from sglang.srt.runtime_context import (
+    get_model,
+)
+
 # ======== Data Format ========
 
 
@@ -258,7 +262,7 @@ def main():
     _add_common_args(gen_parser)
     gen_parser.set_defaults(
         func=lambda args: generate_checksums(
-            source=args.model_path,
+            source=get_model().model_path,
             output_path=args.model_checksum,
             max_workers=args.workers,
         )
@@ -270,7 +274,7 @@ def main():
     _add_common_args(verify_parser)
     verify_parser.set_defaults(
         func=lambda args: verify(
-            model_path=args.model_path,
+            model_path=get_model().model_path,
             checksums_source=args.model_checksum,
             max_workers=args.workers,
         )
