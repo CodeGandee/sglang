@@ -1,8 +1,10 @@
 # Usage (to build SGLang ROCm docker image):
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm724 -t v0.5.10.post1-rocm724-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm724 -t v0.5.10.post1-rocm724-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -21,10 +23,16 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
 # Default base images
+# The rocm724 flavors differ from rocm720 in the ROCm patch level only; both are
+# Ubuntu 22.04 / Python 3.10 / torch 2.9.1. ROCm 7.2.4 carries the roctracer fix
+# for kernel events lost under hipGraphLaunch (ROCm/ROCm#6102, fixed in 7.2.2)
+# and the HIP graph-dispatch fixes from 7.2.1.
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_942_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_950_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -50,6 +58,16 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
+# Base image 942 with rocm724 and args
+FROM $BASE_IMAGE_942_ROCM724 AS gfx942-rocm724
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+
+# ===============================
 # Base image 950 and args
 FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
@@ -62,6 +80,16 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # ===============================
 # Base image 950 with rocm720 and args
 FROM $BASE_IMAGE_950_ROCM720 AS gfx950-rocm720
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+
+# ===============================
+# Base image 950 with rocm724 and args
+FROM $BASE_IMAGE_950_ROCM724 AS gfx950-rocm724
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
@@ -184,16 +212,16 @@ RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
 # Install AMD SMI Python package from ROCm distribution.
-# The ROCm 7.2 base image (rocm/pytorch) does not pre-install this package.
+# The ROCm 7.2 base images (rocm/pytorch) do not pre-install this package.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm720*) \
+      *rocm72*) \
         echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
         cd /opt/rocm/share/amd_smi \
         && python3 -m pip install --no-cache-dir . \
         ;; \
       *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
+        echo "Not a ROCm 7.2 flavor (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
         ;; \
     esac
 
