@@ -42,7 +42,14 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=14400, suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35-mxfp4", nightly=True
+    est_time=14400,
+    suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35-mxfp4",
+    nightly=True,
+    disabled="Never dispatched: no workflow runs this suite. Two fixes are "
+    "needed before it can be: NightlyBenchmarkRunner has no "
+    "setup_profile_directory() and run_benchmark_for_model takes no "
+    "enable_profile=, so test_b_perf raises AttributeError; and the model "
+    "paths are runner-local /data/amd/ directories rather than HF ids.",
 )
 
 # Local checkpoints on the MI35x runner; overridable for other hosts.
