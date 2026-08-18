@@ -28,7 +28,11 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_parallel,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -100,9 +104,9 @@ def build_kv_host_pool(
     return kv_host_pool_cls(
         kv_pool,
         get_memory().hicache_ratio,
-        server_args.hicache_size if host_size is None else host_size,
+        get_memory().hicache_size if host_size is None else host_size,
         page_size,
-        server_args.hicache_mem_layout,
+        get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(server_args),
         pool_label=pool_label,
         **kwargs,
@@ -299,8 +303,8 @@ def build_kv_only_stack(
         attn_cp_group=params.attn_cp_cache_group,
         attn_tp_group=params.attn_tp_cache_group,
         pp_group=params.pp_cache_group,
-        write_policy=server_args.hicache_write_policy,
-        io_backend=server_args.hicache_io_backend,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
@@ -339,9 +343,9 @@ def build_hybrid_swa_stack(
     )
 
     kv_host_size = swa_host_size = None
-    if server_args.hicache_size > 0:
+    if get_memory().hicache_size > 0:
         kv_host_size, swa_host_size = _split_hicache_size(
-            server_args.hicache_size, (full_kv_pool, swa_kv_pool)
+            get_memory().hicache_size, (full_kv_pool, swa_kv_pool)
         )
 
     host_pool_group = build_hybrid_swa_group(
@@ -369,8 +373,8 @@ def build_hybrid_swa_stack(
         attn_cp_group=params.attn_cp_cache_group,
         attn_tp_group=params.attn_tp_cache_group,
         pp_group=params.pp_cache_group,
-        write_policy=server_args.hicache_write_policy,
-        io_backend=server_args.hicache_io_backend,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
@@ -397,7 +401,7 @@ def _deepseek_v4_num_host_pages(
 
     device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
 
-    if server_args.hicache_size > 0:
+    if get_memory().hicache_size > 0:
         raise ValueError(
             "DeepSeek V4 HiCache currently does not support --hicache-size; "
             "use --hicache-ratio instead."
@@ -494,7 +498,7 @@ def build_deepseek_v4_hicache_stack(
     )
 
     logical_host_pool = LogicalHostPool(
-        num_host_pages * page_size, page_size, layout=server_args.hicache_mem_layout
+        num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
     )
     entries = [
         build_pool_entry(
@@ -517,7 +521,7 @@ def build_deepseek_v4_hicache_stack(
             item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
             num_host_pages=swa_num_host_pages,
             slot_page_size=kvcache.swa_page_size,
-            layout=server_args.hicache_mem_layout,
+            layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -543,7 +547,7 @@ def build_deepseek_v4_hicache_stack(
             item_bytes=c4_item_bytes,
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
-            layout=server_args.hicache_mem_layout,
+            layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
@@ -555,7 +559,7 @@ def build_deepseek_v4_hicache_stack(
             ),
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
-            layout=server_args.hicache_mem_layout,
+            layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
         )
         entries.extend(
@@ -586,7 +590,7 @@ def build_deepseek_v4_hicache_stack(
                 ],
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
-                layout=server_args.hicache_mem_layout,
+                layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(server_args),
             )
             c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
@@ -597,7 +601,7 @@ def build_deepseek_v4_hicache_stack(
                 ],
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
-                layout=server_args.hicache_mem_layout,
+                layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(server_args),
             )
             entries.extend(
@@ -629,7 +633,7 @@ def build_deepseek_v4_hicache_stack(
             item_bytes=c128_item_bytes,
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
-            layout=server_args.hicache_mem_layout,
+            layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
         )
         # C128 state pool is intentionally not registered with hicache.
@@ -656,8 +660,8 @@ def build_deepseek_v4_hicache_stack(
         attn_cp_group=params.attn_cp_cache_group,
         attn_tp_group=params.attn_tp_cache_group,
         pp_group=params.pp_cache_group,
-        write_policy=server_args.hicache_write_policy,
-        io_backend=server_args.hicache_io_backend,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
@@ -694,9 +698,9 @@ def build_hybrid_mamba_stack(
         pool.full_kv_pool for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
-    if server_args.hicache_size > 0:
+    if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
-            server_args.hicache_size, (kv_pool, mamba_pool)
+            get_memory().hicache_size, (kv_pool, mamba_pool)
         )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -718,7 +722,7 @@ def build_hybrid_mamba_stack(
         get_memory().hicache_ratio,
         mamba_host_size,
         allocator_type=_get_allocator_type(server_args),
-        layout=server_args.hicache_mem_layout,
+        layout=get_memory().hicache_mem_layout,
     )
     entries = [
         build_pool_entry(
@@ -751,8 +755,8 @@ def build_hybrid_mamba_stack(
         attn_cp_group=params.attn_cp_cache_group,
         attn_tp_group=params.attn_tp_cache_group,
         pp_group=params.pp_cache_group,
-        write_policy=server_args.hicache_write_policy,
-        io_backend=server_args.hicache_io_backend,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
@@ -797,9 +801,9 @@ def build_hybrid_mamba_swa_stack(
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
-    if server_args.hicache_size > 0:
+    if get_memory().hicache_size > 0:
         kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            server_args.hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+            get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
         )
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
@@ -821,8 +825,8 @@ def build_hybrid_mamba_swa_stack(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
-        allocator_type=server_args.hicache_storage_backend,
-        layout=server_args.hicache_mem_layout,
+        allocator_type=get_memory().hicache_storage_backend,
+        layout=get_memory().hicache_mem_layout,
     )
     entries = [
         build_pool_entry(
@@ -866,8 +870,8 @@ def build_hybrid_mamba_swa_stack(
         attn_cp_group=attn_cp_group,
         attn_tp_group=attn_tp_group,
         pp_group=pp_group,
-        write_policy=server_args.hicache_write_policy,
-        io_backend=server_args.hicache_io_backend,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
@@ -943,8 +947,8 @@ def build_anchor_sidecar_stack(
         attn_cp_group=params.attn_cp_cache_group,
         attn_tp_group=params.attn_tp_cache_group,
         pp_group=params.pp_cache_group,
-        write_policy=server_args.hicache_write_policy,
-        io_backend=server_args.hicache_io_backend,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
@@ -1011,7 +1015,7 @@ def build_full_draft_pools(
         pool=pool,
         host_to_device_ratio=host_pool_group.size / pool.size,
         page_size=controller.page_size,
-        layout=server_args.hicache_mem_layout,
+        layout=get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(server_args),
         pool_label="draft",
     )
@@ -1037,7 +1041,7 @@ def build_full_draft_pools(
         indexer_host_pool = DSAIndexerPoolHost(
             pool,
             draft_host_pool,
-            server_args.hicache_mem_layout,
+            get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
         )
         specs.append(
@@ -1494,7 +1498,7 @@ class _DsaStrategy(StackStrategy):
             sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
                 full_kv_pool,
                 kv_host_pool,
-                server_args.hicache_mem_layout,
+                get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(server_args),
             ),
             prefetch_threshold=prefetch_threshold,
@@ -1724,7 +1728,7 @@ def attach_hybrid_pool_to_unified_cache(
             storage_backend=storage_backend,
             storage_backend_extra_config=storage_extra_config,
             prefetch_threshold=storage_prefetch_threshold,
-            model_name=server_args.served_model_name,
+            model_name=get_serving().served_model_name,
             enable_storage_metrics=cache._enable_metrics_flag,
         )
         _apply_stack_result(cache, kvcache, params, result)
@@ -1788,8 +1792,8 @@ def build_minimax_sparse_hicache_stack(
         index_host_pool = MHATokenToKOnlyPoolHost(
             index_k_pool,
             kv_host_pool,
-            server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
+            get_memory().hicache_mem_layout,
+            allocator_type=get_memory().hicache_storage_backend,
         )
         entries.append(
             build_pool_entry(
@@ -1813,8 +1817,8 @@ def build_minimax_sparse_hicache_stack(
         load_cache_event=load_cache_event,
         attn_cp_group=params.attn_cp_cache_group,
         attn_tp_group=params.attn_tp_cache_group,
-        write_policy=server_args.hicache_write_policy,
-        io_backend=server_args.hicache_io_backend,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
@@ -1863,10 +1867,10 @@ def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                     layer_id: layer_id for layer_id in range(main_pool.layer_num)
                 },
                 load_cache_event=load_cache_event,
-                storage_backend=server_args.hicache_storage_backend,
+                storage_backend=get_memory().hicache_storage_backend,
                 use_mla=False,
                 prefetch_threshold=prefetch_threshold,
-                model_name=server_args.served_model_name,
+                model_name=get_serving().served_model_name,
                 storage_backend_extra_config=extra_config,
                 enable_storage_metrics=enable_storage_metrics,
             )
@@ -1877,9 +1881,9 @@ def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                 server_args=server_args,
                 sparse_pool=sparse_pool,
                 load_cache_event=load_cache_event,
-                storage_backend=server_args.hicache_storage_backend,
+                storage_backend=get_memory().hicache_storage_backend,
                 prefetch_threshold=prefetch_threshold,
-                model_name=server_args.served_model_name,
+                model_name=get_serving().served_model_name,
                 storage_backend_extra_config=extra_config,
                 enable_storage_metrics=enable_storage_metrics,
             )
@@ -1925,17 +1929,17 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             sidecar_pool_name=PoolName.INDEXER,
             full_layer_mapping=layer_mapping,
             load_cache_event=load_cache_event,
-            storage_backend=server_args.hicache_storage_backend,
+            storage_backend=get_memory().hicache_storage_backend,
             use_mla=True,
             override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
             sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
                 kv,
                 kv_host_pool,
-                server_args.hicache_mem_layout,
+                get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(server_args),
             ),
-            model_name=server_args.served_model_name,
+            model_name=get_serving().served_model_name,
             storage_backend_extra_config=extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
