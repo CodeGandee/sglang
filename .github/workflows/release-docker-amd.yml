@@ -16,7 +16,7 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        rocm_version: ['rocm700', 'rocm720']
+        rocm_version: ['rocm700', 'rocm720', 'rocm724']
         gpu_arch: ['gfx942', 'gfx950']
         build_type: ['all']
     steps:
@@ -72,6 +72,16 @@ jobs:
               rocm_tag="rocm720-mi30x"
             elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
               rocm_tag="rocm720-mi35x"
+            else
+              echo "Unsupported gfx arch"
+              exit 1
+            fi
+          elif [ "${{ matrix.rocm_version }}" = "rocm724" ]; then
+            gpu_arch_suffix="-${{ matrix.rocm_version }}"
+            if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
+              rocm_tag="rocm724-mi30x"
+            elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
+              rocm_tag="rocm724-mi35x"
             else
               echo "Unsupported gfx arch"
               exit 1
