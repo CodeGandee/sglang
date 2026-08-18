@@ -79,11 +79,11 @@ async fn model_info(State(state): State<AppState>) -> Response {
         "model_path": sa.model_path,
         "tokenizer_path": sa.tokenizer_path,
         "is_generation": true,
-        // Python's `TokenizerManager` merges this into every request
-        // (`{**preferred, **client}`); this server has no equivalent yet, so
-        // `RustServer.launch` REFUSES to start when it is set. It can therefore
-        // only be null here — echoing it keeps the field's shape.
-        "preferred_sampling_params": sa.preferred_sampling_params,
+        // Python's `TokenizerManager` merges `--preferred-sampling-params` into
+        // every request (`{**preferred, **client}`); this server has no
+        // equivalent yet, so `RustServer.launch` REFUSES to start when it is set
+        // and `ServerArgs` does not carry it. Null keeps the field's shape.
+        "preferred_sampling_params": serde_json::Value::Null,
         "weight_version": serde_json::Value::Null,
     });
     (
@@ -202,8 +202,13 @@ mod tests {
         let mut msgpack = Vec::new();
         rmpv::encode::write_value(&mut msgpack, &outer).unwrap();
 
-        let sa =
-            ServerArgs::from_json(r#"{"model_path": "/m", "api_key": "secret-token"}"#).unwrap();
+        // `api_key` is deliberately NOT a `ServerArgs` field — the typed schema
+        // cannot carry it — so the only place it could leak from is the raw
+        // scheduler dump shaped above.
+        let sa = ServerArgs {
+            model_path: "/m".into(),
+            ..Default::default()
+        };
         let out = shape_server_info(&msgpack, &sa).unwrap();
         let text = String::from_utf8(out.clone()).unwrap();
         // No secret leaks anywhere in the serialized response.
