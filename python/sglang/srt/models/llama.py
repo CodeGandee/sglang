@@ -539,7 +539,18 @@ class LlamaForCausalLM(nn.Module):
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+            if self.pp_group.world_size == 1:
+                self.lm_head = self.model.embed_tokens
+            elif self.pp_group.is_last_rank:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                )
+            else:
+                self.lm_head = PPMissingLayer()
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -690,6 +701,16 @@ class LlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.world_size > 1
+                and self.pp_group.is_last_rank
+                and name == "model.embed_tokens.weight"
+            ):
+                lm_head = params_dict["lm_head.weight"]
+                weight_loader = getattr(lm_head, "weight_loader", default_weight_loader)
+                weight_loader(lm_head, loaded_weight)
+                continue
             if name.endswith(".activation_scale"):
                 name = name.replace(".activation_scale", ".input_scale")
             if name.endswith(".weight_scale_inv"):
@@ -758,6 +779,30 @@ class LlamaForCausalLM(nn.Module):
             get_weight_remap,
         )
 
+        tied_pp_loaded: set[str] = set()
+        if (
+            self.config.tie_word_embeddings
+            and self.pp_group.world_size > 1
+            and self.pp_group.is_last_rank
+        ):
+            params_dict = dict(self.named_parameters())
+
+            def route_tied_embedding(
+                source: Iterable[Tuple[str, torch.Tensor]],
+            ) -> Iterable[Tuple[str, torch.Tensor]]:
+                for name, loaded_weight in source:
+                    if name == "model.embed_tokens.weight":
+                        lm_head = params_dict["lm_head.weight"]
+                        weight_loader = getattr(
+                            lm_head, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(lm_head, loaded_weight)
+                        tied_pp_loaded.add("lm_head.weight")
+                        continue
+                    yield name, loaded_weight
+
+            weights = route_tied_embedding(weights)
+
         if hasattr(self.model, "start_layer"):
             weights = filter_pp_weights(
                 weights, self.model.start_layer, self.model.end_layer
@@ -775,6 +820,7 @@ class LlamaForCausalLM(nn.Module):
         )
         mapper = get_weight_remap(self)
         loaded = loader.load_weights(weights, mapper=mapper)
+        loaded.update(tied_pp_loaded)
 
         if self.config.tie_word_embeddings:
             params_dict = dict(self.named_parameters())
