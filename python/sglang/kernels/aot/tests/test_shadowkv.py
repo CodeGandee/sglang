@@ -104,6 +104,7 @@ def _packed_gqa_reference(query, keys, values, lengths):
         (1, 4, 1, 1, [1]),
         (2, 8, 2, 17, [0, 13]),
         (3, 32, 8, 257, [257, 31, 129]),
+        (1, 32, 8, 2465, [2465]),
     ],
 )
 def test_shadowkv_packed_gqa_matches_ragged_reference(
@@ -132,6 +133,14 @@ def test_shadowkv_packed_gqa_matches_ragged_reference(
 
     assert actual.data_ptr() == output.data_ptr()
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    assert torch.equal(actual, expected)
+    if maximum_tokens == 2465:
+        grouped = query[0].float().reshape(kv_heads, query_heads // kv_heads, 64)
+        expected_scores = torch.einsum("hgd,hkd->hgk", grouped, keys[0].float())
+        expected_weights = torch.softmax(expected_scores * 0.125, dim=-1)
+        assert torch.equal(
+            scratch[0], expected_weights.reshape(query_heads, maximum_tokens)
+        )
 
 
 def test_shadowkv_packed_gqa_replays_with_mutable_static_inputs():

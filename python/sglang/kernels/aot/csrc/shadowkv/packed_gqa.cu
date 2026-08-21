@@ -32,6 +32,9 @@ constexpr int kHeadDim = 64;
 constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
 constexpr int kWarps = kThreads / kWarpSize;
+constexpr int kReferenceGemmInterleavedThreshold = 1760;
+constexpr int kReferenceSoftmaxLargeRowThreshold = 2048;
+constexpr int kReferenceSoftmaxThreads = 1024;
 
 void check_b200(const at::Tensor& tensor) {
   cudaDeviceProp properties{};
@@ -132,15 +135,37 @@ __global__ void shadowkv_packed_gqa_kernel(
     return;
   }
 
-  __shared__ float reduction[kWarps];
+  __shared__ float reduction[kReferenceSoftmaxThreads];
   float local_max = -FLT_MAX;
   for (int token = threadIdx.x; token < length; token += blockDim.x) {
     const int64_t key_offset = kv_base + static_cast<int64_t>(token) * kHeadDim;
     float score = 0.0f;
+    // The locked B200 PyTorch GEMM switches to sixteen interleaved K-lane
+    // accumulators above this qualified Llama GQA row width. Matching that
+    // order prevents small score errors from changing greedy continuations.
+    if (length > kReferenceGemmInterleavedThreshold) {
+      float partial[16];
 #pragma unroll
-    for (int dimension = 0; dimension < kHeadDim; ++dimension) {
-      score += __bfloat162float(query[query_offset + dimension]) *
-          __bfloat162float(keys[key_offset + dimension]);
+      for (int lane = 0; lane < 16; ++lane) {
+        float accumulated = 0.0f;
+#pragma unroll
+        for (int dimension = lane; dimension < kHeadDim; dimension += 16) {
+          accumulated += __bfloat162float(query[query_offset + dimension]) *
+              __bfloat162float(keys[key_offset + dimension]);
+        }
+        partial[lane] = accumulated;
+      }
+      score = partial[0];
+#pragma unroll
+      for (int lane = 1; lane < 16; ++lane) {
+        score += partial[lane];
+      }
+    } else {
+#pragma unroll
+      for (int dimension = 0; dimension < kHeadDim; ++dimension) {
+        score += __bfloat162float(query[query_offset + dimension]) *
+            __bfloat162float(keys[key_offset + dimension]);
+      }
     }
     score *= 0.125f;
     weights[weight_base + token] = score;
@@ -148,29 +173,78 @@ __global__ void shadowkv_packed_gqa_kernel(
   }
   const float maximum = block_max(local_max, reduction);
 
-  float local_sum = 0.0f;
-  for (int token = threadIdx.x; token < length; token += blockDim.x) {
-    const int64_t offset = weight_base + token;
-    const float weight = expf(weights[offset] - maximum);
-    weights[offset] = weight;
-    local_sum += weight;
+  float denominator;
+  if (length > kReferenceSoftmaxLargeRowThreshold) {
+    // PyTorch uses 1,024 logical lanes for large FP32 softmax rows. Populate
+    // those lanes with 256 physical threads, then preserve its two-level
+    // warp reduction order exactly.
+    for (int lane = threadIdx.x; lane < kReferenceSoftmaxThreads;
+         lane += blockDim.x) {
+      float local_sum = 0.0f;
+      for (int token = lane; token < length;
+           token += kReferenceSoftmaxThreads) {
+        local_sum += expf(weights[weight_base + token] - maximum);
+      }
+      reduction[lane] = local_sum;
+    }
+    __syncthreads();
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+      for (int lane = threadIdx.x; lane < kReferenceSoftmaxThreads;
+           lane += blockDim.x) {
+        if (lane % kWarpSize < offset) {
+          reduction[lane] += reduction[lane + offset];
+        }
+      }
+      __syncthreads();
+    }
+    float warp_total =
+        threadIdx.x < kWarpSize ? reduction[threadIdx.x * kWarpSize] : 0.0f;
+    if (threadIdx.x < kWarpSize) {
+      warp_total = warp_sum(warp_total);
+    }
+    if (threadIdx.x == 0) {
+      reduction[0] = warp_total;
+    }
+    __syncthreads();
+    denominator = reduction[0];
+  } else {
+    float local_sum = 0.0f;
+    for (int token = threadIdx.x; token < length; token += blockDim.x) {
+      local_sum += expf(weights[weight_base + token] - maximum);
+    }
+    denominator = block_sum(local_sum, reduction);
   }
-  const float denominator = block_sum(local_sum, reduction);
   for (int token = threadIdx.x; token < length; token += blockDim.x) {
-    weights[weight_base + token] /= denominator;
+    weights[weight_base + token] =
+        expf(weights[weight_base + token] - maximum) / denominator;
   }
   __syncthreads();
 
   if (threadIdx.x < kHeadDim) {
     const int dimension = threadIdx.x;
-    float accumulated = 0.0f;
-    for (int token = 0; token < length; ++token) {
-      const int64_t value_offset =
-          kv_base + static_cast<int64_t>(token) * kHeadDim + dimension;
-      accumulated += weights[weight_base + token] *
-          __bfloat162float(values[value_offset]);
+    float result;
+    if (length > kReferenceSoftmaxLargeRowThreshold) {
+      // FP64 accumulation stabilizes the final BF16 rounding at long context
+      // without changing the FP32 softmax contract above.
+      double accumulated = 0.0;
+      for (int token = 0; token < length; ++token) {
+        const int64_t value_offset =
+            kv_base + static_cast<int64_t>(token) * kHeadDim + dimension;
+        accumulated += static_cast<double>(weights[weight_base + token]) *
+            static_cast<double>(__bfloat162float(values[value_offset]));
+      }
+      result = static_cast<float>(accumulated);
+    } else {
+      float accumulated = 0.0f;
+      for (int token = 0; token < length; ++token) {
+        const int64_t value_offset =
+            kv_base + static_cast<int64_t>(token) * kHeadDim + dimension;
+        accumulated += weights[weight_base + token] *
+            __bfloat162float(values[value_offset]);
+      }
+      result = accumulated;
     }
-    output[query_offset + dimension] = __float2bfloat16_rn(accumulated);
+    output[query_offset + dimension] = __float2bfloat16_rn(result);
   }
 }
 
