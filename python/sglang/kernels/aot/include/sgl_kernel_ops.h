@@ -134,6 +134,13 @@ void shadowkv_plan_reuse(
     at::Tensor& deduplicated_exact_chunks,
     at::Tensor& counts,
     at::Tensor& error_codes);
+void shadowkv_packed_gqa(
+    const at::Tensor& query,
+    const at::Tensor& keys,
+    const at::Tensor& values,
+    const at::Tensor& lengths,
+    at::Tensor& weights,
+    at::Tensor& output);
 #endif
 
 /*

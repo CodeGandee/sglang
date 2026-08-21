@@ -83,6 +83,102 @@ def _plan_reference(arguments, max_reuse, chunk_size):
     return plan, deduplicated, counts
 
 
+def _packed_gqa_reference(query, keys, values, lengths):
+    outputs = []
+    for row, length in enumerate(lengths.cpu().tolist()):
+        if length == 0:
+            outputs.append(torch.zeros_like(query[row]))
+            continue
+        groups = query.shape[1] // keys.shape[1]
+        grouped = query[row].float().reshape(keys.shape[1], groups, 64)
+        scores = torch.einsum("hgd,hkd->hgk", grouped, keys[row, :, :length].float())
+        weights = torch.softmax(scores * 0.125, dim=-1)
+        output = torch.einsum("hgk,hkd->hgd", weights, values[row, :, :length].float())
+        outputs.append(output.reshape(query.shape[1], 64).to(torch.bfloat16))
+    return torch.stack(outputs)
+
+
+@pytest.mark.parametrize(
+    "batch,query_heads,kv_heads,maximum_tokens,length_values",
+    [
+        (1, 4, 1, 1, [1]),
+        (2, 8, 2, 17, [0, 13]),
+        (3, 32, 8, 257, [257, 31, 129]),
+    ],
+)
+def test_shadowkv_packed_gqa_matches_ragged_reference(
+    batch, query_heads, kv_heads, maximum_tokens, length_values
+):
+    torch.manual_seed(20260822 + batch + maximum_tokens)
+    query = (torch.randn((batch, query_heads, 64), device="cuda") * 0.125).to(
+        torch.bfloat16
+    )
+    keys = (
+        torch.randn((batch, kv_heads, maximum_tokens, 64), device="cuda") * 0.125
+    ).to(torch.bfloat16)
+    values = (
+        torch.randn((batch, kv_heads, maximum_tokens, 64), device="cuda") * 0.125
+    ).to(torch.bfloat16)
+    lengths = torch.tensor(length_values, dtype=torch.int32, device="cuda")
+    expected = _packed_gqa_reference(query, keys, values, lengths)
+    scratch = torch.empty(
+        (batch, query_heads, maximum_tokens), dtype=torch.float32, device="cuda"
+    )
+    output = torch.empty_like(query)
+
+    actual = sgl_kernel.shadowkv_packed_gqa(
+        query, keys, values, lengths, weights=scratch, out=output
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_shadowkv_packed_gqa_replays_with_mutable_static_inputs():
+    query = torch.zeros((1, 4, 64), dtype=torch.bfloat16, device="cuda")
+    keys = torch.zeros((1, 1, 17, 64), dtype=torch.bfloat16, device="cuda")
+    values = torch.zeros_like(keys)
+    lengths = torch.ones((1,), dtype=torch.int32, device="cuda")
+    scratch = torch.empty((1, 4, 17), dtype=torch.float32, device="cuda")
+    output = torch.empty_like(query)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            sgl_kernel.shadowkv_packed_gqa(
+                query,
+                keys,
+                values,
+                lengths,
+                weights=scratch,
+                out=output,
+                validate_lengths=False,
+            )
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        sgl_kernel.shadowkv_packed_gqa(
+            query,
+            keys,
+            values,
+            lengths,
+            weights=scratch,
+            out=output,
+            validate_lengths=False,
+        )
+
+    torch.manual_seed(20260822)
+    query.copy_(torch.randn_like(query))
+    keys.copy_(torch.randn_like(keys))
+    values.copy_(torch.randn_like(values))
+    lengths.fill_(13)
+    expected = _packed_gqa_reference(query, keys, values, lengths)
+    graph.replay()
+
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize(
     "tokens,heads,position_values",
     [
@@ -125,6 +221,20 @@ def test_shadowkv_reconstruct_rope_matches_fp32_reference(
     assert torch.equal(storage[-guard:], torch.full_like(storage[-guard:], 91))
     repeated = sgl_kernel.shadowkv_reconstruct_rope(u, sv, positions, inverse)
     assert torch.equal(actual, repeated)
+    strided_storage = torch.empty(
+        (heads, len(position_values) + 3, 64),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    strided_output = strided_storage[:, : len(position_values)]
+    sgl_kernel.shadowkv_reconstruct_rope(
+        u,
+        sv,
+        positions,
+        inverse,
+        out=strided_output,
+    )
+    assert torch.equal(actual, strided_output)
 
 
 @pytest.mark.parametrize(

@@ -111,6 +111,7 @@ else:
     from sgl_kernel.shadowkv import (
         ShadowKVReusePlan,
         shadowkv_kernels_available,
+        shadowkv_packed_gqa,
         shadowkv_plan_reuse,
         shadowkv_reconstruct_rope,
     )
@@ -196,6 +197,7 @@ else:
         "rotary_embedding",
         "segment_packbits",
         "shadowkv_plan_reuse",
+        "shadowkv_packed_gqa",
         "shadowkv_reconstruct_rope",
         "sgl_per_token_group_quant_8bit",
         "sgl_per_token_group_quant_fp8",

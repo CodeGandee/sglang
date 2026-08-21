@@ -60,6 +60,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "current_generations, int max_reuse_chunks, int chunk_size, Tensor! plan, Tensor! "
       "deduplicated_exact_chunks, Tensor! counts, Tensor! error_codes) -> ()");
   m.impl("shadowkv_plan_reuse", torch::kCUDA, &shadowkv_plan_reuse);
+  m.def(
+      "shadowkv_packed_gqa(Tensor query, Tensor keys, Tensor values, Tensor lengths, Tensor! weights, Tensor! output) "
+      "-> ()");
+  m.impl("shadowkv_packed_gqa", torch::kCUDA, &shadowkv_packed_gqa);
 #endif
 
   /*

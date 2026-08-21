@@ -46,14 +46,20 @@ __global__ void shadowkv_reconstruct_rope_kernel(
     const float* __restrict__ cosine,
     const float* __restrict__ sine,
     __nv_bfloat16* __restrict__ output,
-    int selected_tokens) {
+    int selected_tokens,
+    int64_t output_head_stride,
+    int64_t output_token_stride) {
   const int dimension = threadIdx.x;
   const int head = blockIdx.x / selected_tokens;
   const int selected = blockIdx.x - head * selected_tokens;
 
-  const int64_t output_offset =
+  const int64_t reconstructed_offset =
       (static_cast<int64_t>(head) * selected_tokens + selected) * kHeadDim;
-  const float value = __bfloat162float(reconstructed[output_offset + dimension]);
+  const int64_t output_offset =
+      static_cast<int64_t>(head) * output_head_stride +
+      static_cast<int64_t>(selected) * output_token_stride;
+  const float value =
+      __bfloat162float(reconstructed[reconstructed_offset + dimension]);
 
   const int frequency_index = dimension % kHalfHeadDim;
   const int64_t frequency_offset =
@@ -62,7 +68,7 @@ __global__ void shadowkv_reconstruct_rope_kernel(
   const int paired_dimension =
       dimension < kHalfHeadDim ? dimension + kHalfHeadDim : dimension - kHalfHeadDim;
   const float paired_value =
-      __bfloat162float(reconstructed[output_offset + paired_dimension]);
+      __bfloat162float(reconstructed[reconstructed_offset + paired_dimension]);
   const float rotated_half = dimension < kHalfHeadDim ? -paired_value : paired_value;
   // Match the readable Torch expression's two rounded FP32 products followed
   // by a rounded FP32 addition. Explicit intrinsics prevent FMA contraction.
@@ -84,7 +90,7 @@ void shadowkv_reconstruct_rope(
   CHECK_INPUT(sv);
   CHECK_INPUT(positions);
   CHECK_INPUT(inverse_frequencies);
-  CHECK_INPUT(output);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
   TORCH_CHECK(u.scalar_type() == at::ScalarType::BFloat16, "u must use bfloat16");
   TORCH_CHECK(sv.scalar_type() == at::ScalarType::BFloat16, "sv must use bfloat16");
   TORCH_CHECK(
@@ -151,6 +157,8 @@ void shadowkv_reconstruct_rope(
       cosine.data_ptr<float>(),
       sine.data_ptr<float>(),
       reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
-      static_cast<int>(positions.size(1)));
+      static_cast<int>(positions.size(1)),
+      output.stride(0),
+      output.stride(1));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
