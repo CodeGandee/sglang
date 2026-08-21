@@ -32,8 +32,15 @@ ATTENTION_BACKENDS = {}
 
 
 def register_attention_backend(name):
+    normalized = name.strip()
+    if not normalized:
+        raise ValueError("attention backend name must not be empty")
+
     def decorator(fn):
-        ATTENTION_BACKENDS[name] = fn
+        existing = ATTENTION_BACKENDS.get(normalized)
+        if existing is not None and existing is not fn:
+            raise ValueError(f"attention backend {normalized!r} is already registered")
+        ATTENTION_BACKENDS[normalized] = fn
         return fn
 
     return decorator

@@ -231,6 +231,7 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         key = torch.zeros((6, 2, 3))
         value = torch.zeros((6, 2, 3))
         k_rope = torch.zeros((6, 2, 1))
+        pre_rope_key = torch.arange(36, dtype=torch.float32).view(6, 2, 3)
         output = torch.empty_like(query)
 
         with (
@@ -254,6 +255,7 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                 True,
                 key_value_num_tokens=5,
                 k_rope=k_rope,
+                pre_rope_key=pre_rope_key,
             )
 
         call_record = backend.calls[-1]
@@ -261,6 +263,9 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         self.assertEqual(call_record.key.shape, (5, 2, 3))
         self.assertEqual(call_record.value.shape, (5, 2, 3))
         self.assertEqual(call_record.kwargs["k_rope"].shape, (5, 2, 1))
+        self.assertTrue(
+            torch.equal(call_record.kwargs["pre_rope_key"], pre_rope_key[:5])
+        )
         self.assertEqual(call_record.output.shape, (2, 2, 3))
         self.assertEqual(lse.shape, (4, 2))
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)

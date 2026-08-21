@@ -147,6 +147,13 @@ class RadixAttention(nn.Module):
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
 
+    def capture_pre_rope_key(self, key: torch.Tensor) -> Optional[torch.Tensor]:
+        """Copy and shape an unrotated key only for a backend that requests it."""
+
+        if not get_attn_backend().requires_pre_rope_key(self):
+            return None
+        return key.view(-1, self.tp_k_head_num, self.qk_head_dim).clone()
+
     def forward(
         self,
         q,
@@ -155,8 +162,20 @@ class RadixAttention(nn.Module):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         key_value_num_tokens: Optional[int] = None,
+        pre_rope_key: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        if pre_rope_key is not None:
+            if not get_attn_backend().requires_pre_rope_key(self):
+                raise RuntimeError(
+                    "model provided a pre-RoPE key to an attention backend that "
+                    "does not request it"
+                )
+            pre_rope_key = pre_rope_key.view(
+                -1, self.tp_k_head_num, self.qk_head_dim
+            )
+            kwargs["pre_rope_key"] = pre_rope_key
+
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None
@@ -307,6 +326,7 @@ def _unified_attention_with_output_impl(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    pre_rope_key: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
@@ -349,6 +369,8 @@ def _unified_attention_with_output_impl(
         kwargs["llama_4_scaling"] = llama_4_scaling
     if topk_indices is not None:
         kwargs["topk_indices"] = topk_indices[:real_query_num_tokens]
+    if pre_rope_key is not None:
+        kwargs["pre_rope_key"] = pre_rope_key[:key_value_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_positions = forward_batch.positions
@@ -419,6 +441,7 @@ def unified_attention_with_output(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    pre_rope_key: Optional[torch.Tensor] = None,
 ) -> None:
     _unified_attention_with_output_impl(
         query,
@@ -437,6 +460,7 @@ def unified_attention_with_output(
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
         topk_indices=topk_indices,
+        pre_rope_key=pre_rope_key,
     )
 
 
@@ -467,6 +491,7 @@ def unified_attention_with_output_and_lse(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    pre_rope_key: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     lse = _unified_attention_with_output_impl(
         query,
@@ -485,6 +510,7 @@ def unified_attention_with_output_and_lse(
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
         topk_indices=topk_indices,
+        pre_rope_key=pre_rope_key,
     )
     assert lse is not None
     return lse
@@ -587,7 +613,13 @@ def attention_with_output_extra_kwargs(
     aux_tensors = kwargs.get("aux_tensors")
     if aux_tensors is not None:
         kwargs["aux_tensors"] = [t[:real_num_tokens] for t in aux_tensors]
-    for per_token_key in ("rel_bias", "q_descale", "k_descale", "v_descale"):
+    for per_token_key in (
+        "rel_bias",
+        "q_descale",
+        "k_descale",
+        "v_descale",
+        "pre_rope_key",
+    ):
         t = kwargs.get(per_token_key)
         if t is not None:
             kwargs[per_token_key] = t[:real_num_tokens]

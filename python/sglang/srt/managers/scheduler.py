@@ -269,6 +269,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.cache_lifecycle import CacheTerminalReason
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -2986,7 +2987,12 @@ class Scheduler(
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(
+            req,
+            self.tree_cache,
+            is_insert=False,
+            terminal_reason=CacheTerminalReason.ABORT,
+        )
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -4517,7 +4523,11 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    terminal_reason=CacheTerminalReason.ABORT,
+                )
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 bootstrap_pending = req.pending_bootstrap
@@ -4537,7 +4547,12 @@ class Scheduler(
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=False,
+                    terminal_reason=CacheTerminalReason.ABORT,
+                )
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
@@ -4553,7 +4568,12 @@ class Scheduler(
                     req.req_pool_idx is not None
                     or getattr(req, "mamba_pool_idx", None) is not None
                 ):
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    release_kv_cache(
+                        req,
+                        self.tree_cache,
+                        is_insert=False,
+                        terminal_reason=CacheTerminalReason.ABORT,
+                    )
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue

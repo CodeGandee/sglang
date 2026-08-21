@@ -40,6 +40,9 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
+from sglang.srt.arg_groups.attention_backend_config import (
+    parse_attention_backend_config,
+)
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     mamba_extra_buffer_lazy_of,
@@ -393,7 +396,9 @@ def add_quantization_method_choices(choices):
 
 
 def add_attention_backend_choices(choices):
-    ATTENTION_BACKEND_CHOICES.extend(choices)
+    for choice in choices:
+        if choice not in ATTENTION_BACKEND_CHOICES:
+            ATTENTION_BACKEND_CHOICES.append(choice)
 
 
 def add_chunked_prefix_cache_attention_backend(backend_name):
@@ -1701,6 +1706,18 @@ class ServerArgs:
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
             resolvable=True,
+        ),
+        NS("exec.kernel"),
+    ] = None
+    attention_backend_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "Opaque attention-backend configuration as an inline JSON object "
+                "or @path to a JSON file. SGLang validates JSON structure; the "
+                "selected backend validates its own keys."
+            ),
+            type_parser=parse_attention_backend_config,
         ),
         NS("exec.kernel"),
     ] = None

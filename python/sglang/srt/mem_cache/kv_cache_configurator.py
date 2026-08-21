@@ -45,6 +45,10 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.cache_provider_registry import (
+    AttentionBackendCacheResult,
+    select_attention_backend_cache_provider,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -275,6 +279,30 @@ class KVCacheConfigurator:
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        provider_result = self._configure_attention_backend_cache_provider(
+            pre_model_load_memory=pre_model_load_memory
+        )
+        if provider_result is not None:
+            if provider_result.cache_lifecycle is not None:
+                provider_result.req_to_token_pool.bind_cache_lifecycle(
+                    provider_result.cache_lifecycle
+                )
+            logger.info(
+                f"Memory pool end. "
+                f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            )
+            return KVCacheConfigResult(
+                max_total_num_tokens=provider_result.max_total_num_tokens,
+                max_running_requests=provider_result.max_running_requests,
+                full_max_total_num_tokens=provider_result.full_max_total_num_tokens,
+                swa_max_total_num_tokens=provider_result.swa_max_total_num_tokens,
+                req_to_token_pool=provider_result.req_to_token_pool,
+                token_to_kv_pool=provider_result.token_to_kv_pool,
+                token_to_kv_pool_allocator=provider_result.token_to_kv_pool_allocator,
+                memory_pool_config=provider_result.memory_pool_config,
+                unified_memory_pool=provider_result.unified_memory_pool,
+            )
+
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None
@@ -307,6 +335,29 @@ class KVCacheConfigurator:
             memory_pool_config=config,
             unified_memory_pool=pools.unified_memory_pool,
         )
+
+    def _configure_attention_backend_cache_provider(
+        self, *, pre_model_load_memory: int
+    ) -> AttentionBackendCacheResult | None:
+        selection = select_attention_backend_cache_provider(
+            self.server_args.get_attention_backends()
+        )
+        if selection is None:
+            return None
+        logger.info(
+            "Trying registered cache provider for attention backend(s): %s",
+            ", ".join(selection.backend_names),
+        )
+        result = selection.factory(
+            self,
+            pre_model_load_memory=pre_model_load_memory,
+        )
+        if result is not None and not isinstance(result, AttentionBackendCacheResult):
+            raise TypeError(
+                "attention backend cache provider must return "
+                "AttentionBackendCacheResult or None"
+            )
+        return result
 
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools

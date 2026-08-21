@@ -12,6 +12,7 @@ from sglang.kernels.ops.memory.common import (
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.cache_lifecycle import CacheTerminalReason
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
@@ -192,7 +193,14 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    is_insert: bool = True,
+    *,
+    terminal_reason: CacheTerminalReason | None = None,
+    terminal_detail: str | None = None,
+):
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
     # MambaRadixCache may alloc mamba state before alloc KV cache
@@ -207,6 +215,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             )
             req.mamba_pool_idx = None
         return
+
+    tree_cache.req_to_token_pool.notify_cache_terminal(
+        req,
+        terminal_reason,
+        detail=terminal_detail,
+    )
 
     effective_kv_committed_len = req.effective_kv_committed_len()
     tree_cache.cache_finished_req(

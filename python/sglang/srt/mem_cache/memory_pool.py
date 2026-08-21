@@ -58,6 +58,14 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.cache_lifecycle import (
+    CacheAllocation,
+    CacheBatchMutationKind,
+    CacheLifecycleCallbacks,
+    CacheLifecycleDispatcher,
+    CacheTerminalReason,
+    infer_cache_terminal_reason,
+)
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.page_major import (
@@ -281,12 +289,63 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self.cache_lifecycle: CacheLifecycleDispatcher | None = None
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
+
+    def bind_cache_lifecycle(self, callbacks: CacheLifecycleCallbacks) -> None:
+        """Bind one provider-owned lifecycle adapter before request allocation."""
+
+        if self.cache_lifecycle is None:
+            self.cache_lifecycle = CacheLifecycleDispatcher(callbacks)
+            return
+        if self.cache_lifecycle.callbacks is not callbacks:
+            raise RuntimeError("request pool already has a cache lifecycle adapter")
+
+    def cache_allocation(self, req: Req) -> CacheAllocation:
+        """Resolve the stable identity of the request's current slot use."""
+
+        if req.req_pool_idx is None:
+            raise RuntimeError("request has no cache allocation")
+        return CacheAllocation(
+            request_id=req.rid,
+            request_pool_index=req.req_pool_idx,
+            generation=int(self.req_generation[req.req_pool_idx]),
+        )
+
+    def publish_cache_allocations(self, reqs: list[Req]) -> None:
+        if self.cache_lifecycle is None:
+            return
+        self.cache_lifecycle.publish(tuple(self.cache_allocation(req) for req in reqs))
+
+    def notify_cache_batch_mutation(
+        self, kind: CacheBatchMutationKind, reqs: list[Req]
+    ) -> None:
+        if self.cache_lifecycle is None:
+            return
+        self.cache_lifecycle.mutate_batch(
+            kind,
+            tuple(self.cache_allocation(req) for req in reqs),
+        )
+
+    def notify_cache_terminal(
+        self,
+        req: Req,
+        reason: CacheTerminalReason | None = None,
+        *,
+        detail: str | None = None,
+    ) -> bool:
+        if self.cache_lifecycle is None or req.req_pool_idx is None:
+            return False
+        return self.cache_lifecycle.terminate(
+            self.cache_allocation(req),
+            reason or infer_cache_terminal_reason(req),
+            detail=detail,
+        )
 
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
@@ -315,19 +374,47 @@ class ReqToTokenPool:
             # Handled separately: free_slots[-0:] is the entire list, not [].
             select_index = []
         offset = 0
+        newly_allocated = []
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
                 self.req_generation[r.req_pool_idx] += 1
+                newly_allocated.append(r)
                 offset += 1
+        if self.cache_lifecycle is not None and newly_allocated:
+            try:
+                self.cache_lifecycle.admit(
+                    tuple(self.cache_allocation(req) for req in newly_allocated)
+                )
+            except Exception:
+                for req in reversed(newly_allocated):
+                    assert req.req_pool_idx is not None
+                    self.free_slots.append(req.req_pool_idx)
+                    req.req_pool_idx = None
+                raise
         return [r.req_pool_idx for r in reqs]
 
-    def free(self, req: Req):
+    def free(
+        self,
+        req: Req,
+        *,
+        terminal_reason: CacheTerminalReason | None = None,
+        terminal_detail: str | None = None,
+    ):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
-        req.req_pool_idx = None
+        try:
+            self.notify_cache_terminal(
+                req,
+                terminal_reason,
+                detail=terminal_detail,
+            )
+        finally:
+            self.free_slots.append(req.req_pool_idx)
+            req.req_pool_idx = None
 
     def clear(self):
+        if self.cache_lifecycle is not None:
+            self.cache_lifecycle.reset()
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
 

@@ -62,6 +62,11 @@ class AttentionBackend(ABC):
 
     supports_ragged_verify_graph: bool = False
 
+    def requires_pre_rope_key(self, layer: RadixAttention) -> bool:
+        """Whether this backend needs an independent unrotated key for ``layer``."""
+
+        return False
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
