@@ -1,3 +1,8 @@
+Notice for ByteDance ShadowKV
+-----------------------------
+
+The optional B200 ShadowKV kernels implement independently written operations whose algorithm semantics were informed by ByteDance's ShadowKV project at revision e51904cdeab7d4d34013370f09f2cf5fcd655e15. ShadowKV is licensed under the Apache License, Version 2.0. No ShadowKV source file is vendored or loaded at build time or runtime.
+
 Notice for flashinfer-ai/flashinfer
 -------------------------------
                                  Apache License

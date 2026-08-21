@@ -185,6 +185,19 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SG
 option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+option(SGL_KERNEL_ENABLE_SHADOWKV         "Build optional B200 ShadowKV kernels" OFF)
+
+if(SGL_KERNEL_ENABLE_SHADOWKV)
+    if(NOT SGL_KERNEL_CUDA_ARCH STREQUAL "100a")
+        message(FATAL_ERROR "SGL_KERNEL_ENABLE_SHADOWKV requires SGL_KERNEL_CUDA_ARCH=100a.")
+    endif()
+    if(NOT SGL_KERNEL_BUILD_SM100_VARIANT)
+        message(FATAL_ERROR "SGL_KERNEL_ENABLE_SHADOWKV requires the SM100 common_ops variant.")
+    endif()
+    if(NOT SGL_KERNEL_ENABLE_BF16)
+        message(FATAL_ERROR "SGL_KERNEL_ENABLE_SHADOWKV requires BF16 support.")
+    endif()
+endif()
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -337,6 +350,14 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
+set(SHADOWKV_SOURCES)
+if(SGL_KERNEL_ENABLE_SHADOWKV)
+    list(APPEND SHADOWKV_SOURCES
+        "csrc/shadowkv/plan_reuse.cu"
+        "csrc/shadowkv/reconstruct_rope.cu"
+    )
+endif()
+
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
@@ -364,7 +385,7 @@ endif()
 # =========================== Common SM100+ Build ============================= #
 # Build SM100+ library with precise math (same namespace, different directory)
 if(SGL_KERNEL_BUILD_SM100_VARIANT)
-    Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+    Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES} ${SHADOWKV_SOURCES})
     target_compile_options(common_ops_sm100_build PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
     )
@@ -373,6 +394,9 @@ if(SGL_KERNEL_BUILD_SM100_VARIANT)
         OUTPUT_NAME "common_ops"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
     )
+    if(SGL_KERNEL_ENABLE_SHADOWKV)
+        target_compile_definitions(common_ops_sm100_build PRIVATE SGL_KERNEL_ENABLE_SHADOWKV=1)
+    endif()
 endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)

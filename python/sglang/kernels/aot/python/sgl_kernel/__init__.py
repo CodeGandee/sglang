@@ -108,6 +108,12 @@ else:
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
+    from sgl_kernel.shadowkv import (
+        ShadowKVReusePlan,
+        shadowkv_kernels_available,
+        shadowkv_plan_reuse,
+        shadowkv_reconstruct_rope,
+    )
     from sgl_kernel.speculative import (
         assign_draft_cache_locs_contiguous_cpu,
         assign_extend_cache_locs_cpu,
@@ -189,6 +195,8 @@ else:
         "rmsnorm",
         "rotary_embedding",
         "segment_packbits",
+        "shadowkv_plan_reuse",
+        "shadowkv_reconstruct_rope",
         "sgl_per_token_group_quant_8bit",
         "sgl_per_token_group_quant_fp8",
         "sgl_per_token_group_quant_int8",
