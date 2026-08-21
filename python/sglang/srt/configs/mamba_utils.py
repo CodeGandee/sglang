@@ -48,9 +48,14 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
     """
     Get mamba2 state dtype from config or environment variable.
 
-    Priority (from highest to lowest):
+    Convolution state priority (from highest to lowest):
+    1. Environment variable SGLANG_MAMBA_CONV_DTYPE
+    2. Config file dtype or torch_dtype
+    3. Default "bfloat16"
+
+    Temporal state priority (from highest to lowest):
     1. Environment variable SGLANG_MAMBA_SSM_DTYPE
-    2. Config file (config.mamba_ssm_dtype or config.text_config.mamba_ssm_dtype)
+    2. Config file mamba_ssm_dtype
     3. Default "float32"
 
     Args:
@@ -65,7 +70,40 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
-    conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
+    conv_dtype = torch.bfloat16
+    dtype_config = getattr(config, "text_config", config)
+    config_conv_dtype = None
+    if dtype_config is not None:
+        config_conv_dtype = getattr(dtype_config, "dtype", None) or getattr(
+            dtype_config, "torch_dtype", None
+        )
+    if isinstance(config_conv_dtype, torch.dtype):
+        if config_conv_dtype in dtype_map.values():
+            conv_dtype = config_conv_dtype
+        else:
+            logger.warning(
+                f"Invalid convolution state dtype '{config_conv_dtype}' in config. "
+                f"Must be one of {list(dtype_map.values())}. Using default "
+                "'bfloat16'."
+            )
+    elif config_conv_dtype is not None:
+        if config_conv_dtype in dtype_map:
+            conv_dtype = dtype_map[config_conv_dtype]
+        else:
+            logger.warning(
+                f"Invalid convolution state dtype '{config_conv_dtype}' in config. "
+                f"Must be one of {list(dtype_map.keys())}. Using default 'bfloat16'."
+            )
+
+    env_conv_dtype = envs.SGLANG_MAMBA_CONV_DTYPE.get()
+    if env_conv_dtype is not None:
+        if env_conv_dtype in dtype_map:
+            conv_dtype = dtype_map[env_conv_dtype]
+        else:
+            logger.warning(
+                f"Invalid SGLANG_MAMBA_CONV_DTYPE '{env_conv_dtype}'. Must be one "
+                f"of {list(dtype_map.keys())}. Using the config or default dtype."
+            )
 
     # Get SSM dtype: default -> config -> env var
     ssm_dtype = torch.float32  # Step 1: Default value

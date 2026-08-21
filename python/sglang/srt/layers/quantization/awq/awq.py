@@ -22,7 +22,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supported,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.utils import get_scalar_types
+from sglang.srt.layers.quantization.utils import get_scalar_types, is_layer_skipped
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
@@ -57,8 +57,18 @@ logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
 
 
-def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
-    return any(module_name in prefix for module_name in modules_to_not_convert)
+def is_layer_skipped_awq(
+    prefix: str,
+    modules_to_not_convert: list[str],
+    packed_modules_mapping: dict[str, list[str]] | None = None,
+):
+    normalized_modules = list(modules_to_not_convert)
+    normalized_modules.extend(
+        module_name.removeprefix("model.")
+        for module_name in modules_to_not_convert
+        if module_name.startswith("model.")
+    )
+    return is_layer_skipped(prefix, normalized_modules, packed_modules_mapping or {})
 
 
 class AWQConfig(QuantizationConfig):
@@ -130,7 +140,11 @@ class AWQConfig(QuantizationConfig):
         modules_to_not_convert = cls.get_from_keys_or(
             config, ["modules_to_not_convert"], None
         )
-        return cls(weight_bits, group_size, zero_point, modules_to_not_convert)
+        quant_config = cls(weight_bits, group_size, zero_point, modules_to_not_convert)
+        quant_config.update_packed_modules_mapping(
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], {})
+        )
+        return quant_config
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -140,19 +154,29 @@ class AWQConfig(QuantizationConfig):
 
         if _is_npu:
             if isinstance(layer, LinearBase):
-                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                if is_layer_skipped_awq(
+                    prefix,
+                    self.modules_to_not_convert,
+                    self.packed_modules_mapping,
+                ):
                     return UnquantizedLinearMethod()
                 layer.scheme = self.get_linear_scheme(layer)
                 return AWQLinearMethod(self)
             elif isinstance(layer, FusedMoE):
-                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                if is_layer_skipped_awq(
+                    prefix,
+                    self.modules_to_not_convert,
+                    self.packed_modules_mapping,
+                ):
                     return None
                 layer.scheme = self.get_moe_scheme(layer)
                 return AWQMoEMethod(self)
             return None
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix, self.modules_to_not_convert, self.packed_modules_mapping
+            ):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
@@ -189,12 +213,16 @@ class AWQCPUConfig(AWQConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix, self.modules_to_not_convert, self.packed_modules_mapping
+            ):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix, self.modules_to_not_convert, self.packed_modules_mapping
+            ):
                 return None
             layer.scheme = self.get_moe_scheme(layer)
             return AWQMoEMethod(self)
@@ -291,7 +319,7 @@ class AWQMarlinConfig(QuantizationConfig):
         modules_to_not_convert = cls.get_from_keys_or(
             config, ["modules_to_not_convert"], None
         )
-        return cls(
+        quant_config = cls(
             weight_bits,
             group_size,
             zero_point,
@@ -299,6 +327,10 @@ class AWQMarlinConfig(QuantizationConfig):
             modules_to_not_convert,
             config,
         )
+        quant_config.update_packed_modules_mapping(
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], {})
+        )
+        return quant_config
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
@@ -333,7 +365,9 @@ class AWQMarlinConfig(QuantizationConfig):
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix, self.modules_to_not_convert, self.packed_modules_mapping
+            ):
                 return UnquantizedLinearMethod()
             # Check if the layer is supported by AWQMarlin.
             if not check_marlin_supports_layer(layer, self.group_size):
@@ -347,7 +381,9 @@ class AWQMarlinConfig(QuantizationConfig):
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix, self.modules_to_not_convert, self.packed_modules_mapping
+            ):
                 return None
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
@@ -439,7 +475,6 @@ class AWQLinearMethod(LinearMethodBase):
 
 
 class AWQMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
         self.quant_type = scalar_types.uint4

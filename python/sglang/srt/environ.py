@@ -1171,7 +1171,7 @@ class Envs:
     # ===================================================================
     # Mamba state and cache
     # ===================================================================
-    SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
+    SGLANG_MAMBA_CONV_DTYPE = EnvStr(None)
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.

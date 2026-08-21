@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.layers.quantization.awq.awq import is_layer_skipped_awq
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -24,6 +25,26 @@ def _qwen3_next_ignored_layers(layer_idx: int, name: str) -> list:
 
 
 class TestIsLayerSkipped(CustomTestCase):
+    def test_awq_fused_qkv_is_skipped_when_all_shards_are_unquantized(self):
+        prefix = "model.layers.3.self_attn.qkv_proj"
+        ignored = [
+            "model.layers.3.self_attn.q_proj",
+            "model.layers.3.self_attn.k_proj",
+            "model.layers.3.self_attn.v_proj",
+        ]
+        self.assertTrue(is_layer_skipped_awq(prefix, ignored))
+
+    def test_awq_uses_model_mapping_for_hybrid_fused_projection(self):
+        prefix = "model.layers.1.linear_attn.in_proj_ba"
+        ignored = ["linear_attn.in_proj_b", "linear_attn.in_proj_a"]
+        mapping = {"in_proj_ba": ["in_proj_b", "in_proj_a"]}
+        self.assertTrue(is_layer_skipped_awq(prefix, ignored, mapping))
+
+    def test_awq_matches_wrapped_language_model_layer(self):
+        prefix = "model.language_model.layers.0.mlp.down_proj"
+        ignored = ["model.layers.0."]
+        self.assertTrue(is_layer_skipped_awq(prefix, ignored))
+
     def test_qwen3_next_in_proj_ba_is_skipped(self):
         # Regression for #23467: in_proj_ba is a unified tensor in the FP8
         # checkpoint. modules_to_not_convert lists it explicitly, so it must
