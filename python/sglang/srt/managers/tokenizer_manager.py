@@ -1218,6 +1218,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens)."
                 )
 
+        # The scheduler reserves a small request-control margin below context_len.
+        # Reject an overlong request here when truncation is disabled so
+        # it never enters the scheduler's one-token abort-forward path. Besides
+        # avoiding wasted inference, this guarantees that cache providers do not
+        # admit ownership for a request whose length is already known to be invalid.
+        max_req_input_len = getattr(self, "max_req_input_len", None)
+        if (
+            not self.allow_auto_truncate
+            and isinstance(max_req_input_len, int)
+            and input_token_num >= max_req_input_len
+        ):
+            raise ValueError(
+                f"Input length ({input_token_num} tokens) exceeds the maximum "
+                f"allowed length ({max_req_input_len} tokens). Use a shorter input "
+                "or enable --allow-auto-truncate."
+            )
+
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
