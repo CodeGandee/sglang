@@ -31,7 +31,9 @@ class TestShadowKVDenseParityBackend(CustomTestCase):
             self.delegate, SimpleNamespace(to_dict=lambda: {})
         )
         self.layer = SimpleNamespace(tp_k_head_num=2, qk_head_dim=4)
-        self.forward_batch = object()
+        self.forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend=lambda: False)
+        )
         device = os.getenv("SHADOWKV_TEST_DEVICE", "cpu")
         self.q = torch.arange(32, dtype=torch.float32, device=device).reshape(2, 4, 4)
         self.k = torch.arange(16, dtype=torch.float32, device=device).reshape(2, 2, 4)
