@@ -113,6 +113,7 @@ else:
         shadowkv_kernels_available,
         shadowkv_packed_gqa,
         shadowkv_plan_reuse,
+        shadowkv_reconstruct,
         shadowkv_reconstruct_rope,
     )
     from sgl_kernel.speculative import (
@@ -198,6 +199,7 @@ else:
         "segment_packbits",
         "shadowkv_plan_reuse",
         "shadowkv_packed_gqa",
+        "shadowkv_reconstruct",
         "shadowkv_reconstruct_rope",
         "sgl_per_token_group_quant_8bit",
         "sgl_per_token_group_quant_fp8",

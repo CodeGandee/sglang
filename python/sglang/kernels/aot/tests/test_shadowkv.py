@@ -30,6 +30,10 @@ def _reconstruct_reference(u, sv, positions, inverse_frequencies):
     return (reconstructed * cosine + rotated_half * sine).to(torch.bfloat16)
 
 
+def _pre_rope_reconstruct_reference(u, sv, positions):
+    return torch.einsum("hnr,hrd->hnd", u[positions], sv)
+
+
 def _plan_reference(arguments, max_reuse, chunk_size):
     (
         previous,
@@ -90,35 +94,39 @@ def _packed_gqa_reference(query, keys, values, lengths):
             outputs.append(torch.zeros_like(query[row]))
             continue
         groups = query.shape[1] // keys.shape[1]
-        grouped = query[row].float().reshape(keys.shape[1], groups, 64)
+        head_dim = query.shape[-1]
+        grouped = query[row].float().reshape(keys.shape[1], groups, head_dim)
         scores = torch.einsum("hgd,hkd->hgk", grouped, keys[row, :, :length].float())
-        weights = torch.softmax(scores * 0.125, dim=-1)
+        weights = torch.softmax(scores * (head_dim**-0.5), dim=-1)
         output = torch.einsum("hgk,hkd->hgd", weights, values[row, :, :length].float())
-        outputs.append(output.reshape(query.shape[1], 64).to(torch.bfloat16))
+        outputs.append(output.reshape(query.shape[1], head_dim).to(torch.bfloat16))
     return torch.stack(outputs)
 
 
 @pytest.mark.parametrize(
-    "batch,query_heads,kv_heads,maximum_tokens,length_values",
+    "batch,query_heads,kv_heads,head_dim,maximum_tokens,length_values",
     [
-        (1, 4, 1, 1, [1]),
-        (2, 8, 2, 17, [0, 13]),
-        (3, 32, 8, 257, [257, 31, 129]),
-        (1, 32, 8, 2465, [2465]),
+        (1, 4, 1, 64, 1, [1]),
+        (2, 8, 2, 64, 17, [0, 13]),
+        (3, 32, 8, 64, 257, [257, 31, 129]),
+        (1, 32, 8, 64, 2465, [2465]),
+        (1, 32, 8, 128, 1, [1]),
+        (2, 32, 8, 128, 257, [257, 129]),
+        (1, 32, 4, 128, 2049, [2049]),
     ],
 )
 def test_shadowkv_packed_gqa_matches_ragged_reference(
-    batch, query_heads, kv_heads, maximum_tokens, length_values
+    batch, query_heads, kv_heads, head_dim, maximum_tokens, length_values
 ):
     torch.manual_seed(20260822 + batch + maximum_tokens)
-    query = (torch.randn((batch, query_heads, 64), device="cuda") * 0.125).to(
+    query = (torch.randn((batch, query_heads, head_dim), device="cuda") * 0.125).to(
         torch.bfloat16
     )
     keys = (
-        torch.randn((batch, kv_heads, maximum_tokens, 64), device="cuda") * 0.125
+        torch.randn((batch, kv_heads, maximum_tokens, head_dim), device="cuda") * 0.125
     ).to(torch.bfloat16)
     values = (
-        torch.randn((batch, kv_heads, maximum_tokens, 64), device="cuda") * 0.125
+        torch.randn((batch, kv_heads, maximum_tokens, head_dim), device="cuda") * 0.125
     ).to(torch.bfloat16)
     lengths = torch.tensor(length_values, dtype=torch.int32, device="cuda")
     expected = _packed_gqa_reference(query, keys, values, lengths)
@@ -133,19 +141,29 @@ def test_shadowkv_packed_gqa_matches_ragged_reference(
 
     assert actual.data_ptr() == output.data_ptr()
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    assert torch.equal(actual, expected)
-    if maximum_tokens == 2465:
-        grouped = query[0].float().reshape(kv_heads, query_heads // kv_heads, 64)
+    if head_dim == 64:
+        assert torch.equal(actual, expected)
+    if head_dim == 64 and maximum_tokens == 2465:
+        grouped = (
+            query[0]
+            .float()
+            .reshape(
+                kv_heads,
+                query_heads // kv_heads,
+                head_dim,
+            )
+        )
         expected_scores = torch.einsum("hgd,hkd->hgk", grouped, keys[0].float())
-        expected_weights = torch.softmax(expected_scores * 0.125, dim=-1)
+        expected_weights = torch.softmax(expected_scores * (head_dim**-0.5), dim=-1)
         assert torch.equal(
             scratch[0], expected_weights.reshape(query_heads, maximum_tokens)
         )
 
 
-def test_shadowkv_packed_gqa_replays_with_mutable_static_inputs():
-    query = torch.zeros((1, 4, 64), dtype=torch.bfloat16, device="cuda")
-    keys = torch.zeros((1, 1, 17, 64), dtype=torch.bfloat16, device="cuda")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_shadowkv_packed_gqa_replays_with_mutable_static_inputs(head_dim):
+    query = torch.zeros((1, 4, head_dim), dtype=torch.bfloat16, device="cuda")
+    keys = torch.zeros((1, 1, 17, head_dim), dtype=torch.bfloat16, device="cuda")
     values = torch.zeros_like(keys)
     lengths = torch.ones((1,), dtype=torch.int32, device="cuda")
     scratch = torch.empty((1, 4, 17), dtype=torch.float32, device="cuda")
@@ -186,6 +204,26 @@ def test_shadowkv_packed_gqa_replays_with_mutable_static_inputs():
     graph.replay()
 
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_shadowkv_packed_gqa_rejects_unqualified_head_dimension():
+    query = torch.zeros((1, 4, 96), dtype=torch.bfloat16, device="cuda")
+    keys = torch.zeros((1, 1, 17, 96), dtype=torch.bfloat16, device="cuda")
+    values = torch.zeros_like(keys)
+    lengths = torch.ones((1,), dtype=torch.int32, device="cuda")
+
+    with pytest.raises(ValueError, match="64 or 128"):
+        sgl_kernel.shadowkv_packed_gqa(query, keys, values, lengths)
+
+
+def test_shadowkv_packed_gqa_rejects_zero_kv_heads_before_division():
+    query = torch.zeros((1, 4, 128), dtype=torch.bfloat16, device="cuda")
+    keys = torch.zeros((1, 0, 17, 128), dtype=torch.bfloat16, device="cuda")
+    values = torch.zeros_like(keys)
+    lengths = torch.ones((1,), dtype=torch.int32, device="cuda")
+
+    with pytest.raises(ValueError, match="positive"):
+        sgl_kernel.shadowkv_packed_gqa(query, keys, values, lengths)
 
 
 @pytest.mark.parametrize(
@@ -274,6 +312,95 @@ def test_shadowkv_reconstruct_rope_rejects_unsupported_input(mutation, message):
 
     with pytest.raises(ValueError, match=message):
         sgl_kernel.shadowkv_reconstruct_rope(u, sv, positions, inverse)
+
+
+@pytest.mark.parametrize(
+    "rank,tokens,position_rows",
+    [
+        (64, 1, [[]]),
+        (128, 1, [[0]]),
+        (160, 257, [[0, 1, 7, 8, 127, 128, 256], [256, 8, 8, 1, 0, 128, 7]]),
+        (
+            256,
+            4097,
+            [
+                [4096, 0, 4096, 31, 32, 2047, 2048],
+                [2048, 2047, 32, 31, 4096, 0, 1],
+                [1, 1, 2, 3, 5, 8, 13],
+            ],
+        ),
+    ],
+)
+def test_shadowkv_reconstruct_matches_ragged_adversarial_reference(
+    rank, tokens, position_rows
+):
+    torch.manual_seed(20260824 + rank + tokens)
+    heads = len(position_rows)
+    u = (torch.randn((tokens, rank), device="cuda") * 0.125).to(torch.bfloat16)
+    sv = (torch.randn((heads, rank, 128), device="cuda") * 0.125).to(torch.bfloat16)
+    positions = torch.tensor(position_rows, dtype=torch.int64, device="cuda").reshape(
+        heads, -1
+    )
+    expected = _pre_rope_reconstruct_reference(u, sv, positions)
+
+    guard = 117
+    output_elements = heads * positions.shape[1] * 128
+    storage = torch.full(
+        (guard + output_elements + guard,),
+        91,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = storage[guard : guard + output_elements].view(
+        heads, positions.shape[1], 128
+    )
+    actual = sgl_kernel.shadowkv_reconstruct(u, sv, positions, out=output)
+
+    torch.testing.assert_close(actual, expected, rtol=4e-2, atol=4e-2)
+    assert torch.equal(actual, expected)
+    assert torch.equal(storage[:guard], torch.full_like(storage[:guard], 91))
+    assert torch.equal(storage[-guard:], torch.full_like(storage[-guard:], 91))
+    repeated = sgl_kernel.shadowkv_reconstruct(u, sv, positions)
+    assert torch.equal(actual, repeated)
+    strided_storage = torch.empty(
+        (heads, positions.shape[1] + 3, 128),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    strided_output = strided_storage[:, : positions.shape[1]]
+    sgl_kernel.shadowkv_reconstruct(u, sv, positions, out=strided_output)
+    assert torch.equal(actual, strided_output)
+
+
+@pytest.mark.parametrize(
+    "mutation,message",
+    [
+        ("u-dtype", "u must use"),
+        ("rank-32", "rank must be one of"),
+        ("rank-96", "rank must be one of"),
+        ("rank-192", "rank must be one of"),
+        ("sv-rank", r"\[kv_heads, rank, 128\]"),
+        ("sv-head-dim", r"\[kv_heads, rank, 128\]"),
+        ("negative-position", "positions exceed"),
+        ("large-position", "positions exceed"),
+    ],
+)
+def test_shadowkv_reconstruct_rejects_unsupported_input(mutation, message):
+    rank = int(mutation.removeprefix("rank-")) if mutation.startswith("rank-") else 160
+    u = torch.zeros((8, rank), dtype=torch.bfloat16, device="cuda")
+    sv_rank = 128 if mutation == "sv-rank" else rank
+    head_dim = 127 if mutation == "sv-head-dim" else 128
+    sv = torch.zeros((2, sv_rank, head_dim), dtype=torch.bfloat16, device="cuda")
+    positions = torch.zeros((2, 1), dtype=torch.int64, device="cuda")
+    if mutation == "u-dtype":
+        u = u.float()
+    elif mutation == "negative-position":
+        positions[0, 0] = -1
+    elif mutation == "large-position":
+        positions[0, 0] = 8
+
+    with pytest.raises(ValueError, match=message):
+        sgl_kernel.shadowkv_reconstruct(u, sv, positions)
 
 
 @pytest.mark.parametrize(

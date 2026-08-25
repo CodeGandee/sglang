@@ -23,12 +23,10 @@ limitations under the License.
 #include <cfloat>
 #include <cstdint>
 #include <limits>
-
 #include "utils.h"
 
 namespace {
 
-constexpr int kHeadDim = 64;
 constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
 constexpr int kWarps = kThreads / kWarpSize;
@@ -101,6 +99,7 @@ __device__ __forceinline__ float block_sum(float value, float* shared) {
   return shared[0];
 }
 
+template <int HeadDim>
 __global__ void shadowkv_packed_gqa_kernel(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ keys,
@@ -122,14 +121,14 @@ __global__ void shadowkv_packed_gqa_kernel(
   const int kv_head = query_head / groups;
   const int length = max(0, min(lengths[batch], maximum_tokens));
   const int64_t query_offset =
-      (static_cast<int64_t>(batch) * query_heads + query_head) * kHeadDim;
+      (static_cast<int64_t>(batch) * query_heads + query_head) * HeadDim;
   const int64_t kv_base =
-      (static_cast<int64_t>(batch) * kv_heads + kv_head) * maximum_tokens * kHeadDim;
+      (static_cast<int64_t>(batch) * kv_heads + kv_head) * maximum_tokens * HeadDim;
   const int64_t weight_base =
       (static_cast<int64_t>(batch) * query_heads + query_head) * maximum_tokens;
 
   if (length == 0) {
-    if (threadIdx.x < kHeadDim) {
+    if (threadIdx.x < HeadDim) {
       output[query_offset + threadIdx.x] = __float2bfloat16_rn(0.0f);
     }
     return;
@@ -138,7 +137,7 @@ __global__ void shadowkv_packed_gqa_kernel(
   __shared__ float reduction[kReferenceSoftmaxThreads];
   float local_max = -FLT_MAX;
   for (int token = threadIdx.x; token < length; token += blockDim.x) {
-    const int64_t key_offset = kv_base + static_cast<int64_t>(token) * kHeadDim;
+    const int64_t key_offset = kv_base + static_cast<int64_t>(token) * HeadDim;
     float score = 0.0f;
     // The locked B200 PyTorch GEMM switches to sixteen interleaved K-lane
     // accumulators above this qualified Llama GQA row width. Matching that
@@ -149,7 +148,7 @@ __global__ void shadowkv_packed_gqa_kernel(
       for (int lane = 0; lane < 16; ++lane) {
         float accumulated = 0.0f;
 #pragma unroll
-        for (int dimension = lane; dimension < kHeadDim; dimension += 16) {
+        for (int dimension = lane; dimension < HeadDim; dimension += 16) {
           accumulated += __bfloat162float(query[query_offset + dimension]) *
               __bfloat162float(keys[key_offset + dimension]);
         }
@@ -162,12 +161,12 @@ __global__ void shadowkv_packed_gqa_kernel(
       }
     } else {
 #pragma unroll
-      for (int dimension = 0; dimension < kHeadDim; ++dimension) {
+      for (int dimension = 0; dimension < HeadDim; ++dimension) {
         score += __bfloat162float(query[query_offset + dimension]) *
             __bfloat162float(keys[key_offset + dimension]);
       }
     }
-    score *= 0.125f;
+    score *= rsqrtf(static_cast<float>(HeadDim));
     weights[weight_base + token] = score;
     local_max = fmaxf(local_max, score);
   }
@@ -220,7 +219,7 @@ __global__ void shadowkv_packed_gqa_kernel(
   }
   __syncthreads();
 
-  if (threadIdx.x < kHeadDim) {
+  if (threadIdx.x < HeadDim) {
     const int dimension = threadIdx.x;
     float result;
     if (length > kReferenceSoftmaxLargeRowThreshold) {
@@ -229,7 +228,7 @@ __global__ void shadowkv_packed_gqa_kernel(
       double accumulated = 0.0;
       for (int token = 0; token < length; ++token) {
         const int64_t value_offset =
-            kv_base + static_cast<int64_t>(token) * kHeadDim + dimension;
+            kv_base + static_cast<int64_t>(token) * HeadDim + dimension;
         accumulated += static_cast<double>(weights[weight_base + token]) *
             static_cast<double>(__bfloat162float(values[value_offset]));
       }
@@ -238,7 +237,7 @@ __global__ void shadowkv_packed_gqa_kernel(
       float accumulated = 0.0f;
       for (int token = 0; token < length; ++token) {
         const int64_t value_offset =
-            kv_base + static_cast<int64_t>(token) * kHeadDim + dimension;
+            kv_base + static_cast<int64_t>(token) * HeadDim + dimension;
         accumulated += weights[weight_base + token] *
             __bfloat162float(values[value_offset]);
       }
@@ -246,6 +245,29 @@ __global__ void shadowkv_packed_gqa_kernel(
     }
     output[query_offset + dimension] = __float2bfloat16_rn(result);
   }
+}
+
+template <int HeadDim>
+void launch_shadowkv_packed_gqa(
+    const at::Tensor& query,
+    const at::Tensor& keys,
+    const at::Tensor& values,
+    const at::Tensor& lengths,
+    at::Tensor& weights,
+    at::Tensor& output,
+    int blocks,
+    cudaStream_t stream) {
+  shadowkv_packed_gqa_kernel<HeadDim><<<blocks, kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(query.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const __nv_bfloat16*>(keys.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const __nv_bfloat16*>(values.data_ptr<at::BFloat16>()),
+      lengths.data_ptr<int32_t>(),
+      weights.data_ptr<float>(),
+      reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+      static_cast<int>(query.size(0)),
+      static_cast<int>(query.size(1)),
+      static_cast<int>(keys.size(1)),
+      static_cast<int>(keys.size(2)));
 }
 
 }  // namespace
@@ -269,10 +291,15 @@ void shadowkv_packed_gqa(
   TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16, "output must use bfloat16");
   TORCH_CHECK(lengths.scalar_type() == at::ScalarType::Int, "lengths must use int32");
   TORCH_CHECK(weights.scalar_type() == at::ScalarType::Float, "weights must use float32");
-  TORCH_CHECK(query.dim() == 3 && query.size(2) == kHeadDim, "query must have shape [batch, q_heads, 64]");
-  TORCH_CHECK(keys.dim() == 4 && keys.size(3) == kHeadDim, "keys must have shape [batch, kv_heads, tokens, 64]");
+  TORCH_CHECK(
+      query.dim() == 3 && (query.size(2) == 64 || query.size(2) == 128),
+      "query head dimension must be 64 or 128");
+  TORCH_CHECK(
+      keys.dim() == 4 && keys.size(3) == query.size(2),
+      "keys must match the query head dimension");
   TORCH_CHECK(values.sizes() == keys.sizes(), "values must match the packed key shape");
   TORCH_CHECK(query.size(0) == keys.size(0), "query and packed KV batch dimensions differ");
+  TORCH_CHECK(query.size(0) > 0 && query.size(1) > 0 && keys.size(1) > 0, "packed GQA dimensions must be positive");
   TORCH_CHECK(query.size(1) % keys.size(1) == 0, "query heads must be divisible by KV heads");
   TORCH_CHECK(lengths.dim() == 1 && lengths.size(0) == query.size(0), "lengths must have shape [batch]");
   TORCH_CHECK(
@@ -284,7 +311,6 @@ void shadowkv_packed_gqa(
       query.device() == keys.device() && query.device() == values.device() && query.device() == lengths.device() &&
           query.device() == weights.device() && query.device() == output.device(),
       "all shadowkv_packed_gqa tensors must share one CUDA device");
-  TORCH_CHECK(query.size(0) > 0 && query.size(1) > 0 && keys.size(1) > 0, "packed GQA dimensions must be positive");
   TORCH_CHECK(keys.size(2) > 0, "packed GQA token capacity must be positive");
   TORCH_CHECK(
       query.size(0) * query.size(1) <= static_cast<int64_t>(std::numeric_limits<int>::max()),
@@ -294,16 +320,12 @@ void shadowkv_packed_gqa(
   check_b200(query);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int blocks = static_cast<int>(query.size(0) * query.size(1));
-  shadowkv_packed_gqa_kernel<<<blocks, kThreads, 0, stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(query.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const __nv_bfloat16*>(keys.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const __nv_bfloat16*>(values.data_ptr<at::BFloat16>()),
-      lengths.data_ptr<int32_t>(),
-      weights.data_ptr<float>(),
-      reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
-      static_cast<int>(query.size(0)),
-      static_cast<int>(query.size(1)),
-      static_cast<int>(keys.size(1)),
-      static_cast<int>(keys.size(2)));
+  if (query.size(2) == 64) {
+    launch_shadowkv_packed_gqa<64>(
+        query, keys, values, lengths, weights, output, blocks, stream);
+  } else {
+    launch_shadowkv_packed_gqa<128>(
+        query, keys, values, lengths, weights, output, blocks, stream);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

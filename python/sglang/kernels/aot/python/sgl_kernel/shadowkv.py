@@ -30,7 +30,8 @@ def shadowkv_kernels_available() -> bool:
     """Return whether this wheel contains the optional ShadowKV operators."""
 
     return (
-        hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct_rope")
+        hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct_rope")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_reuse")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_packed_gqa")
     )
@@ -52,14 +53,21 @@ def shadowkv_packed_gqa(
     _require_tensor("keys", keys, dtype=torch.bfloat16, dimensions=4)
     _require_tensor("values", values, dtype=torch.bfloat16, dimensions=4)
     _require_tensor("lengths", lengths, dtype=torch.int32, dimensions=1)
-    if query.shape[-1] != 64:
-        raise ValueError("query must have shape [batch, q_heads, 64]")
-    if keys.shape[-1] != 64:
-        raise ValueError("keys must have shape [batch, kv_heads, tokens, 64]")
+    if query.shape[-1] not in (64, 128):
+        raise ValueError("query head dimension must be 64 or 128")
+    if keys.shape[-1] != query.shape[-1]:
+        raise ValueError("keys must match the query head dimension")
     if values.shape != keys.shape:
         raise ValueError("values must match the packed key shape")
     if query.shape[0] != keys.shape[0]:
         raise ValueError("query and packed KV batch dimensions differ")
+    if (
+        query.shape[0] < 1
+        or query.shape[1] < 1
+        or keys.shape[1] < 1
+        or keys.shape[2] < 1
+    ):
+        raise ValueError("packed GQA dimensions must be positive")
     if query.shape[1] % keys.shape[1]:
         raise ValueError("query heads must be divisible by KV heads")
     if lengths.shape != (query.shape[0],):
@@ -181,6 +189,50 @@ def shadowkv_reconstruct_rope(
     torch.ops.sgl_kernel.shadowkv_reconstruct_rope.default(
         u, sv, positions, inverse_frequencies, out
     )
+    return out
+
+
+def shadowkv_reconstruct(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gather U and reconstruct 128-element pre-RoPE keys on B200."""
+
+    _require_tensor("u", u, dtype=torch.bfloat16, dimensions=2)
+    _require_tensor("sv", sv, dtype=torch.bfloat16, dimensions=3)
+    _require_tensor("positions", positions, dtype=torch.int64, dimensions=2)
+    approved_ranks = (64, 128, 160, 256)
+    if u.shape[1] not in approved_ranks:
+        raise ValueError("rank must be one of 64, 128, 160, or 256")
+    if sv.shape[1:] != (u.shape[1], 128):
+        raise ValueError("sv must have shape [kv_heads, rank, 128]")
+    if positions.shape[0] != sv.shape[0]:
+        raise ValueError("positions and sv must have the same kv_heads")
+    if u.shape[0] < 1:
+        raise ValueError("u must contain at least one token")
+    device = u.device
+    if any(tensor.device != device for tensor in (sv, positions)):
+        raise ValueError("all reconstruction tensors must share one CUDA device")
+    if positions.numel() and (
+        int(positions.min().item()) < 0 or int(positions.max().item()) >= u.shape[0]
+    ):
+        raise ValueError("positions exceed the U token dimension")
+    _require_b200(device)
+    expected_shape = (sv.shape[0], positions.shape[1], 128)
+    if out is None:
+        out = torch.empty(expected_shape, dtype=torch.bfloat16, device=device)
+    else:
+        if out.dtype != torch.bfloat16 or out.ndim != 3 or not out.is_cuda:
+            raise ValueError("out must be a 3D CUDA bfloat16 tensor")
+        if out.stride(-1) != 1:
+            raise ValueError("out must be contiguous in its head dimension")
+        if out.shape != expected_shape:
+            raise ValueError(f"out must have shape {expected_shape}")
+        if out.device != device:
+            raise ValueError("out must share the reconstruction CUDA device")
+    torch.ops.sgl_kernel.shadowkv_reconstruct.default(u, sv, positions, out)
     return out
 
 

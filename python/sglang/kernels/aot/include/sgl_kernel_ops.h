@@ -113,6 +113,11 @@ int64_t cutlass_mla_get_workspace_size(
     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 
 #ifdef SGL_KERNEL_ENABLE_SHADOWKV
+void shadowkv_reconstruct(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    const at::Tensor& positions,
+    at::Tensor& output);
 void shadowkv_reconstruct_rope(
     const at::Tensor& u,
     const at::Tensor& sv,

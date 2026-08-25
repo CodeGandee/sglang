@@ -416,7 +416,9 @@ class ReqToTokenPool:
         if self.cache_lifecycle is not None:
             self.cache_lifecycle.reset()
         self.free_slots = list(range(1, self._alloc_size))
-        self.req_generation.zero_()
+        # Generation identifies a slot use across the lifetime of this pool.
+        # Keep it monotonic across an idle clear so provider-owned bounded
+        # history cannot mistake the next allocation for an old generation.
 
 
 class MambaPool:

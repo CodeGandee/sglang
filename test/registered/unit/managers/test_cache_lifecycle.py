@@ -8,6 +8,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.benchmark.one_batch import _TorchBenchRunner
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.cache_lifecycle import (
     CacheAllocation,
@@ -72,6 +73,50 @@ def _make_pool(callbacks: _RecordingCallbacks, *, size: int = 2):
 
 
 class TestCacheLifecycle(unittest.TestCase):
+    def test_one_batch_cleanup_terminates_allocations_before_pool_reset(self):
+        events = []
+        request = SimpleNamespace(req_pool_idx=1)
+
+        class _RequestPool:
+            def free(self, req, *, terminal_reason, terminal_detail):
+                events.append(("free", terminal_reason, terminal_detail))
+                req.req_pool_idx = None
+
+            def clear(self):
+                self.assert_no_active_request()
+                events.append(("request-pool-clear",))
+
+            def assert_no_active_request(self):
+                if request.req_pool_idx is not None:
+                    raise RuntimeError("request allocation is still active")
+
+        class _TokenAllocator:
+            def clear(self):
+                events.append(("token-pool-clear",))
+
+        runner = _TorchBenchRunner(
+            SimpleNamespace(
+                req_to_token_pool=_RequestPool(),
+                token_to_kv_pool_allocator=_TokenAllocator(),
+            )
+        )
+
+        runner.cleanup(SimpleNamespace(reqs=[request]))
+        runner.clear()
+
+        self.assertEqual(
+            events,
+            [
+                (
+                    "free",
+                    CacheTerminalReason.COMPLETION,
+                    "one-batch benchmark cleanup",
+                ),
+                ("request-pool-clear",),
+                ("token-pool-clear",),
+            ],
+        )
+
     def test_completion_precedes_batch_filter(self):
         callbacks = _RecordingCallbacks()
         pool = _make_pool(callbacks)
@@ -132,6 +177,27 @@ class TestCacheLifecycle(unittest.TestCase):
         terminal = [event for kind, event in callbacks.events if kind == "terminal"]
         self.assertEqual(len(terminal), 1)
         self.assertEqual(terminal[0].reason, CacheTerminalReason.RETRACTION)
+
+    def test_idle_pool_clear_preserves_monotonic_slot_generation(self):
+        callbacks = _RecordingCallbacks()
+        pool = _make_pool(callbacks, size=1)
+        first = _make_req("before-clear")
+
+        pool.alloc([first])
+        first_allocation = pool.cache_allocation(first)
+        pool.publish_cache_allocations([first])
+        pool.free(first, terminal_reason=CacheTerminalReason.COMPLETION)
+        pool.clear()
+
+        second = _make_req("after-clear")
+        pool.alloc([second])
+        second_allocation = pool.cache_allocation(second)
+
+        self.assertEqual(
+            second_allocation.request_pool_index,
+            first_allocation.request_pool_index,
+        )
+        self.assertEqual(second_allocation.generation, first_allocation.generation + 1)
 
     def test_publication_failure_notifies_terminal_before_raising(self):
         callbacks = _RecordingCallbacks(fail_publication=True)

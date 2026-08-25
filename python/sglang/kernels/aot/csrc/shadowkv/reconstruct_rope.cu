@@ -29,6 +29,12 @@ namespace {
 constexpr int kHeadDim = 64;
 constexpr int kHalfHeadDim = kHeadDim / 2;
 constexpr int kRank = 160;
+constexpr int kGeneralHeadDim = 128;
+constexpr int kGatherThreads = 256;
+
+bool supported_general_rank(int64_t rank) {
+  return rank == 64 || rank == 128 || rank == 160 || rank == 256;
+}
 
 void check_b200(const at::Tensor& tensor) {
   cudaDeviceProp properties{};
@@ -78,7 +84,121 @@ __global__ void shadowkv_reconstruct_rope_kernel(
       __float2bfloat16_rn(__fadd_rn(direct_product, rotated_product));
 }
 
+template <int Rank>
+__global__ void shadowkv_gather_u_kernel(
+    const __nv_bfloat16* __restrict__ u,
+    const int64_t* __restrict__ positions,
+    __nv_bfloat16* __restrict__ gathered_u,
+    int selected_tokens) {
+  const int head = blockIdx.x / selected_tokens;
+  const int selected = blockIdx.x - head * selected_tokens;
+  const int64_t source_row =
+      positions[static_cast<int64_t>(head) * selected_tokens + selected];
+  const int64_t source_offset = source_row * Rank;
+  const int64_t destination_offset =
+      (static_cast<int64_t>(head) * selected_tokens + selected) * Rank;
+  for (int column = threadIdx.x; column < Rank; column += blockDim.x) {
+    gathered_u[destination_offset + column] = u[source_offset + column];
+  }
+}
+
+template <int Rank>
+void launch_shadowkv_gather_u(
+    const at::Tensor& u,
+    const at::Tensor& positions,
+    at::Tensor& gathered_u,
+    int blocks,
+    cudaStream_t stream) {
+  shadowkv_gather_u_kernel<Rank><<<blocks, kGatherThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(u.data_ptr<at::BFloat16>()),
+      positions.data_ptr<int64_t>(),
+      reinterpret_cast<__nv_bfloat16*>(gathered_u.data_ptr<at::BFloat16>()),
+      static_cast<int>(positions.size(1)));
+}
+
 }  // namespace
+
+void shadowkv_reconstruct(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    const at::Tensor& positions,
+    at::Tensor& output) {
+  CHECK_INPUT(u);
+  CHECK_INPUT(sv);
+  CHECK_INPUT(positions);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+  TORCH_CHECK(u.scalar_type() == at::ScalarType::BFloat16, "u must use bfloat16");
+  TORCH_CHECK(sv.scalar_type() == at::ScalarType::BFloat16, "sv must use bfloat16");
+  TORCH_CHECK(
+      output.scalar_type() == at::ScalarType::BFloat16,
+      "output must use bfloat16");
+  TORCH_CHECK(
+      positions.scalar_type() == at::ScalarType::Long,
+      "positions must use int64");
+  TORCH_CHECK(u.dim() == 2, "u must have shape [tokens, rank]");
+  TORCH_CHECK(
+      supported_general_rank(u.size(1)),
+      "rank must be one of 64, 128, 160, or 256");
+  TORCH_CHECK(
+      sv.dim() == 3 && sv.size(1) == u.size(1) &&
+          sv.size(2) == kGeneralHeadDim,
+      "sv must have shape [kv_heads, rank, 128]");
+  TORCH_CHECK(
+      positions.dim() == 2,
+      "positions must have shape [kv_heads, selected_tokens]");
+  TORCH_CHECK(
+      positions.size(0) == sv.size(0),
+      "positions and sv must have the same kv_heads");
+  TORCH_CHECK(
+      output.dim() == 3 && output.size(0) == sv.size(0) &&
+          output.size(1) == positions.size(1) &&
+          output.size(2) == kGeneralHeadDim,
+      "output must have shape [kv_heads, selected_tokens, 128]");
+  TORCH_CHECK(
+      u.device() == sv.device() && u.device() == positions.device() &&
+          u.device() == output.device(),
+      "all shadowkv_reconstruct tensors must share one CUDA device");
+  TORCH_CHECK(u.size(0) > 0, "u must contain at least one token");
+
+  c10::cuda::CUDAGuard device_guard(u.device());
+  check_b200(u);
+  if (positions.numel() == 0) {
+    return;
+  }
+  const int64_t minimum_position = positions.min().item<int64_t>();
+  const int64_t maximum_position = positions.max().item<int64_t>();
+  TORCH_CHECK(minimum_position >= 0, "positions must be nonnegative");
+  TORCH_CHECK(maximum_position < u.size(0), "positions exceed the U token dimension");
+  TORCH_CHECK(
+      sv.size(0) * positions.size(1) <=
+          static_cast<int64_t>(std::numeric_limits<int>::max()),
+      "reconstruction grid exceeds the CUDA launch bound");
+
+  at::Tensor gathered_u = at::empty(
+      {sv.size(0), positions.size(1), u.size(1)}, u.options());
+  const int blocks = static_cast<int>(sv.size(0) * positions.size(1));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  switch (u.size(1)) {
+    case 64:
+      launch_shadowkv_gather_u<64>(u, positions, gathered_u, blocks, stream);
+      break;
+    case 128:
+      launch_shadowkv_gather_u<128>(u, positions, gathered_u, blocks, stream);
+      break;
+    case 160:
+      launch_shadowkv_gather_u<160>(u, positions, gathered_u, blocks, stream);
+      break;
+    case 256:
+      launch_shadowkv_gather_u<256>(u, positions, gathered_u, blocks, stream);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported reconstruction rank");
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const at::Tensor reconstructed =
+      torch::einsum("hnr,hrd->hnd", {gathered_u, sv});
+  output.copy_(reconstructed);
+}
 
 void shadowkv_reconstruct_rope(
     const at::Tensor& u,

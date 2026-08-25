@@ -51,6 +51,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
 #ifdef SGL_KERNEL_ENABLE_SHADOWKV
   m.def(
+      "shadowkv_reconstruct(Tensor u, Tensor sv, Tensor positions, Tensor! output) -> ()");
+  m.impl("shadowkv_reconstruct", torch::kCUDA, &shadowkv_reconstruct);
+  m.def(
       "shadowkv_reconstruct_rope(Tensor u, Tensor sv, Tensor positions, Tensor inverse_frequencies, Tensor! output) "
       "-> ()");
   m.impl("shadowkv_reconstruct_rope", torch::kCUDA, &shadowkv_reconstruct_rope);
