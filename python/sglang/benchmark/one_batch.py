@@ -483,6 +483,16 @@ class TreeCacheNamespace(SimpleNamespace):
     def evict(self, params: EvictParams):
         pass
 
+    def available_and_evictable_str(self) -> str:
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        return (
+            f"Available tokens: {available_size} "
+            f"(available_size={available_size} + evictable_size=0)\n"
+        )
+
+    def pretty_print(self) -> str:
+        return ""
+
 
 @torch.no_grad
 def extend(reqs, model_runner):

@@ -8,7 +8,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.benchmark.one_batch import _TorchBenchRunner
+from sglang.benchmark.one_batch import TreeCacheNamespace, _TorchBenchRunner
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.cache_lifecycle import (
     CacheAllocation,
@@ -73,6 +73,16 @@ def _make_pool(callbacks: _RecordingCallbacks, *, size: int = 2):
 
 
 class TestCacheLifecycle(unittest.TestCase):
+    def test_one_batch_cache_reports_capacity_without_a_prefix_tree(self):
+        allocator = SimpleNamespace(available_size=lambda: 37)
+        cache = TreeCacheNamespace(token_to_kv_pool_allocator=allocator)
+
+        self.assertEqual(
+            cache.available_and_evictable_str(),
+            "Available tokens: 37 (available_size=37 + evictable_size=0)\n",
+        )
+        self.assertEqual(cache.pretty_print(), "")
+
     def test_one_batch_cleanup_terminates_allocations_before_pool_reset(self):
         events = []
         request = SimpleNamespace(req_pool_idx=1)
