@@ -28,10 +28,8 @@ ops, and the speculative-decoding / forward spans -- share one primitive.
 import logging
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
-from typing import Optional
 
 import torch
-
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -39,17 +37,37 @@ logger = logging.getLogger(__name__)
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
 
-_nvtx_module = None
+_nvtx_annotate = None
+NVTX_BACKEND = None
+
+
+@contextmanager
+def _torch_nvtx_range(debug_name: str, color: str | None = None):
+    """Provide the annotate protocol through PyTorch's built-in NVTX binding."""
+
+    del color
+    torch.cuda.nvtx.range_push(debug_name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 if _SCHEDULER_NVTX or _OPERATIONS_NVTX:
     try:
-        import nvtx as _nvtx_module  # type: ignore
+        import nvtx as _nvtx_module  # type: ignore[import-not-found]
+
+        _nvtx_annotate = _nvtx_module.annotate
+        NVTX_BACKEND = "nvtx-package"
     except ImportError:
-        logger.warning(
-            "An SGLANG_ENABLE_NVTX_* flag is set, but the `nvtx` package is "
-            "missing. NVTX markers are disabled; torch profiler spans still emit."
+        _nvtx_annotate = _torch_nvtx_range
+        NVTX_BACKEND = "torch-cuda-nvtx"
+        logger.info(
+            "An SGLANG_ENABLE_NVTX_* flag is set without the optional `nvtx` "
+            "package; using torch.cuda.nvtx."
         )
 
-NVTX_AVAILABLE = _nvtx_module is not None
+NVTX_AVAILABLE = _nvtx_annotate is not None
 # Per-subsystem nvtx gates: emit nvtx ranges only when the flag is set AND the
 # package is importable. The record_function path is independent of both.
 NVTX_SCHEDULER_ENABLED = _SCHEDULER_NVTX and NVTX_AVAILABLE
@@ -69,7 +87,7 @@ _NULL_CONTEXT = nullcontext()
 
 @contextmanager
 def _profile_range_impl(
-    debug_name: str, color: Optional[str], record: bool, nvtx_enabled: bool
+    debug_name: str, color: str | None, record: bool, nvtx_enabled: bool
 ):
     with ExitStack() as stack:
         if record:
@@ -77,12 +95,12 @@ def _profile_range_impl(
         if nvtx_enabled:
             if color is None:
                 color = _NVTX_COLOR_MAP.get(debug_name)
-            stack.enter_context(_nvtx_module.annotate(debug_name, color=color))
+            stack.enter_context(_nvtx_annotate(debug_name, color=color))
         yield
 
 
 def profile_range(
-    debug_name: str, *, color: Optional[str] = None, nvtx_enabled: bool = False
+    debug_name: str, *, color: str | None = None, nvtx_enabled: bool = False
 ):
     """Context manager emitting a profiler span for ``debug_name``.
 
@@ -98,7 +116,7 @@ def profile_range(
 
 
 def profile_method(
-    debug_name: str, *, color: Optional[str] = None, nvtx_enabled: bool = False
+    debug_name: str, *, color: str | None = None, nvtx_enabled: bool = False
 ):
     """Decorator form of ``profile_range``."""
 
