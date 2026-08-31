@@ -77,8 +77,10 @@ def shadowkv_kernels_available() -> bool:
     return (
         hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct_rope")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_place_device")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_device")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_reuse")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_publish_device")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_packed_gqa")
     )
 
@@ -425,6 +427,222 @@ def shadowkv_plan_device(
         miss_ordinals=miss_ordinals,
         counts=counts,
         error_codes=error_codes,
+    )
+
+
+def shadowkv_place_device(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    compatibility_key_values: torch.Tensor,
+    destination_key_values: torch.Tensor,
+    *,
+    plan_capacity: int,
+) -> torch.Tensor:
+    """Place temporal hits and full-work compatibility outputs into one stable slot."""
+
+    inputs = (
+        ("component_kinds", component_kinds, torch.int8, 3),
+        ("source_slots", source_slots, torch.int32, 3),
+        ("destination_slots", destination_slots, torch.int32, 3),
+        ("plan_slots", plan_slots, torch.int32, 1),
+        ("planner_error_codes", planner_error_codes, torch.int32, 1),
+        ("temporal_key_values", temporal_key_values, torch.bfloat16, 7),
+        (
+            "compatibility_key_values",
+            compatibility_key_values,
+            torch.bfloat16,
+            5,
+        ),
+        (
+            "destination_key_values",
+            destination_key_values,
+            torch.bfloat16,
+            5,
+        ),
+    )
+    for name, tensor, dtype, dimensions in inputs:
+        _require_tensor(name, tensor, dtype=dtype, dimensions=dimensions)
+    if component_kinds.shape[0] != 2:
+        raise ValueError("component_kinds must have shape [2, heads, selected]")
+    heads, selected_capacity = component_kinds.shape[1:]
+    if not 1 <= selected_capacity <= 256 or heads < 1:
+        raise ValueError("placement heads and selected capacity are outside bounds")
+    if (
+        source_slots.shape != component_kinds.shape
+        or destination_slots.shape != component_kinds.shape
+    ):
+        raise ValueError("placement plan tensors must share shape [2, heads, selected]")
+    if plan_slots.shape != (heads,) or planner_error_codes.shape != (heads,):
+        raise ValueError("placement row tensors must have shape [heads]")
+    if temporal_key_values.shape[0] != 2 or temporal_key_values.shape[3] != heads:
+        raise ValueError("temporal K/V component or head dimensions differ")
+    if temporal_key_values.shape[-2:] != (8, 128):
+        raise ValueError("temporal K/V must use chunk_size=8 and head_dim=128")
+    expected_output = (2, heads, selected_capacity, 8, 128)
+    if compatibility_key_values.shape != expected_output:
+        raise ValueError(f"compatibility_key_values must have shape {expected_output}")
+    if destination_key_values.shape != expected_output:
+        raise ValueError(f"destination_key_values must have shape {expected_output}")
+    if isinstance(plan_capacity, bool) or not isinstance(plan_capacity, int):
+        raise TypeError("plan_capacity must be an integer")
+    if plan_capacity < 1:
+        raise ValueError("plan_capacity must be positive")
+    device = component_kinds.device
+    if any(tensor.device != device for _, tensor, _, _ in inputs):
+        raise ValueError("all placement tensors must share one CUDA device")
+    _require_b200(device)
+    torch.ops.sgl_kernel.shadowkv_place_device.default(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        compatibility_key_values,
+        plan_capacity,
+        destination_key_values,
+    )
+    return destination_key_values
+
+
+def shadowkv_publish_device(
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    exact_chunk_ids: torch.Tensor,
+    exact_lengths: torch.Tensor,
+    row_indices: torch.Tensor,
+    row_generations: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    destination_key_values: torch.Tensor,
+    temporal_request_generations: torch.Tensor,
+    temporal_layout_generations: torch.Tensor,
+    temporal_chunk_ids: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    temporal_publication_generations: torch.Tensor,
+    temporal_component_validity: torch.Tensor,
+) -> None:
+    """Publish the effective selected prefix after a caller-ordered completion."""
+
+    inputs = (
+        ("selected_chunk_ids", selected_chunk_ids, torch.int32, 2),
+        ("selected_lengths", selected_lengths, torch.int32, 1),
+        ("exact_chunk_ids", exact_chunk_ids, torch.int32, 2),
+        ("exact_lengths", exact_lengths, torch.int32, 1),
+        ("row_indices", row_indices, torch.int32, 2),
+        ("row_generations", row_generations, torch.int64, 2),
+        ("planner_error_codes", planner_error_codes, torch.int32, 1),
+        (
+            "destination_key_values",
+            destination_key_values,
+            torch.bfloat16,
+            5,
+        ),
+        (
+            "temporal_request_generations",
+            temporal_request_generations,
+            torch.int64,
+            1,
+        ),
+        (
+            "temporal_layout_generations",
+            temporal_layout_generations,
+            torch.int64,
+            1,
+        ),
+        ("temporal_chunk_ids", temporal_chunk_ids, torch.int32, 4),
+        ("temporal_key_values", temporal_key_values, torch.bfloat16, 7),
+        (
+            "temporal_publication_generations",
+            temporal_publication_generations,
+            torch.int64,
+            5,
+        ),
+        (
+            "temporal_component_validity",
+            temporal_component_validity,
+            torch.uint8,
+            5,
+        ),
+    )
+    for name, tensor, dtype, dimensions in inputs:
+        _require_tensor(name, tensor, dtype=dtype, dimensions=dimensions)
+    heads, selected_capacity = selected_chunk_ids.shape
+    exact_capacity = exact_chunk_ids.shape[1]
+    request_slots, local_layers, temporal_heads, temporal_capacity = (
+        temporal_chunk_ids.shape
+    )
+    if heads < 1 or not 1 <= selected_capacity <= 256:
+        raise ValueError("publication heads or selected capacity are outside bounds")
+    if exact_capacity > 64 or temporal_capacity > selected_capacity:
+        raise ValueError("publication exact or temporal capacity is outside bounds")
+    if (
+        selected_lengths.shape != (heads,)
+        or exact_chunk_ids.shape[0] != heads
+        or exact_lengths.shape != (heads,)
+        or row_indices.shape != (heads, 3)
+        or row_generations.shape != (heads, 3)
+        or planner_error_codes.shape != (heads,)
+    ):
+        raise ValueError("publication row tensors have incompatible shapes")
+    if temporal_heads != heads:
+        raise ValueError("publication temporal and selected head counts differ")
+    expected_destination = (2, heads, selected_capacity, 8, 128)
+    if destination_key_values.shape != expected_destination:
+        raise ValueError(
+            f"destination_key_values must have shape {expected_destination}"
+        )
+    expected_temporal_values = (
+        2,
+        request_slots,
+        local_layers,
+        heads,
+        temporal_capacity,
+        8,
+        128,
+    )
+    if temporal_key_values.shape != expected_temporal_values:
+        raise ValueError(
+            f"temporal_key_values must have shape {expected_temporal_values}"
+        )
+    expected_component_metadata = (
+        2,
+        request_slots,
+        local_layers,
+        heads,
+        temporal_capacity,
+    )
+    if (
+        temporal_publication_generations.shape != expected_component_metadata
+        or temporal_component_validity.shape != expected_component_metadata
+    ):
+        raise ValueError("temporal component metadata shapes differ")
+    if temporal_request_generations.shape != (
+        request_slots,
+    ) or temporal_layout_generations.shape != (request_slots,):
+        raise ValueError("temporal owner generations must have shape [request_slots]")
+    device = selected_chunk_ids.device
+    if any(tensor.device != device for _, tensor, _, _ in inputs):
+        raise ValueError("all publication tensors must share one CUDA device")
+    _require_b200(device)
+    torch.ops.sgl_kernel.shadowkv_publish_device.default(
+        selected_chunk_ids,
+        selected_lengths,
+        exact_chunk_ids,
+        exact_lengths,
+        row_indices,
+        row_generations,
+        planner_error_codes,
+        destination_key_values,
+        temporal_request_generations,
+        temporal_layout_generations,
+        temporal_chunk_ids,
+        temporal_key_values,
+        temporal_publication_generations,
+        temporal_component_validity,
     )
 
 

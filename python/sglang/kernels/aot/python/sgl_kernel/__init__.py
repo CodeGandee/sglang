@@ -113,8 +113,10 @@ else:
         ShadowKVReusePlan,
         shadowkv_kernels_available,
         shadowkv_packed_gqa,
+        shadowkv_place_device,
         shadowkv_plan_device,
         shadowkv_plan_reuse,
+        shadowkv_publish_device,
         shadowkv_reconstruct,
         shadowkv_reconstruct_rope,
     )

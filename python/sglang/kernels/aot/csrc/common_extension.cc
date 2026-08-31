@@ -66,6 +66,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "miss_ordinals, Tensor! counts, Tensor! error_codes) -> ()");
   m.impl("shadowkv_plan_device", torch::kCUDA, &shadowkv_plan_device);
   m.def(
+      "shadowkv_place_device(Tensor component_kinds, Tensor source_slots, Tensor destination_slots, Tensor "
+      "plan_slots, Tensor! planner_error_codes, Tensor temporal_key_values, Tensor compatibility_key_values, int "
+      "plan_capacity, Tensor! destination_key_values) -> ()");
+  m.impl("shadowkv_place_device", torch::kCUDA, &shadowkv_place_device);
+  m.def(
+      "shadowkv_publish_device(Tensor selected_chunk_ids, Tensor selected_lengths, Tensor exact_chunk_ids, Tensor "
+      "exact_lengths, Tensor row_indices, Tensor row_generations, Tensor planner_error_codes, Tensor "
+      "destination_key_values, Tensor temporal_request_generations, Tensor temporal_layout_generations, Tensor! "
+      "temporal_chunk_ids, Tensor! temporal_key_values, Tensor! temporal_publication_generations, Tensor! "
+      "temporal_component_validity) -> ()");
+  m.impl("shadowkv_publish_device", torch::kCUDA, &shadowkv_publish_device);
+  m.def(
       "shadowkv_plan_reuse(Tensor previous_chunks, Tensor previous_lengths, Tensor current_chunks, Tensor "
       "current_lengths, Tensor exact_chunks, Tensor exact_lengths, Tensor cached_generations, Tensor "
       "current_generations, int max_reuse_chunks, int chunk_size, Tensor! plan, Tensor! "

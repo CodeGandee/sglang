@@ -203,6 +203,85 @@ def _device_plan_arguments():
     )
 
 
+def _device_placement_arguments(mode):
+    selected = torch.tensor(
+        [[8, 5, 8, 99, 6], [4, 7, 4, 99, 9]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    selected_lengths = torch.tensor([5, 5], dtype=torch.int32, device="cuda")
+    exact = torch.tensor([[99, -1], [99, -1]], dtype=torch.int32, device="cuda")
+    exact_lengths = torch.tensor([1, 1], dtype=torch.int32, device="cuda")
+    temporal_ids = torch.full((1, 2, 2, 3), -1, dtype=torch.int32, device="cuda")
+    temporal_ids[0, 1, 0] = torch.tensor([5, 6, 8], dtype=torch.int32, device="cuda")
+    temporal_ids[0, 1, 1] = torch.tensor([7, 9, 4], dtype=torch.int32, device="cuda")
+    validity = torch.zeros((2, 1, 2, 2, 3), dtype=torch.uint8, device="cuda")
+    publications = torch.full((2, 1, 2, 2, 3), -1, dtype=torch.int64, device="cuda")
+    if mode == "all-hit":
+        validity[:, 0, 1].fill_(1)
+        publications[:, 0, 1].fill_(4)
+    elif mode == "asymmetric":
+        validity[0, 0, 1, 0] = torch.tensor([1, 0, 1], dtype=torch.uint8, device="cuda")
+        validity[1, 0, 1, 0] = torch.tensor([0, 1, 1], dtype=torch.uint8, device="cuda")
+        validity[0, 0, 1, 1] = torch.tensor([1, 0, 1], dtype=torch.uint8, device="cuda")
+        validity[1, 0, 1, 1] = torch.tensor([0, 1, 1], dtype=torch.uint8, device="cuda")
+        publications.masked_fill_(validity == 1, 4)
+    elif mode != "all-miss":
+        raise AssertionError(f"unknown placement mode {mode}")
+    planner_arguments = (
+        selected,
+        selected_lengths,
+        exact,
+        exact_lengths,
+        temporal_ids,
+        validity,
+        publications,
+        torch.tensor([7], dtype=torch.int64, device="cuda"),
+        torch.tensor([3], dtype=torch.int64, device="cuda"),
+        torch.tensor([[0, 1, 0], [0, 1, 1]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[7, 3, 9], [7, 3, 9]], dtype=torch.int64, device="cuda"),
+        torch.tensor([1, 1], dtype=torch.int32, device="cuda"),
+    )
+    plan = sgl_kernel.shadowkv_plan_device(*planner_arguments, plan_capacity=2)
+    temporal_values = torch.empty(
+        (2, 1, 2, 2, 3, 8, 128), dtype=torch.bfloat16, device="cuda"
+    )
+    for component in range(2):
+        for layer in range(2):
+            for head in range(2):
+                for temporal in range(3):
+                    temporal_values[component, 0, layer, head, temporal].fill_(
+                        component * 1000 + layer * 100 + head * 10 + temporal + 1
+                    )
+    compatibility = torch.empty((2, 2, 5, 8, 128), dtype=torch.bfloat16, device="cuda")
+    for component in range(2):
+        for head in range(2):
+            for selected_ordinal in range(5):
+                compatibility[component, head, selected_ordinal].fill_(
+                    -(component * 100 + head * 10 + selected_ordinal + 1)
+                )
+    return plan, temporal_values, compatibility, exact, exact_lengths
+
+
+def _device_placement_reference(plan, temporal_values, compatibility):
+    expected = torch.zeros_like(compatibility)
+    temporal_chunks = temporal_values.view(-1, 8, 128)
+    for component in range(plan.component_kinds.shape[0]):
+        for head in range(plan.component_kinds.shape[1]):
+            if plan.error_codes[head].item() != 0:
+                continue
+            for selected in range(plan.component_kinds.shape[2]):
+                kind = plan.component_kinds[component, head, selected].item()
+                if kind == 1:
+                    source = plan.source_slots[component, head, selected].item()
+                    expected[component, head, selected].copy_(temporal_chunks[source])
+                elif kind == 2:
+                    expected[component, head, selected].copy_(
+                        compatibility[component, head, selected]
+                    )
+    return expected
+
+
 def _packed_gqa_reference(query, keys, values, lengths):
     outputs = []
     for row, length in enumerate(lengths.cpu().tolist()):
@@ -602,6 +681,143 @@ def test_shadowkv_plan_device_matches_component_aware_readable_contract():
     assert actual.selected_chunk_ids.data_ptr() == arguments[0].data_ptr()
     assert actual.row_indices.data_ptr() == arguments[9].data_ptr()
     assert actual.plan_slots.data_ptr() == arguments[11].data_ptr()
+
+
+@pytest.mark.parametrize("mode", ["all-hit", "all-miss", "asymmetric"])
+def test_shadowkv_place_device_populates_each_stable_destination_once(mode):
+    plan, temporal_values, compatibility, exact, exact_lengths = (
+        _device_placement_arguments(mode)
+    )
+    expected = _device_placement_reference(plan, temporal_values, compatibility)
+    guard_elements = 256
+    output_elements = compatibility.numel()
+    guarded = torch.full(
+        (output_elements + 2 * guard_elements,),
+        13,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = guarded.narrow(0, guard_elements, output_elements).view_as(compatibility)
+    compatibility_before = compatibility.clone()
+
+    actual = sgl_kernel.shadowkv_place_device(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        compatibility,
+        output,
+        plan_capacity=2,
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    assert torch.equal(actual, expected)
+    assert torch.equal(compatibility, compatibility_before)
+    assert torch.equal(
+        guarded[:guard_elements],
+        torch.full_like(guarded[:guard_elements], 13),
+    )
+    assert torch.equal(
+        guarded[-guard_elements:],
+        torch.full_like(guarded[-guard_elements:], 13),
+    )
+    active = plan.component_kinds >= 1
+    assert active.sum().item() == 12
+    assert torch.count_nonzero(actual[active]).item() == active.sum().item() * 8 * 128
+    assert not torch.count_nonzero(actual[~active]).item()
+
+    sgl_kernel.shadowkv_publish_device(
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        exact,
+        exact_lengths,
+        plan.row_indices,
+        plan.row_generations,
+        plan.error_codes,
+        actual,
+        torch.tensor([7], dtype=torch.int64, device="cuda"),
+        torch.tensor([3], dtype=torch.int64, device="cuda"),
+        temporal_ids := torch.full((1, 2, 2, 3), -1, dtype=torch.int32, device="cuda"),
+        published_values := torch.zeros_like(temporal_values),
+        publication_generations := torch.full(
+            (2, 1, 2, 2, 3), -1, dtype=torch.int64, device="cuda"
+        ),
+        published_validity := torch.zeros(
+            (2, 1, 2, 2, 3), dtype=torch.uint8, device="cuda"
+        ),
+    )
+    assert torch.equal(
+        temporal_ids[0, 1],
+        torch.tensor([[8, 5, 6], [4, 7, 9]], dtype=torch.int32, device="cuda"),
+    )
+    assert published_validity[:, 0, 1].all().item()
+    assert torch.equal(
+        publication_generations[:, 0, 1],
+        torch.full((2, 2, 3), 9, dtype=torch.int64, device="cuda"),
+    )
+    assert torch.equal(published_values[0, 0, 1, 0, 0], actual[0, 0, 0])
+    assert torch.equal(published_values[0, 0, 1, 0, 1], actual[0, 0, 1])
+    assert torch.equal(published_values[0, 0, 1, 0, 2], actual[0, 0, 4])
+    assert torch.equal(published_values[1, 0, 1, 1, 0], actual[1, 1, 0])
+    assert torch.equal(published_values[1, 0, 1, 1, 1], actual[1, 1, 1])
+    assert torch.equal(published_values[1, 0, 1, 1, 2], actual[1, 1, 4])
+
+
+def test_shadowkv_place_device_zeroes_invalid_rows_and_destinations():
+    plan, temporal_values, compatibility, exact, exact_lengths = (
+        _device_placement_arguments("all-hit")
+    )
+    plan.error_codes[0] = 3
+    plan.destination_slots[0, 1, 0] = -1
+    output = torch.full_like(compatibility, 17)
+
+    sgl_kernel.shadowkv_place_device(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        compatibility,
+        output,
+        plan_capacity=2,
+    )
+
+    assert not torch.count_nonzero(output[:, 0]).item()
+    assert not torch.count_nonzero(output[0, 1, 0]).item()
+    assert torch.count_nonzero(output[1, 1, 0]).item() == 8 * 128
+    assert plan.error_codes.cpu().tolist() == [3, 8]
+
+    temporal_ids = torch.full((1, 2, 2, 3), 23, dtype=torch.int32, device="cuda")
+    temporal_before = temporal_ids.clone()
+    published_values = torch.full_like(temporal_values, 29)
+    values_before = published_values.clone()
+    publication_generations = torch.full(
+        (2, 1, 2, 2, 3), 31, dtype=torch.int64, device="cuda"
+    )
+    published_validity = torch.ones((2, 1, 2, 2, 3), dtype=torch.uint8, device="cuda")
+    sgl_kernel.shadowkv_publish_device(
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        exact,
+        exact_lengths,
+        plan.row_indices,
+        plan.row_generations,
+        plan.error_codes,
+        output,
+        torch.tensor([7], dtype=torch.int64, device="cuda"),
+        torch.tensor([3], dtype=torch.int64, device="cuda"),
+        temporal_ids,
+        published_values,
+        publication_generations,
+        published_validity,
+    )
+    assert torch.equal(temporal_ids[0, 1, 0], temporal_before[0, 1, 0])
+    assert torch.equal(temporal_ids[0, 1, 1], temporal_before[0, 1, 1])
+    assert torch.equal(published_values[:, 0, 1, 0], values_before[:, 0, 1, 0])
+    assert torch.equal(published_values[:, 0, 1, 1], values_before[:, 0, 1, 1])
 
 
 def test_shadowkv_plan_device_matches_random_ragged_and_stale_owner_rows():
