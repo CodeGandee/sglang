@@ -107,10 +107,13 @@ def test_architecture_aware_metadata_round_trips_deterministically():
     encoded = msgspec.json.encode(spec)
     decoded = msgspec.json.decode(encoded, type=KernelSpec)
     assert decoded == spec
-    assert msgspec.json.encode(decoded) == encoded
     inventory = spec.inventory_record()
+    assert msgspec.json.encode(decoded.inventory_record()) == msgspec.json.encode(
+        inventory
+    )
     assert inventory["implementation_id"] == spec.identity
     assert inventory["provider"] == "aot"
+    assert inventory["supported_architectures"] == ["sm100a", "sm80"]
 
 
 @pytest.mark.parametrize("architectures", [frozenset(), frozenset({"*"})])

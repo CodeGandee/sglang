@@ -489,6 +489,24 @@ class KernelSpec(msgspec.Struct, frozen=True):
     def inventory_record(self) -> dict[str, Any]:
         """Return stable, JSON-compatible metadata without loading providers."""
         record = msgspec.json.decode(msgspec.json.encode(self))
+        # ``frozenset`` preserves the descriptor's unordered membership
+        # semantics, but its iteration order is not a serialization contract.
+        # Canonicalize every set-backed field before this record reaches build
+        # manifests, provenance hashes, or user-facing inventory output.
+        record["capabilities"] = sorted(
+            record["capabilities"],
+            key=lambda capability: (
+                capability["device"],
+                capability["min_cuda_arch"] or [],
+                capability["max_cuda_arch"] or [],
+            ),
+        )
+        record["supported_architectures"] = sorted(
+            record["supported_architectures"]
+        )
+        envelope = record["input_envelope"]
+        for field in ("dtypes", "head_dimensions", "factor_ranks", "features"):
+            envelope[field] = sorted(envelope[field])
         record["implementation_id"] = self.identity
         record["provider"] = self.provider.value
         return record
