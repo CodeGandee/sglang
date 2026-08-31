@@ -980,17 +980,18 @@ def test_shadowkv_plan_device_preserves_guard_regions():
     miss_storage, misses = guarded((2, rows, selected_capacity), torch.int32, 999)
     count_storage, counts = guarded((2, rows, 2), torch.int32, 1000)
     error_storage, errors = guarded((rows,), torch.int32, 1001)
-    torch.ops.sgl_kernel.shadowkv_plan_device.default(
-        *arguments,
-        2,
-        kinds,
-        sources,
-        destinations,
-        misses,
-        counts,
-        errors,
+    outputs = sgl_kernel.ShadowKVDevicePlanOutputs(
+        component_kinds=kinds,
+        source_slots=sources,
+        destination_slots=destinations,
+        miss_ordinals=misses,
+        counts=counts,
+        error_codes=errors,
     )
+    plan = sgl_kernel.shadowkv_plan_device(*arguments, plan_capacity=2, out=outputs)
 
+    assert plan.component_kinds.data_ptr() == kinds.data_ptr()
+    assert plan.error_codes.data_ptr() == errors.data_ptr()
     assert torch.equal(kinds, expected[0])
     assert torch.equal(sources, expected[1])
     assert torch.equal(destinations, expected[2])
@@ -1007,6 +1008,20 @@ def test_shadowkv_plan_device_preserves_guard_regions():
     ):
         assert torch.equal(storage[:guard], torch.full_like(storage[:guard], fill))
         assert torch.equal(storage[-guard:], torch.full_like(storage[-guard:], fill))
+
+    with pytest.raises(ValueError, match="out.error_codes must have shape"):
+        sgl_kernel.shadowkv_plan_device(
+            *arguments,
+            plan_capacity=2,
+            out=sgl_kernel.ShadowKVDevicePlanOutputs(
+                component_kinds=kinds,
+                source_slots=sources,
+                destination_slots=destinations,
+                miss_ordinals=misses,
+                counts=counts,
+                error_codes=torch.empty((rows + 1,), dtype=torch.int32, device="cuda"),
+            ),
+        )
 
 
 def test_shadowkv_plan_device_wrapper_has_no_error_materialization():

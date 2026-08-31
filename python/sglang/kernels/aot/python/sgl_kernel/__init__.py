@@ -110,6 +110,7 @@ else:
     )
     from sgl_kernel.shadowkv import (
         ShadowKVDevicePlan,
+        ShadowKVDevicePlanOutputs,
         ShadowKVReusePlan,
         shadowkv_kernels_available,
         shadowkv_packed_gqa,

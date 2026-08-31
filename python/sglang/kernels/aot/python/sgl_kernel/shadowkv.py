@@ -71,6 +71,18 @@ class ShadowKVDevicePlan:
         self.error_codes = error_codes
 
 
+@dataclass(frozen=True)
+class ShadowKVDevicePlanOutputs:
+    """Caller-owned output tensors for allocation-free device planning."""
+
+    component_kinds: torch.Tensor
+    source_slots: torch.Tensor
+    destination_slots: torch.Tensor
+    miss_ordinals: torch.Tensor
+    counts: torch.Tensor
+    error_codes: torch.Tensor
+
+
 def shadowkv_kernels_available() -> bool:
     """Return whether this wheel contains the optional ShadowKV operators."""
 
@@ -299,6 +311,7 @@ def shadowkv_plan_device(
     plan_slots: torch.Tensor,
     *,
     plan_capacity: int,
+    out: ShadowKVDevicePlanOutputs | None = None,
 ) -> ShadowKVDevicePlan:
     """Launch the compact K/V planner without materializing deferred errors."""
 
@@ -388,12 +401,41 @@ def shadowkv_plan_device(
     _require_b200(device)
 
     component_shape = (2, rows, selected_capacity)
-    component_kinds = torch.empty(component_shape, dtype=torch.int8, device=device)
-    source_slots = torch.empty(component_shape, dtype=torch.int32, device=device)
-    destination_slots = torch.empty(component_shape, dtype=torch.int32, device=device)
-    miss_ordinals = torch.empty(component_shape, dtype=torch.int32, device=device)
-    counts = torch.empty((2, rows, 2), dtype=torch.int32, device=device)
-    error_codes = torch.empty((rows,), dtype=torch.int32, device=device)
+    if out is None:
+        out = ShadowKVDevicePlanOutputs(
+            component_kinds=torch.empty(
+                component_shape, dtype=torch.int8, device=device
+            ),
+            source_slots=torch.empty(component_shape, dtype=torch.int32, device=device),
+            destination_slots=torch.empty(
+                component_shape, dtype=torch.int32, device=device
+            ),
+            miss_ordinals=torch.empty(
+                component_shape, dtype=torch.int32, device=device
+            ),
+            counts=torch.empty((2, rows, 2), dtype=torch.int32, device=device),
+            error_codes=torch.empty((rows,), dtype=torch.int32, device=device),
+        )
+    output_specs = (
+        ("out.component_kinds", out.component_kinds, torch.int8, 3, component_shape),
+        ("out.source_slots", out.source_slots, torch.int32, 3, component_shape),
+        (
+            "out.destination_slots",
+            out.destination_slots,
+            torch.int32,
+            3,
+            component_shape,
+        ),
+        ("out.miss_ordinals", out.miss_ordinals, torch.int32, 3, component_shape),
+        ("out.counts", out.counts, torch.int32, 3, (2, rows, 2)),
+        ("out.error_codes", out.error_codes, torch.int32, 1, (rows,)),
+    )
+    for name, tensor, dtype, dimensions, shape in output_specs:
+        _require_tensor(name, tensor, dtype=dtype, dimensions=dimensions)
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+        if tensor.device != device:
+            raise ValueError(f"{name} must share the device-plan CUDA device")
     torch.ops.sgl_kernel.shadowkv_plan_device.default(
         selected_chunk_ids,
         selected_lengths,
@@ -408,12 +450,12 @@ def shadowkv_plan_device(
         row_generations,
         plan_slots,
         plan_capacity,
-        component_kinds,
-        source_slots,
-        destination_slots,
-        miss_ordinals,
-        counts,
-        error_codes,
+        out.component_kinds,
+        out.source_slots,
+        out.destination_slots,
+        out.miss_ordinals,
+        out.counts,
+        out.error_codes,
     )
     return ShadowKVDevicePlan(
         row_indices=row_indices,
@@ -421,12 +463,12 @@ def shadowkv_plan_device(
         selected_chunk_ids=selected_chunk_ids,
         selected_lengths=selected_lengths,
         plan_slots=plan_slots,
-        component_kinds=component_kinds,
-        source_slots=source_slots,
-        destination_slots=destination_slots,
-        miss_ordinals=miss_ordinals,
-        counts=counts,
-        error_codes=error_codes,
+        component_kinds=out.component_kinds,
+        source_slots=out.source_slots,
+        destination_slots=out.destination_slots,
+        miss_ordinals=out.miss_ordinals,
+        counts=out.counts,
+        error_codes=out.error_codes,
     )
 
 
