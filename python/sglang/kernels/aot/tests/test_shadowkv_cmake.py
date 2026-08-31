@@ -181,3 +181,15 @@ def test_shadowkv_extension_is_separate_from_common_ops():
     assert "shadowkv_reconstruct" not in common_extension
     assert "shadowkv_reconstruct_generic_aot_v1" in binding
     assert "REGISTER_EXTENSION(shadowkv_ops)" in binding
+
+
+def test_shadowkv_public_wrappers_are_exported_only_with_the_optional_extension():
+    package_init = (
+        AOT_ROOT / "python/sgl_kernel/__init__.py"
+    ).read_text(encoding="utf-8")
+    availability, conditional_exports = package_init.split(
+        "if shadowkv_ops is not None:", 1
+    )
+    assert "def shadowkv_kernels_available():" in availability
+    assert "from sgl_kernel.shadowkv import (" in conditional_exports
+    assert "shadowkv_packed_gqa," in conditional_exports
