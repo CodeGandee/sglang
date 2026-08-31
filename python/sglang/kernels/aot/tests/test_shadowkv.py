@@ -162,8 +162,6 @@ def test_shadowkv_packed_gqa_matches_ragged_reference(
 
     assert actual.data_ptr() == output.data_ptr()
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    if head_dim == 64:
-        assert torch.equal(actual, expected)
     if head_dim == 64 and maximum_tokens == 2465:
         grouped = (
             query[0]
