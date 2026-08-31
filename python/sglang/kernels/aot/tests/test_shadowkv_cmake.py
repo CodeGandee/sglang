@@ -159,6 +159,8 @@ def test_packed_gqa_shared_reductions_use_explicit_warp_barriers():
         encoding="utf-8"
     )
     assert source.count("__syncwarp();") == 3
+    assert source.count("const float result = shared[0];") == 2
+    assert "until every thread has\n  // copied the published maximum" in source
     assert "before lane zero reuses reduction[0]" in source
     assert "overwrites reduction[0] with the block total" in source
 

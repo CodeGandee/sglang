@@ -71,7 +71,11 @@ __device__ __forceinline__ float block_max(float value, float* shared) {
     shared[0] = value;
   }
   __syncthreads();
-  return shared[0];
+  const float result = shared[0];
+  // No warp may reuse the shared reduction slots until every thread has
+  // copied the published maximum into a register.
+  __syncthreads();
+  return result;
 }
 
 __device__ __forceinline__ float block_sum(float value, float* shared) {
@@ -92,7 +96,10 @@ __device__ __forceinline__ float block_sum(float value, float* shared) {
     shared[0] = value;
   }
   __syncthreads();
-  return shared[0];
+  const float result = shared[0];
+  // Preserve the same publication contract for every shared reduction.
+  __syncthreads();
+  return result;
 }
 
 template <int HeadDim>
