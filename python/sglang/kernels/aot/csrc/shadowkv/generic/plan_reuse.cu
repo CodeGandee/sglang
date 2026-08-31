@@ -21,7 +21,7 @@ limitations under the License.
 
 #include <limits>
 
-#include "shadowkv/device_contract.cuh"
+#include "shadowkv/common/device_contract.cuh"
 #include "utils.h"
 
 namespace {

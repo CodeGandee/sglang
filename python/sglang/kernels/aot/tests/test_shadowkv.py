@@ -2,6 +2,7 @@ import pytest
 import sgl_kernel
 import sgl_kernel.shadowkv as shadowkv_module
 import torch
+from sglang.kernels.ops import shadowkv as shadowkv_api
 
 
 def _supported_shadowkv_device_available() -> bool:
@@ -541,3 +542,122 @@ def test_shape_and_budget_guards_run_before_operator_launch(monkeypatch):
             max_reuse_chunks=1,
             chunk_size=0,
         )
+
+
+def test_public_dispatch_matches_legacy_compatibility_wrappers():
+    u = torch.zeros((8, 160), dtype=torch.bfloat16, device="cuda")
+    positions = torch.tensor([[0, 7]], dtype=torch.int64, device="cuda")
+    reconstruct_sv = torch.zeros(
+        (1, 160, 128), dtype=torch.bfloat16, device="cuda"
+    )
+    rope_sv = torch.zeros((1, 160, 64), dtype=torch.bfloat16, device="cuda")
+    inverse = torch.ones((32,), dtype=torch.float32, device="cuda")
+    torch.testing.assert_close(
+        shadowkv_api.reconstruct(
+            u,
+            reconstruct_sv,
+            positions,
+            implementation="shadowkv.reconstruct.generic-aot.v1",
+        ),
+        sgl_kernel.shadowkv_reconstruct(u, reconstruct_sv, positions),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        shadowkv_api.reconstruct_rope(
+            u,
+            rope_sv,
+            positions,
+            inverse,
+            implementation="shadowkv.reconstruct-rope.generic-aot.v1",
+        ),
+        sgl_kernel.shadowkv_reconstruct_rope(u, rope_sv, positions, inverse),
+        rtol=0,
+        atol=0,
+    )
+
+    planner = (
+        torch.tensor([[1, 4]], dtype=torch.int64, device="cuda"),
+        torch.tensor([2], dtype=torch.int32, device="cuda"),
+        torch.tensor([[4, 5]], dtype=torch.int64, device="cuda"),
+        torch.tensor([2], dtype=torch.int32, device="cuda"),
+        torch.tensor([[5]], dtype=torch.int64, device="cuda"),
+        torch.tensor([1], dtype=torch.int32, device="cuda"),
+        torch.tensor([3], dtype=torch.int64, device="cuda"),
+        torch.tensor([3], dtype=torch.int64, device="cuda"),
+    )
+    public_plan = shadowkv_api.plan_reuse(
+        *planner,
+        max_reuse_chunks=2,
+        chunk_size=8,
+        implementation="shadowkv.plan-reuse.generic-aot.v1",
+    )
+    legacy_plan = sgl_kernel.shadowkv_plan_reuse(
+        *planner, max_reuse_chunks=2, chunk_size=8
+    )
+    assert torch.equal(public_plan.plan, legacy_plan.plan)
+    assert torch.equal(
+        public_plan.deduplicated_exact_chunks,
+        legacy_plan.deduplicated_exact_chunks,
+    )
+    assert torch.equal(public_plan.counts, legacy_plan.counts)
+
+    query = torch.zeros((1, 4, 64), dtype=torch.bfloat16, device="cuda")
+    keys = torch.zeros((1, 1, 7, 64), dtype=torch.bfloat16, device="cuda")
+    values = torch.zeros_like(keys)
+    lengths = torch.tensor([7], dtype=torch.int32, device="cuda")
+    torch.testing.assert_close(
+        shadowkv_api.packed_gqa(
+            query,
+            keys,
+            values,
+            lengths,
+            implementation="shadowkv.packed-gqa.generic-aot.v1",
+        ),
+        sgl_kernel.shadowkv_packed_gqa(query, keys, values, lengths),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "legacy,new,message",
+    [
+        (
+            lambda: sgl_kernel.shadowkv_reconstruct(
+                torch.zeros((8, 96), dtype=torch.bfloat16, device="cuda"),
+                torch.zeros((1, 96, 128), dtype=torch.bfloat16, device="cuda"),
+                torch.zeros((1, 1), dtype=torch.int64, device="cuda"),
+            ),
+            lambda: shadowkv_api.reconstruct(
+                torch.zeros((8, 96), dtype=torch.bfloat16, device="cuda"),
+                torch.zeros((1, 96, 128), dtype=torch.bfloat16, device="cuda"),
+                torch.zeros((1, 1), dtype=torch.int64, device="cuda"),
+                implementation="shadowkv.reconstruct.generic-aot.v1",
+            ),
+            "rank must be one of",
+        ),
+        (
+            lambda: sgl_kernel.shadowkv_packed_gqa(
+                torch.zeros((1, 3, 64), dtype=torch.bfloat16, device="cuda"),
+                torch.zeros((1, 2, 7, 64), dtype=torch.bfloat16, device="cuda"),
+                torch.zeros((1, 2, 7, 64), dtype=torch.bfloat16, device="cuda"),
+                torch.ones((1,), dtype=torch.int32, device="cuda"),
+            ),
+            lambda: shadowkv_api.packed_gqa(
+                torch.zeros((1, 3, 64), dtype=torch.bfloat16, device="cuda"),
+                torch.zeros((1, 2, 7, 64), dtype=torch.bfloat16, device="cuda"),
+                torch.zeros((1, 2, 7, 64), dtype=torch.bfloat16, device="cuda"),
+                torch.ones((1,), dtype=torch.int32, device="cuda"),
+                implementation="shadowkv.packed-gqa.generic-aot.v1",
+            ),
+            "query heads must be divisible",
+        ),
+    ],
+)
+def test_public_dispatch_matches_legacy_error_boundary(legacy, new, message):
+    with pytest.raises(ValueError, match=message) as legacy_error:
+        legacy()
+    with pytest.raises(type(legacy_error.value), match=message) as public_error:
+        new()
+    assert str(public_error.value) == str(legacy_error.value)

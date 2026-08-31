@@ -49,26 +49,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
 
-#ifdef SGL_KERNEL_ENABLE_SHADOWKV
-  m.def(
-      "shadowkv_reconstruct(Tensor u, Tensor sv, Tensor positions, Tensor! output) -> ()");
-  m.impl("shadowkv_reconstruct", torch::kCUDA, &shadowkv_reconstruct);
-  m.def(
-      "shadowkv_reconstruct_rope(Tensor u, Tensor sv, Tensor positions, Tensor inverse_frequencies, Tensor! output) "
-      "-> ()");
-  m.impl("shadowkv_reconstruct_rope", torch::kCUDA, &shadowkv_reconstruct_rope);
-  m.def(
-      "shadowkv_plan_reuse(Tensor previous_chunks, Tensor previous_lengths, Tensor current_chunks, Tensor "
-      "current_lengths, Tensor exact_chunks, Tensor exact_lengths, Tensor cached_generations, Tensor "
-      "current_generations, int max_reuse_chunks, int chunk_size, Tensor! plan, Tensor! "
-      "deduplicated_exact_chunks, Tensor! counts, Tensor! error_codes) -> ()");
-  m.impl("shadowkv_plan_reuse", torch::kCUDA, &shadowkv_plan_reuse);
-  m.def(
-      "shadowkv_packed_gqa(Tensor query, Tensor keys, Tensor values, Tensor lengths, Tensor! weights, Tensor! output) "
-      "-> ()");
-  m.impl("shadowkv_packed_gqa", torch::kCUDA, &shadowkv_packed_gqa);
-#endif
-
   /*
    * From csrc/infllm_v2
    */

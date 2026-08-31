@@ -12,11 +12,13 @@ else:
     from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
     from sgl_kernel.load_utils import (
         _load_architecture_specific_ops,
+        _load_optional_shadowkv_ops,
         _preload_cuda_library,
     )
 
     # Initialize the ops library based on current GPU
     common_ops = _load_architecture_specific_ops()
+    shadowkv_ops = _load_optional_shadowkv_ops()
 
     # Preload the CUDA library to avoid the issue of libcudart.so.12 not found
     if torch.version.cuda is not None:

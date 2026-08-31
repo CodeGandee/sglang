@@ -30,10 +30,10 @@ def shadowkv_kernels_available() -> bool:
     """Return whether this wheel contains the optional ShadowKV operators."""
 
     return (
-        hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct")
-        and hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct_rope")
-        and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_reuse")
-        and hasattr(torch.ops.sgl_kernel, "shadowkv_packed_gqa")
+        hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct_generic_aot_v1")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct_rope_generic_aot_v1")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_reuse_generic_aot_v1")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_packed_gqa_generic_aot_v1")
     )
 
 
@@ -45,7 +45,7 @@ def _launch_shadowkv_packed_gqa(
     weights: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.shadowkv_packed_gqa.default(
+    torch.ops.sgl_kernel.shadowkv_packed_gqa_generic_aot_v1.default(
         query,
         keys,
         values,
@@ -62,7 +62,7 @@ def _launch_shadowkv_reconstruct_rope(
     inverse_frequencies: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.shadowkv_reconstruct_rope.default(
+    torch.ops.sgl_kernel.shadowkv_reconstruct_rope_generic_aot_v1.default(
         u, sv, positions, inverse_frequencies, out
     )
 
@@ -73,7 +73,9 @@ def _launch_shadowkv_reconstruct(
     positions: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.shadowkv_reconstruct.default(u, sv, positions, out)
+    torch.ops.sgl_kernel.shadowkv_reconstruct_generic_aot_v1.default(
+        u, sv, positions, out
+    )
 
 
 def _launch_shadowkv_plan_reuse(
@@ -92,7 +94,7 @@ def _launch_shadowkv_plan_reuse(
     counts: torch.Tensor,
     error_codes: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.shadowkv_plan_reuse.default(
+    torch.ops.sgl_kernel.shadowkv_plan_reuse_generic_aot_v1.default(
         previous_chunks,
         previous_lengths,
         current_chunks,

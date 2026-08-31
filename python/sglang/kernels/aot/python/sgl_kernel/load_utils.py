@@ -197,6 +197,26 @@ Error details from previous import attempts:
     raise ImportError(error_msg)
 
 
+def _load_optional_shadowkv_ops():
+    """Load the optional implementation-specific ShadowKV extension.
+
+    An absent module is an ordinary disabled build. A present module that
+    fails to load is corrupt and raises instead of degrading to absence.
+    """
+    sgl_kernel_dir = Path(__file__).parent
+    pattern = str(sgl_kernel_dir / "shadowkv_ops.*")
+    matching_files = _filter_compiled_extensions(glob.glob(pattern))
+    if not matching_files:
+        return None
+    path = Path(matching_files[0])
+    spec = importlib.util.spec_from_file_location("shadowkv_ops", str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create module spec for {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # copy & modify from torch/utils/cpp_extension.py
 def _find_cuda_home():
     """Find the CUDA install path."""
