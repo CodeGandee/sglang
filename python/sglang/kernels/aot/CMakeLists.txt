@@ -3,6 +3,7 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 
 # utils
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/shadowkv.cmake)
 include(FetchContent)
 
 # CMake
@@ -185,19 +186,7 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SG
 option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
-option(SGL_KERNEL_ENABLE_SHADOWKV         "Build optional B200 ShadowKV kernels" OFF)
-
-if(SGL_KERNEL_ENABLE_SHADOWKV)
-    if(NOT SGL_KERNEL_CUDA_ARCH STREQUAL "100a")
-        message(FATAL_ERROR "SGL_KERNEL_ENABLE_SHADOWKV requires SGL_KERNEL_CUDA_ARCH=100a.")
-    endif()
-    if(NOT SGL_KERNEL_BUILD_SM100_VARIANT)
-        message(FATAL_ERROR "SGL_KERNEL_ENABLE_SHADOWKV requires the SM100 common_ops variant.")
-    endif()
-    if(NOT SGL_KERNEL_ENABLE_BF16)
-        message(FATAL_ERROR "SGL_KERNEL_ENABLE_SHADOWKV requires BF16 support.")
-    endif()
-endif()
+option(SGL_KERNEL_ENABLE_SHADOWKV         "Build optional SM80 or SM100a ShadowKV kernels" OFF)
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -350,14 +339,7 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
-set(SHADOWKV_SOURCES)
-if(SGL_KERNEL_ENABLE_SHADOWKV)
-    list(APPEND SHADOWKV_SOURCES
-        "csrc/shadowkv/packed_gqa.cu"
-        "csrc/shadowkv/plan_reuse.cu"
-        "csrc/shadowkv/reconstruct_rope.cu"
-    )
-endif()
+sgl_configure_shadowkv_sources(SHADOWKV_SOURCES)
 
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include

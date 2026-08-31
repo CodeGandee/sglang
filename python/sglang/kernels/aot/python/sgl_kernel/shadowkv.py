@@ -1,4 +1,4 @@
-"""Optional B200 ShadowKV AOT kernel wrappers."""
+"""Optional SM80 and SM100a ShadowKV AOT kernel wrappers."""
 
 from dataclasses import dataclass
 
@@ -7,7 +7,7 @@ import torch
 
 @dataclass(frozen=True)
 class ShadowKVReusePlan:
-    """Stable row-packed reuse plan produced by the B200 planner."""
+    """Stable row-packed reuse plan produced by the AOT planner."""
 
     plan: torch.Tensor
     deduplicated_exact_chunks: torch.Tensor
@@ -37,6 +37,79 @@ def shadowkv_kernels_available() -> bool:
     )
 
 
+def _launch_shadowkv_packed_gqa(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    weights: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_packed_gqa.default(
+        query,
+        keys,
+        values,
+        lengths,
+        weights,
+        out,
+    )
+
+
+def _launch_shadowkv_reconstruct_rope(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    positions: torch.Tensor,
+    inverse_frequencies: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_reconstruct_rope.default(
+        u, sv, positions, inverse_frequencies, out
+    )
+
+
+def _launch_shadowkv_reconstruct(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_reconstruct.default(u, sv, positions, out)
+
+
+def _launch_shadowkv_plan_reuse(
+    previous_chunks: torch.Tensor,
+    previous_lengths: torch.Tensor,
+    current_chunks: torch.Tensor,
+    current_lengths: torch.Tensor,
+    exact_chunks: torch.Tensor,
+    exact_lengths: torch.Tensor,
+    cached_generations: torch.Tensor,
+    current_generations: torch.Tensor,
+    max_reuse_chunks: int,
+    chunk_size: int,
+    plan: torch.Tensor,
+    deduplicated_exact: torch.Tensor,
+    counts: torch.Tensor,
+    error_codes: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_plan_reuse.default(
+        previous_chunks,
+        previous_lengths,
+        current_chunks,
+        current_lengths,
+        exact_chunks,
+        exact_lengths,
+        cached_generations,
+        current_generations,
+        max_reuse_chunks,
+        chunk_size,
+        plan,
+        deduplicated_exact,
+        counts,
+        error_codes,
+    )
+
+
 def shadowkv_packed_gqa(
     query: torch.Tensor,
     keys: torch.Tensor,
@@ -47,7 +120,7 @@ def shadowkv_packed_gqa(
     out: torch.Tensor | None = None,
     validate_lengths: bool = True,
 ) -> torch.Tensor:
-    """Run caller-buffered ragged GQA over fixed-stride packed B200 storage."""
+    """Run caller-buffered ragged GQA over fixed-stride packed storage."""
 
     _require_tensor("query", query, dtype=torch.bfloat16, dimensions=3)
     _require_tensor("keys", keys, dtype=torch.bfloat16, dimensions=4)
@@ -81,7 +154,7 @@ def shadowkv_packed_gqa(
         and (int(lengths.min().item()) < 0 or int(lengths.max().item()) > keys.shape[2])
     ):
         raise ValueError("lengths exceed the packed KV token capacity")
-    _require_b200(device)
+    _require_supported_device(device)
     expected_weights = (query.shape[0], query.shape[1], keys.shape[2])
     if weights is None:
         weights = torch.empty(expected_weights, dtype=torch.float32, device=device)
@@ -95,7 +168,7 @@ def shadowkv_packed_gqa(
         _require_tensor("out", out, dtype=torch.bfloat16, dimensions=3)
         if out.shape != query.shape or out.device != device:
             raise ValueError(f"out must have shape {query.shape} on {device}")
-    torch.ops.sgl_kernel.shadowkv_packed_gqa.default(
+    _launch_shadowkv_packed_gqa(
         query,
         keys,
         values,
@@ -106,17 +179,17 @@ def shadowkv_packed_gqa(
     return out
 
 
-def _require_b200(device: torch.device) -> None:
+def _require_supported_device(device: torch.device) -> None:
     if not shadowkv_kernels_available():
         raise RuntimeError(
             "the installed sglang-kernel wheel was built without optional ShadowKV kernels"
         )
     if not torch.cuda.is_available():
-        raise RuntimeError("ShadowKV AOT kernels require a visible NVIDIA B200")
+        raise RuntimeError("ShadowKV AOT kernels require a visible NVIDIA GPU")
     capability = torch.cuda.get_device_capability(device)
-    if capability != (10, 0):
+    if capability not in {(8, 0), (10, 0)}:
         raise RuntimeError(
-            "ShadowKV AOT kernels require NVIDIA B200 compute capability 10.0; "
+            "ShadowKV AOT kernels require compute capability 8.0 or 10.0; "
             f"found {capability}"
         )
 
@@ -173,7 +246,7 @@ def shadowkv_reconstruct_rope(
         int(positions.min().item()) < 0 or int(positions.max().item()) >= u.shape[0]
     ):
         raise ValueError("positions exceed the U token dimension")
-    _require_b200(device)
+    _require_supported_device(device)
     expected_shape = (sv.shape[0], positions.shape[1], 64)
     if out is None:
         out = torch.empty(expected_shape, dtype=torch.bfloat16, device=u.device)
@@ -186,9 +259,7 @@ def shadowkv_reconstruct_rope(
             raise ValueError(f"out must have shape {expected_shape}")
         if out.device != device:
             raise ValueError("out must share the reconstruction CUDA device")
-    torch.ops.sgl_kernel.shadowkv_reconstruct_rope.default(
-        u, sv, positions, inverse_frequencies, out
-    )
+    _launch_shadowkv_reconstruct_rope(u, sv, positions, inverse_frequencies, out)
     return out
 
 
@@ -198,7 +269,7 @@ def shadowkv_reconstruct(
     positions: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Gather U and reconstruct 128-element pre-RoPE keys on B200."""
+    """Gather U and reconstruct 128-element pre-RoPE keys."""
 
     _require_tensor("u", u, dtype=torch.bfloat16, dimensions=2)
     _require_tensor("sv", sv, dtype=torch.bfloat16, dimensions=3)
@@ -219,7 +290,7 @@ def shadowkv_reconstruct(
         int(positions.min().item()) < 0 or int(positions.max().item()) >= u.shape[0]
     ):
         raise ValueError("positions exceed the U token dimension")
-    _require_b200(device)
+    _require_supported_device(device)
     expected_shape = (sv.shape[0], positions.shape[1], 128)
     if out is None:
         out = torch.empty(expected_shape, dtype=torch.bfloat16, device=device)
@@ -232,7 +303,7 @@ def shadowkv_reconstruct(
             raise ValueError(f"out must have shape {expected_shape}")
         if out.device != device:
             raise ValueError("out must share the reconstruction CUDA device")
-    torch.ops.sgl_kernel.shadowkv_reconstruct.default(u, sv, positions, out)
+    _launch_shadowkv_reconstruct(u, sv, positions, out)
     return out
 
 
@@ -289,7 +360,7 @@ def shadowkv_plan_reuse(
         raise ValueError("planner chunk widths must not exceed 256")
     if exact_chunks.shape[1] > 64:
         raise ValueError("planner exact width must not exceed 64")
-    _require_b200(device)
+    _require_supported_device(device)
     plan = torch.full(
         (rows, current_width, 3),
         -1,
@@ -299,7 +370,7 @@ def shadowkv_plan_reuse(
     deduplicated_exact = torch.full_like(exact_chunks, -1)
     counts = torch.zeros((rows, 3), dtype=torch.int32, device=current_chunks.device)
     error_codes = torch.zeros((rows,), dtype=torch.int32, device=current_chunks.device)
-    torch.ops.sgl_kernel.shadowkv_plan_reuse.default(
+    _launch_shadowkv_plan_reuse(
         previous_chunks,
         previous_lengths,
         current_chunks,

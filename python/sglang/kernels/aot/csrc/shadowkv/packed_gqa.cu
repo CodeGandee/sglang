@@ -23,6 +23,8 @@ limitations under the License.
 #include <cfloat>
 #include <cstdint>
 #include <limits>
+
+#include "shadowkv/device_contract.cuh"
 #include "utils.h"
 
 namespace {
@@ -33,17 +35,6 @@ constexpr int kWarps = kThreads / kWarpSize;
 constexpr int kReferenceGemmInterleavedThreshold = 1760;
 constexpr int kReferenceSoftmaxLargeRowThreshold = 2048;
 constexpr int kReferenceSoftmaxThreads = 1024;
-
-void check_b200(const at::Tensor& tensor) {
-  cudaDeviceProp properties{};
-  C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, tensor.get_device()));
-  TORCH_CHECK(
-      properties.major == 10 && properties.minor == 0,
-      "shadowkv_packed_gqa requires NVIDIA B200 compute capability 10.0; found ",
-      properties.major,
-      ".",
-      properties.minor);
-}
 
 __device__ __forceinline__ float warp_max(float value) {
 #pragma unroll
@@ -139,7 +130,7 @@ __global__ void shadowkv_packed_gqa_kernel(
   for (int token = threadIdx.x; token < length; token += blockDim.x) {
     const int64_t key_offset = kv_base + static_cast<int64_t>(token) * HeadDim;
     float score = 0.0f;
-    // The locked B200 PyTorch GEMM switches to sixteen interleaved K-lane
+    // The locked PyTorch GEMM switches to sixteen interleaved K-lane
     // accumulators above this qualified Llama GQA row width. Matching that
     // order prevents small score errors from changing greedy continuations.
     if (length > kReferenceGemmInterleavedThreshold) {
@@ -317,7 +308,9 @@ void shadowkv_packed_gqa(
       "packed GQA grid exceeds the CUDA launch bound");
 
   c10::cuda::CUDAGuard device_guard(query.device());
-  check_b200(query);
+  sglang::shadowkv::check_operation_device(
+      query,
+      "shadowkv_packed_gqa");
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int blocks = static_cast<int>(query.size(0) * query.size(1));
   if (query.size(2) == 64) {
