@@ -109,9 +109,11 @@ else:
         top_p_renorm_prob,
     )
     from sgl_kernel.shadowkv import (
+        ShadowKVDevicePlan,
         ShadowKVReusePlan,
         shadowkv_kernels_available,
         shadowkv_packed_gqa,
+        shadowkv_plan_device,
         shadowkv_plan_reuse,
         shadowkv_reconstruct,
         shadowkv_reconstruct_rope,
@@ -197,6 +199,7 @@ else:
         "rmsnorm",
         "rotary_embedding",
         "segment_packbits",
+        "shadowkv_plan_device",
         "shadowkv_plan_reuse",
         "shadowkv_packed_gqa",
         "shadowkv_reconstruct",

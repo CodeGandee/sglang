@@ -58,6 +58,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "-> ()");
   m.impl("shadowkv_reconstruct_rope", torch::kCUDA, &shadowkv_reconstruct_rope);
   m.def(
+      "shadowkv_plan_device(Tensor selected_chunk_ids, Tensor selected_lengths, Tensor exact_chunk_ids, Tensor "
+      "exact_lengths, Tensor temporal_chunk_ids, Tensor temporal_component_validity, Tensor "
+      "temporal_publication_generations, Tensor temporal_request_generations, Tensor "
+      "temporal_layout_generations, Tensor row_indices, Tensor row_generations, Tensor plan_slots, int "
+      "plan_capacity, Tensor! component_kinds, Tensor! source_slots, Tensor! destination_slots, Tensor! "
+      "miss_ordinals, Tensor! counts, Tensor! error_codes) -> ()");
+  m.impl("shadowkv_plan_device", torch::kCUDA, &shadowkv_plan_device);
+  m.def(
       "shadowkv_plan_reuse(Tensor previous_chunks, Tensor previous_lengths, Tensor current_chunks, Tensor "
       "current_lengths, Tensor exact_chunks, Tensor exact_lengths, Tensor cached_generations, Tensor "
       "current_generations, int max_reuse_chunks, int chunk_size, Tensor! plan, Tensor! "

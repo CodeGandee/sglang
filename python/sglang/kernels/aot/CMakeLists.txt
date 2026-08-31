@@ -354,6 +354,7 @@ set(SHADOWKV_SOURCES)
 if(SGL_KERNEL_ENABLE_SHADOWKV)
     list(APPEND SHADOWKV_SOURCES
         "csrc/shadowkv/packed_gqa.cu"
+        "csrc/shadowkv/plan_device.cu"
         "csrc/shadowkv/plan_reuse.cu"
         "csrc/shadowkv/reconstruct_rope.cu"
     )

@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import sgl_kernel
 import torch
@@ -85,6 +87,120 @@ def _plan_reference(arguments, max_reuse, chunk_size):
             device="cuda",
         )
     return plan, deduplicated, counts
+
+
+def _device_plan_reference(arguments, plan_capacity):
+    (
+        selected,
+        selected_lengths,
+        exact,
+        exact_lengths,
+        temporal,
+        validity,
+        publications,
+        temporal_request_generations,
+        temporal_layout_generations,
+        row_indices,
+        row_generations,
+        plan_slots,
+    ) = arguments
+    del publications
+    rows, selected_capacity = selected.shape
+    request_slots, local_layers, kv_heads, temporal_capacity = temporal.shape
+    kinds = torch.full(
+        (2, rows, selected_capacity), -1, dtype=torch.int8, device="cuda"
+    )
+    sources = torch.full_like(kinds, -1, dtype=torch.int32)
+    destinations = torch.full_like(kinds, -1, dtype=torch.int32)
+    misses = torch.full_like(kinds, -1, dtype=torch.int32)
+    counts = torch.zeros((2, rows, 2), dtype=torch.int32, device="cuda")
+    for row in range(rows):
+        request_slot, local_layer, kv_head = row_indices[row].cpu().tolist()
+        request_generation, layout_generation, _ = row_generations[row].cpu().tolist()
+        selected_row = selected[row, : selected_lengths[row]].cpu().tolist()
+        exact_row = exact[row, : exact_lengths[row]].cpu().tolist()
+        temporal_row = temporal[request_slot, local_layer, kv_head].cpu().tolist()
+        owner_matches = (
+            temporal_request_generations[request_slot].item() == request_generation
+            and temporal_layout_generations[request_slot].item() == layout_generation
+        )
+        source_by_chunk = (
+            {chunk: index for index, chunk in enumerate(temporal_row) if chunk >= 0}
+            if owner_matches
+            else {}
+        )
+        seen = set()
+        exact_set = set(exact_row)
+        for selected_ordinal, chunk in enumerate(selected_row):
+            if chunk in seen or chunk in exact_set:
+                continue
+            seen.add(chunk)
+            for component in range(2):
+                destinations[component, row, selected_ordinal] = (
+                    (component * plan_capacity + plan_slots[row].item()) * kv_heads
+                    + kv_head
+                ) * selected_capacity + selected_ordinal
+                temporal_ordinal = source_by_chunk.get(chunk)
+                hit = (
+                    temporal_ordinal is not None
+                    and validity[
+                        component,
+                        request_slot,
+                        local_layer,
+                        kv_head,
+                        temporal_ordinal,
+                    ].item()
+                    == 1
+                )
+                if hit:
+                    kinds[component, row, selected_ordinal] = 1
+                    sources[component, row, selected_ordinal] = (
+                        (
+                            (component * request_slots + request_slot) * local_layers
+                            + local_layer
+                        )
+                        * kv_heads
+                        + kv_head
+                    ) * temporal_capacity + temporal_ordinal
+                    counts[component, row, 0] += 1
+                else:
+                    kinds[component, row, selected_ordinal] = 2
+                    misses[component, row, selected_ordinal] = counts[component, row, 1]
+                    counts[component, row, 1] += 1
+    return kinds, sources, destinations, misses, counts
+
+
+def _device_plan_arguments():
+    selected = torch.tensor([[8, 5, 8, 99, 6]], dtype=torch.int32, device="cuda")
+    selected_lengths = torch.tensor([5], dtype=torch.int32, device="cuda")
+    exact = torch.tensor([[99, 99, -1]], dtype=torch.int32, device="cuda")
+    exact_lengths = torch.tensor([2], dtype=torch.int32, device="cuda")
+    temporal = torch.full((1, 2, 2, 3), -1, dtype=torch.int32, device="cuda")
+    temporal[0, 1, 1] = torch.tensor([5, 6, 8], dtype=torch.int32, device="cuda")
+    validity = torch.zeros((2, 1, 2, 2, 3), dtype=torch.uint8, device="cuda")
+    validity[0, 0, 1, 1] = torch.tensor([1, 0, 1], dtype=torch.uint8, device="cuda")
+    validity[1, 0, 1, 1] = torch.tensor([0, 1, 1], dtype=torch.uint8, device="cuda")
+    publications = torch.full((2, 1, 2, 2, 3), -1, dtype=torch.int64, device="cuda")
+    publications[0, 0, 1, 1] = torch.tensor(
+        [4, -1, 5], dtype=torch.int64, device="cuda"
+    )
+    publications[1, 0, 1, 1] = torch.tensor(
+        [-1, 6, 5], dtype=torch.int64, device="cuda"
+    )
+    return (
+        selected,
+        selected_lengths,
+        exact,
+        exact_lengths,
+        temporal,
+        validity,
+        publications,
+        torch.tensor([7], dtype=torch.int64, device="cuda"),
+        torch.tensor([3], dtype=torch.int64, device="cuda"),
+        torch.tensor([[0, 1, 1]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[7, 3, 9]], dtype=torch.int64, device="cuda"),
+        torch.tensor([1], dtype=torch.int32, device="cuda"),
+    )
 
 
 def _packed_gqa_reference(query, keys, values, lengths):
@@ -467,3 +583,218 @@ def test_shadowkv_plan_reuse_rejects_invalid_active_region():
             max_reuse_chunks=2,
             chunk_size=8,
         )
+
+
+def test_shadowkv_plan_device_matches_component_aware_readable_contract():
+    arguments = _device_plan_arguments()
+    expected = _device_plan_reference(arguments, plan_capacity=2)
+
+    actual = sgl_kernel.shadowkv_plan_device(*arguments, plan_capacity=2)
+    repeated = sgl_kernel.shadowkv_plan_device(*arguments, plan_capacity=2)
+
+    assert not actual.error_codes.any().item()
+    assert torch.equal(actual.component_kinds, expected[0])
+    assert torch.equal(actual.source_slots, expected[1])
+    assert torch.equal(actual.destination_slots, expected[2])
+    assert torch.equal(actual.miss_ordinals, expected[3])
+    assert torch.equal(actual.counts, expected[4])
+    assert torch.equal(actual.component_kinds, repeated.component_kinds)
+    assert actual.selected_chunk_ids.data_ptr() == arguments[0].data_ptr()
+    assert actual.row_indices.data_ptr() == arguments[9].data_ptr()
+
+
+def test_shadowkv_plan_device_matches_random_ragged_and_stale_owner_rows():
+    generator = torch.Generator(device="cuda").manual_seed(20260831)
+    rows = 24
+    selected_capacity = 17
+    exact_capacity = 7
+    temporal_capacity = 11
+    request_slots = 3
+    local_layers = 2
+    kv_heads = 4
+    plan_capacity = 5
+    selected = torch.randint(
+        0,
+        23,
+        (rows, selected_capacity),
+        dtype=torch.int32,
+        device="cuda",
+        generator=generator,
+    )
+    selected_lengths = torch.randint(
+        0,
+        selected_capacity + 1,
+        (rows,),
+        dtype=torch.int32,
+        device="cuda",
+        generator=generator,
+    )
+    exact = torch.randint(
+        0,
+        23,
+        (rows, exact_capacity),
+        dtype=torch.int32,
+        device="cuda",
+        generator=generator,
+    )
+    exact_lengths = torch.randint(
+        0,
+        exact_capacity + 1,
+        (rows,),
+        dtype=torch.int32,
+        device="cuda",
+        generator=generator,
+    )
+    temporal = (
+        torch.arange(temporal_capacity, dtype=torch.int32, device="cuda")
+        .expand(request_slots, local_layers, kv_heads, -1)
+        .contiguous()
+    )
+    validity = torch.randint(
+        0,
+        2,
+        (2, request_slots, local_layers, kv_heads, temporal_capacity),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=generator,
+    )
+    publications = torch.where(
+        validity.bool(),
+        torch.ones_like(validity, dtype=torch.int64),
+        torch.full_like(validity, -1, dtype=torch.int64),
+    )
+    request_generations = torch.tensor([7, 8, 9], dtype=torch.int64, device="cuda")
+    layout_generations = torch.tensor([3, 3, 4], dtype=torch.int64, device="cuda")
+    row_indices = torch.empty((rows, 3), dtype=torch.int32, device="cuda")
+    row_indices[:, 0] = torch.arange(rows, device="cuda") % request_slots
+    row_indices[:, 1] = torch.arange(rows, device="cuda") % local_layers
+    row_indices[:, 2] = torch.arange(rows, device="cuda") % kv_heads
+    row_generations = torch.empty((rows, 3), dtype=torch.int64, device="cuda")
+    row_generations[:, 0] = request_generations[row_indices[:, 0].long()]
+    row_generations[:, 1] = layout_generations[row_indices[:, 0].long()]
+    row_generations[:, 2] = 9
+    row_generations[::3, 0] += 1
+    plan_slots = torch.arange(rows, dtype=torch.int32, device="cuda") % plan_capacity
+    arguments = (
+        selected,
+        selected_lengths,
+        exact,
+        exact_lengths,
+        temporal,
+        validity,
+        publications,
+        request_generations,
+        layout_generations,
+        row_indices,
+        row_generations,
+        plan_slots,
+    )
+    expected = _device_plan_reference(arguments, plan_capacity)
+
+    actual = sgl_kernel.shadowkv_plan_device(*arguments, plan_capacity=plan_capacity)
+
+    assert not actual.error_codes.any().item()
+    assert torch.equal(actual.component_kinds, expected[0])
+    assert torch.equal(actual.source_slots, expected[1])
+    assert torch.equal(actual.destination_slots, expected[2])
+    assert torch.equal(actual.miss_ordinals, expected[3])
+    assert torch.equal(actual.counts, expected[4])
+
+
+@pytest.mark.parametrize(
+    "mutation,error_code",
+    [
+        ("invalid-length", 1),
+        ("invalid-chunk", 2),
+        ("invalid-identity", 3),
+        ("invalid-plan-slot", 4),
+        ("invalid-validity", 5),
+        ("duplicate-temporal", 6),
+        ("invalid-publication", 7),
+    ],
+)
+def test_shadowkv_plan_device_defers_row_errors(mutation, error_code):
+    arguments = list(_device_plan_arguments())
+    if mutation == "invalid-length":
+        arguments[1][0] = 6
+    elif mutation == "invalid-chunk":
+        arguments[0][0, 0] = -1
+    elif mutation == "invalid-identity":
+        arguments[9][0, 1] = 2
+    elif mutation == "invalid-plan-slot":
+        arguments[11][0] = 2
+    elif mutation == "invalid-validity":
+        arguments[5][0, 0, 1, 1, 0] = 2
+    elif mutation == "duplicate-temporal":
+        arguments[4][0, 1, 1, 1] = 5
+    elif mutation == "invalid-publication":
+        arguments[6][0, 0, 1, 1, 0] = 9
+
+    plan = sgl_kernel.shadowkv_plan_device(*arguments, plan_capacity=2)
+
+    assert plan.error_codes.cpu().tolist() == [error_code]
+    assert torch.equal(plan.component_kinds, torch.full_like(plan.component_kinds, -1))
+    assert torch.equal(plan.source_slots, torch.full_like(plan.source_slots, -1))
+    assert torch.equal(
+        plan.destination_slots, torch.full_like(plan.destination_slots, -1)
+    )
+    assert torch.equal(plan.miss_ordinals, torch.full_like(plan.miss_ordinals, -1))
+    assert torch.equal(plan.counts, torch.zeros_like(plan.counts))
+
+
+def test_shadowkv_plan_device_preserves_guard_regions():
+    arguments = _device_plan_arguments()
+    expected = _device_plan_reference(arguments, plan_capacity=2)
+    rows, selected_capacity = arguments[0].shape
+    guard = 31
+
+    def guarded(shape, dtype, fill):
+        elements = math.prod(shape)
+        storage = torch.full(
+            (guard + elements + guard,), fill, dtype=dtype, device="cuda"
+        )
+        return storage, storage[guard : guard + elements].view(shape)
+
+    kind_storage, kinds = guarded((2, rows, selected_capacity), torch.int8, 99)
+    source_storage, sources = guarded((2, rows, selected_capacity), torch.int32, 997)
+    destination_storage, destinations = guarded(
+        (2, rows, selected_capacity), torch.int32, 998
+    )
+    miss_storage, misses = guarded((2, rows, selected_capacity), torch.int32, 999)
+    count_storage, counts = guarded((2, rows, 2), torch.int32, 1000)
+    error_storage, errors = guarded((rows,), torch.int32, 1001)
+    torch.ops.sgl_kernel.shadowkv_plan_device.default(
+        *arguments,
+        2,
+        kinds,
+        sources,
+        destinations,
+        misses,
+        counts,
+        errors,
+    )
+
+    assert torch.equal(kinds, expected[0])
+    assert torch.equal(sources, expected[1])
+    assert torch.equal(destinations, expected[2])
+    assert torch.equal(misses, expected[3])
+    assert torch.equal(counts, expected[4])
+    assert not errors.any().item()
+    for storage, fill in (
+        (kind_storage, 99),
+        (source_storage, 997),
+        (destination_storage, 998),
+        (miss_storage, 999),
+        (count_storage, 1000),
+        (error_storage, 1001),
+    ):
+        assert torch.equal(storage[:guard], torch.full_like(storage[:guard], fill))
+        assert torch.equal(storage[-guard:], torch.full_like(storage[-guard:], fill))
+
+
+def test_shadowkv_plan_device_wrapper_has_no_error_materialization():
+    import inspect
+
+    source = inspect.getsource(sgl_kernel.shadowkv_plan_device)
+    assert ".cpu(" not in source
+    assert ".item(" not in source

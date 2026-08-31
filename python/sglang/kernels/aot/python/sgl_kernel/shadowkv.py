@@ -26,12 +26,55 @@ class ShadowKVReusePlan:
         return self.plan[..., 2]
 
 
+class ShadowKVDevicePlan:
+    """Compact component-aware plan whose validation remains on the device."""
+
+    __slots__ = (
+        "component_kinds",
+        "counts",
+        "destination_slots",
+        "error_codes",
+        "miss_ordinals",
+        "row_generations",
+        "row_indices",
+        "selected_chunk_ids",
+        "selected_lengths",
+        "source_slots",
+    )
+
+    def __init__(
+        self,
+        *,
+        row_indices: torch.Tensor,
+        row_generations: torch.Tensor,
+        selected_chunk_ids: torch.Tensor,
+        selected_lengths: torch.Tensor,
+        component_kinds: torch.Tensor,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+        miss_ordinals: torch.Tensor,
+        counts: torch.Tensor,
+        error_codes: torch.Tensor,
+    ) -> None:
+        self.row_indices = row_indices
+        self.row_generations = row_generations
+        self.selected_chunk_ids = selected_chunk_ids
+        self.selected_lengths = selected_lengths
+        self.component_kinds = component_kinds
+        self.source_slots = source_slots
+        self.destination_slots = destination_slots
+        self.miss_ordinals = miss_ordinals
+        self.counts = counts
+        self.error_codes = error_codes
+
+
 def shadowkv_kernels_available() -> bool:
     """Return whether this wheel contains the optional ShadowKV operators."""
 
     return (
         hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct_rope")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_device")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_reuse")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_packed_gqa")
     )
@@ -234,6 +277,151 @@ def shadowkv_reconstruct(
             raise ValueError("out must share the reconstruction CUDA device")
     torch.ops.sgl_kernel.shadowkv_reconstruct.default(u, sv, positions, out)
     return out
+
+
+def shadowkv_plan_device(
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    exact_chunk_ids: torch.Tensor,
+    exact_lengths: torch.Tensor,
+    temporal_chunk_ids: torch.Tensor,
+    temporal_component_validity: torch.Tensor,
+    temporal_publication_generations: torch.Tensor,
+    temporal_request_generations: torch.Tensor,
+    temporal_layout_generations: torch.Tensor,
+    row_indices: torch.Tensor,
+    row_generations: torch.Tensor,
+    plan_slots: torch.Tensor,
+    *,
+    plan_capacity: int,
+) -> ShadowKVDevicePlan:
+    """Launch the compact K/V planner without materializing deferred errors."""
+
+    inputs = (
+        ("selected_chunk_ids", selected_chunk_ids, torch.int32, 2),
+        ("selected_lengths", selected_lengths, torch.int32, 1),
+        ("exact_chunk_ids", exact_chunk_ids, torch.int32, 2),
+        ("exact_lengths", exact_lengths, torch.int32, 1),
+        ("temporal_chunk_ids", temporal_chunk_ids, torch.int32, 4),
+        (
+            "temporal_component_validity",
+            temporal_component_validity,
+            torch.uint8,
+            5,
+        ),
+        (
+            "temporal_publication_generations",
+            temporal_publication_generations,
+            torch.int64,
+            5,
+        ),
+        (
+            "temporal_request_generations",
+            temporal_request_generations,
+            torch.int64,
+            1,
+        ),
+        (
+            "temporal_layout_generations",
+            temporal_layout_generations,
+            torch.int64,
+            1,
+        ),
+        ("row_indices", row_indices, torch.int32, 2),
+        ("row_generations", row_generations, torch.int64, 2),
+        ("plan_slots", plan_slots, torch.int32, 1),
+    )
+    for name, tensor, dtype, dimensions in inputs:
+        _require_tensor(name, tensor, dtype=dtype, dimensions=dimensions)
+    rows, selected_capacity = selected_chunk_ids.shape
+    exact_capacity = exact_chunk_ids.shape[1]
+    request_slots, local_layers, kv_heads, temporal_capacity = temporal_chunk_ids.shape
+    if not 1 <= selected_capacity <= 256:
+        raise ValueError("selected capacity must be between 1 and 256")
+    if exact_capacity > 64:
+        raise ValueError("exact capacity must not exceed 64")
+    if request_slots < 1 or local_layers < 1 or kv_heads < 1:
+        raise ValueError("temporal owner dimensions must be positive")
+    if temporal_capacity > selected_capacity:
+        raise ValueError("temporal capacity must not exceed selected capacity")
+    if isinstance(plan_capacity, bool) or not isinstance(plan_capacity, int):
+        raise TypeError("plan_capacity must be an integer")
+    if plan_capacity < 1:
+        raise ValueError("plan_capacity must be positive")
+    if 2 * plan_capacity * kv_heads * selected_capacity > 2**31:
+        raise ValueError("logical destination slots exceed int32")
+    if 2 * request_slots * local_layers * kv_heads * temporal_capacity > 2**31:
+        raise ValueError("logical source slots exceed int32")
+    if (
+        selected_lengths.shape != (rows,)
+        or exact_chunk_ids.shape[0] != rows
+        or exact_lengths.shape != (rows,)
+        or plan_slots.shape != (rows,)
+    ):
+        raise ValueError("selected, exact, and plan-slot row counts differ")
+    if row_indices.shape != (rows, 3) or row_generations.shape != (rows, 3):
+        raise ValueError("row identity tensors must have shape [rows, 3]")
+    temporal_shape = (
+        2,
+        request_slots,
+        local_layers,
+        kv_heads,
+        temporal_capacity,
+    )
+    if (
+        temporal_component_validity.shape != temporal_shape
+        or temporal_publication_generations.shape != temporal_shape
+    ):
+        raise ValueError("temporal component tensors have incompatible shapes")
+    if temporal_request_generations.shape != (
+        request_slots,
+    ) or temporal_layout_generations.shape != (request_slots,):
+        raise ValueError("temporal owner generations must have shape [request_slots]")
+    device = selected_chunk_ids.device
+    if any(tensor.device != device for _, tensor, _, _ in inputs):
+        raise ValueError("all device-plan tensors must share one CUDA device")
+    _require_b200(device)
+
+    component_shape = (2, rows, selected_capacity)
+    component_kinds = torch.empty(component_shape, dtype=torch.int8, device=device)
+    source_slots = torch.empty(component_shape, dtype=torch.int32, device=device)
+    destination_slots = torch.empty(component_shape, dtype=torch.int32, device=device)
+    miss_ordinals = torch.empty(component_shape, dtype=torch.int32, device=device)
+    counts = torch.empty((2, rows, 2), dtype=torch.int32, device=device)
+    error_codes = torch.empty((rows,), dtype=torch.int32, device=device)
+    torch.ops.sgl_kernel.shadowkv_plan_device.default(
+        selected_chunk_ids,
+        selected_lengths,
+        exact_chunk_ids,
+        exact_lengths,
+        temporal_chunk_ids,
+        temporal_component_validity,
+        temporal_publication_generations,
+        temporal_request_generations,
+        temporal_layout_generations,
+        row_indices,
+        row_generations,
+        plan_slots,
+        plan_capacity,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        counts,
+        error_codes,
+    )
+    return ShadowKVDevicePlan(
+        row_indices=row_indices,
+        row_generations=row_generations,
+        selected_chunk_ids=selected_chunk_ids,
+        selected_lengths=selected_lengths,
+        component_kinds=component_kinds,
+        source_slots=source_slots,
+        destination_slots=destination_slots,
+        miss_ordinals=miss_ordinals,
+        counts=counts,
+        error_codes=error_codes,
+    )
 
 
 def shadowkv_plan_reuse(
