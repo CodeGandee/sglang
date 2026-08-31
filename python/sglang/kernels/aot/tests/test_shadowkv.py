@@ -601,6 +601,7 @@ def test_shadowkv_plan_device_matches_component_aware_readable_contract():
     assert torch.equal(actual.component_kinds, repeated.component_kinds)
     assert actual.selected_chunk_ids.data_ptr() == arguments[0].data_ptr()
     assert actual.row_indices.data_ptr() == arguments[9].data_ptr()
+    assert actual.plan_slots.data_ptr() == arguments[11].data_ptr()
 
 
 def test_shadowkv_plan_device_matches_random_ragged_and_stale_owner_rows():

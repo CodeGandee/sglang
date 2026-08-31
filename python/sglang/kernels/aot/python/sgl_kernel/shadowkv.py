@@ -35,6 +35,7 @@ class ShadowKVDevicePlan:
         "destination_slots",
         "error_codes",
         "miss_ordinals",
+        "plan_slots",
         "row_generations",
         "row_indices",
         "selected_chunk_ids",
@@ -49,6 +50,7 @@ class ShadowKVDevicePlan:
         row_generations: torch.Tensor,
         selected_chunk_ids: torch.Tensor,
         selected_lengths: torch.Tensor,
+        plan_slots: torch.Tensor,
         component_kinds: torch.Tensor,
         source_slots: torch.Tensor,
         destination_slots: torch.Tensor,
@@ -60,6 +62,7 @@ class ShadowKVDevicePlan:
         self.row_generations = row_generations
         self.selected_chunk_ids = selected_chunk_ids
         self.selected_lengths = selected_lengths
+        self.plan_slots = plan_slots
         self.component_kinds = component_kinds
         self.source_slots = source_slots
         self.destination_slots = destination_slots
@@ -415,6 +418,7 @@ def shadowkv_plan_device(
         row_generations=row_generations,
         selected_chunk_ids=selected_chunk_ids,
         selected_lengths=selected_lengths,
+        plan_slots=plan_slots,
         component_kinds=component_kinds,
         source_slots=source_slots,
         destination_slots=destination_slots,
