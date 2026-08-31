@@ -63,6 +63,9 @@ __device__ __forceinline__ float block_max(float value, float* shared) {
   value = threadIdx.x < kWarps ? shared[lane] : -FLT_MAX;
   if (warp == 0) {
     value = warp_max(value);
+    // Volta and newer GPUs schedule warp lanes independently. Publish the
+    // shared-memory reads before lane zero reuses reduction[0].
+    __syncwarp();
   }
   if (threadIdx.x == 0) {
     shared[0] = value;
@@ -82,6 +85,8 @@ __device__ __forceinline__ float block_sum(float value, float* shared) {
   value = threadIdx.x < kWarps ? shared[lane] : 0.0f;
   if (warp == 0) {
     value = warp_sum(value);
+    // Keep the final shared-memory reuse ordered under independent scheduling.
+    __syncwarp();
   }
   if (threadIdx.x == 0) {
     shared[0] = value;
@@ -191,6 +196,9 @@ __global__ void shadowkv_packed_gqa_kernel(
         threadIdx.x < kWarpSize ? reduction[threadIdx.x * kWarpSize] : 0.0f;
     if (threadIdx.x < kWarpSize) {
       warp_total = warp_sum(warp_total);
+      // Every lane must finish reading its warp subtotal before lane zero
+      // overwrites reduction[0] with the block total.
+      __syncwarp();
     }
     if (threadIdx.x == 0) {
       reduction[0] = warp_total;

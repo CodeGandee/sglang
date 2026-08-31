@@ -148,8 +148,19 @@ def test_generic_and_specialized_source_layout_is_explicit():
         directory = AOT_ROOT / f"csrc/shadowkv/{architecture}"
         assert directory.is_dir()
         assert list(directory.glob("*.cu")) == []
-    source = "\n".join(path.read_text(encoding="utf-8") for path in generic.glob("*.cu"))
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in generic.glob("*.cu")
+    )
     assert "__CUDA_ARCH__" not in source
+
+
+def test_packed_gqa_shared_reductions_use_explicit_warp_barriers():
+    source = (AOT_ROOT / "csrc/shadowkv/generic/packed_gqa.cu").read_text(
+        encoding="utf-8"
+    )
+    assert source.count("__syncwarp();") == 3
+    assert "before lane zero reuses reduction[0]" in source
+    assert "overwrites reduction[0] with the block total" in source
 
 
 def test_shadowkv_extension_is_separate_from_common_ops():
@@ -157,13 +168,14 @@ def test_shadowkv_extension_is_separate_from_common_ops():
     common_extension = (AOT_ROOT / "csrc/common_extension.cc").read_text(
         encoding="utf-8"
     )
-    binding = (
-        AOT_ROOT / "csrc/shadowkv/bindings/shadowkv_extension.cc"
-    ).read_text(encoding="utf-8")
+    binding = (AOT_ROOT / "csrc/shadowkv/bindings/shadowkv_extension.cc").read_text(
+        encoding="utf-8"
+    )
     assert "Python_add_library(\n        shadowkv_ops" in cmake
-    assert "${SHADOWKV_GENERIC_SOURCES}" not in cmake.split(
-        "# ======================= Optional ShadowKV Build"
-    )[0]
+    assert (
+        "${SHADOWKV_GENERIC_SOURCES}"
+        not in cmake.split("# ======================= Optional ShadowKV Build")[0]
+    )
     assert "shadowkv_reconstruct" not in common_extension
     assert "shadowkv_reconstruct_generic_aot_v1" in binding
     assert "REGISTER_EXTENSION(shadowkv_ops)" in binding
