@@ -144,6 +144,7 @@ else:
             ShadowKVReusePlan,
             shadowkv_a100_fused_key_kernels_available,
             shadowkv_fused_key_a100,
+            shadowkv_fused_key_mapped_value_a100,
             shadowkv_packed_gqa,
             shadowkv_place_device,
             shadowkv_place_device_mapped_host,

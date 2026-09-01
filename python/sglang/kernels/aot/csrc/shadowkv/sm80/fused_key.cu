@@ -16,6 +16,7 @@ limitations under the License.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -775,12 +776,10 @@ __global__ void shadowkv_place_value_a100_kernel(
   destination_key_values[destination_vector] = value_source[source_vector];
 }
 
-}  // namespace
-
-void shadowkv_fused_key_a100(
+PlanGeometry validate_fused_key_a100(
     const at::Tensor& u,
     const at::Tensor& sv,
-    at::Tensor& gathered_u,
+    const at::Tensor& gathered_u,
     const at::Tensor& cosine,
     const at::Tensor& sine,
     const at::Tensor& component_kinds,
@@ -790,10 +789,10 @@ void shadowkv_fused_key_a100(
     const at::Tensor& selected_chunk_ids,
     const at::Tensor& selected_lengths,
     const at::Tensor& plan_slots,
-    at::Tensor& planner_error_codes,
+    const at::Tensor& planner_error_codes,
     const at::Tensor& temporal_key_values,
     int64_t plan_capacity,
-    at::Tensor& destination_key_values) {
+    const at::Tensor& destination_key_values) {
   check_tensor(u, "u", at::ScalarType::BFloat16, 2);
   check_tensor(sv, "sv", at::ScalarType::BFloat16, 3);
   check_tensor(gathered_u, "gathered_u", at::ScalarType::BFloat16, 3);
@@ -855,9 +854,29 @@ void shadowkv_fused_key_a100(
         tensor->device() == device,
         "all A100 fused-key tensors must share one CUDA device");
   }
-  c10::cuda::CUDAGuard device_guard(device);
-  check_sm80(u);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  return geometry;
+}
+
+void launch_fused_key_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const PlanGeometry& geometry,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
   shadowkv_prepare_key_bmm_a100_kernel
       <<<kKVHeads * kSelectedCapacity, kThreads, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(u.data_ptr<at::BFloat16>()),
@@ -897,6 +916,200 @@ void shadowkv_fused_key_a100(
           reinterpret_cast<uint4*>(
               destination_key_values.data_ptr<at::BFloat16>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+PlanGeometry validate_mapped_value_a100(
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    const at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t mapped_host_bytes,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    int64_t plan_capacity,
+    const at::Tensor& destination_key_values) {
+  check_tensor(miss_ordinals, "miss_ordinals", at::ScalarType::Int, 3);
+  check_tensor(selected_chunk_ids, "selected_chunk_ids", at::ScalarType::Int, 2);
+  check_tensor(value_miss_chunk_ids, "value_miss_chunk_ids", at::ScalarType::Int, 2);
+  check_tensor(value_miss_lengths, "value_miss_lengths", at::ScalarType::Int, 1);
+  check_tensor(descriptor_generation, "descriptor_generation", at::ScalarType::Long, 1);
+  check_tensor(descriptor_validity, "descriptor_validity", at::ScalarType::Byte, 1);
+  const PlanGeometry geometry = check_plan_tensors(
+      component_kinds,
+      source_slots,
+      destination_slots,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      plan_capacity,
+      destination_key_values);
+  TORCH_CHECK(
+      miss_ordinals.sizes() == component_kinds.sizes(),
+      "miss_ordinals must have shape [2, 8, 256]");
+  const auto compact_shape =
+      at::IntArrayRef({kKVHeads, kSelectedCapacity});
+  TORCH_CHECK(
+      selected_chunk_ids.sizes() == compact_shape &&
+          value_miss_chunk_ids.sizes() == compact_shape,
+      "selected and value-miss chunk ids must have shape [8, 256]");
+  TORCH_CHECK(
+      value_miss_lengths.sizes() == at::IntArrayRef({kKVHeads}) &&
+          descriptor_generation.sizes() == at::IntArrayRef({1}) &&
+          descriptor_validity.sizes() == at::IntArrayRef({1}),
+      "value descriptor rows or generation have invalid shapes");
+  TORCH_CHECK(
+      mapped_host_pointer > 0 && mapped_host_pointer % kVectorBytes == 0,
+      "mapped host pointer is invalid");
+  TORCH_CHECK(
+      prompt_chunk_capacity >= 1 && prompt_tokens >= 1 &&
+          prompt_tokens <= prompt_chunk_capacity * kChunkSize,
+      "mapped host prompt bounds are invalid");
+  TORCH_CHECK(
+      prompt_chunk_capacity <=
+          std::numeric_limits<int64_t>::max() / kKVHeads / kChunkBytes,
+      "mapped host byte range overflows int64");
+  TORCH_CHECK(
+      mapped_host_bytes >= kKVHeads * prompt_chunk_capacity * kChunkBytes,
+      "mapped host byte range is smaller than its declared shape");
+  TORCH_CHECK(expected_generation >= 0, "expected_generation must be nonnegative");
+  const auto device = component_kinds.device();
+  const at::Tensor* tensors[] = {
+      &miss_ordinals,
+      &selected_chunk_ids,
+      &value_miss_chunk_ids,
+      &value_miss_lengths,
+      &descriptor_generation,
+      &descriptor_validity,
+  };
+  for (const at::Tensor* tensor : tensors) {
+    TORCH_CHECK(
+        tensor->device() == device,
+        "all A100 mapped-value tensors must share one CUDA device");
+  }
+  return geometry;
+}
+
+void launch_mapped_value_a100(
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    const PlanGeometry& geometry,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  shadowkv_place_value_a100_kernel<ValueSource::kMappedHost>
+      <<<kKVHeads * kSelectedCapacity, kVectorsPerChunk, 0, stream>>>(
+          component_kinds.data_ptr<int8_t>(),
+          source_slots.data_ptr<int32_t>(),
+          destination_slots.data_ptr<int32_t>(),
+          miss_ordinals.data_ptr<int32_t>(),
+          selected_chunk_ids.data_ptr<int32_t>(),
+          selected_lengths.data_ptr<int32_t>(),
+          plan_slots.data_ptr<int32_t>(),
+          planner_error_codes.data_ptr<int32_t>(),
+          reinterpret_cast<const uint4*>(
+              temporal_key_values.data_ptr<at::BFloat16>()),
+          value_miss_chunk_ids.data_ptr<int32_t>(),
+          value_miss_lengths.data_ptr<int32_t>(),
+          descriptor_generation.data_ptr<int64_t>(),
+          descriptor_validity.data_ptr<uint8_t>(),
+          expected_generation,
+          geometry.temporal_chunks_per_component,
+          static_cast<int>(plan_capacity),
+          reinterpret_cast<const uint4*>(
+              static_cast<uintptr_t>(mapped_host_pointer)),
+          static_cast<int>(prompt_chunk_capacity),
+          static_cast<int>(prompt_tokens),
+          reinterpret_cast<uint4*>(
+              destination_key_values.data_ptr<at::BFloat16>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace
+
+void shadowkv_fused_key_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values) {
+  const PlanGeometry geometry = validate_fused_key_a100(
+          u,
+          sv,
+          gathered_u,
+          cosine,
+          sine,
+          component_kinds,
+          source_slots,
+          destination_slots,
+          miss_ordinals,
+          selected_chunk_ids,
+          selected_lengths,
+          plan_slots,
+          planner_error_codes,
+          temporal_key_values,
+          plan_capacity,
+          destination_key_values);
+  const auto device = u.device();
+  c10::cuda::CUDAGuard device_guard(device);
+  check_sm80(u);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  launch_fused_key_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      geometry,
+      plan_capacity,
+      destination_key_values,
+      stream);
 }
 
 void shadowkv_place_value_a100(
@@ -1083,92 +1296,177 @@ void shadowkv_place_value_mapped_host_a100(
     int64_t expected_generation,
     int64_t plan_capacity,
     at::Tensor& destination_key_values) {
-  check_tensor(miss_ordinals, "miss_ordinals", at::ScalarType::Int, 3);
-  check_tensor(selected_chunk_ids, "selected_chunk_ids", at::ScalarType::Int, 2);
-  check_tensor(value_miss_chunk_ids, "value_miss_chunk_ids", at::ScalarType::Int, 2);
-  check_tensor(value_miss_lengths, "value_miss_lengths", at::ScalarType::Int, 1);
-  check_tensor(descriptor_generation, "descriptor_generation", at::ScalarType::Long, 1);
-  check_tensor(descriptor_validity, "descriptor_validity", at::ScalarType::Byte, 1);
-  const PlanGeometry geometry = check_plan_tensors(
+  const PlanGeometry geometry = validate_mapped_value_a100(
       component_kinds,
       source_slots,
       destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      mapped_host_bytes,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      plan_capacity,
+      destination_key_values);
+  const auto device = component_kinds.device();
+  c10::cuda::CUDAGuard device_guard(device);
+  check_sm80(component_kinds);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  launch_mapped_value_a100(
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      geometry,
+      plan_capacity,
+      destination_key_values,
+      stream);
+}
+
+void shadowkv_fused_key_mapped_value_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t mapped_host_bytes,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    int64_t plan_capacity,
+    int64_t reconstruction_stream,
+    at::Tensor& destination_key_values) {
+  const PlanGeometry key_geometry = validate_fused_key_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
       selected_lengths,
       plan_slots,
       planner_error_codes,
       temporal_key_values,
       plan_capacity,
       destination_key_values);
-  TORCH_CHECK(
-      miss_ordinals.sizes() == component_kinds.sizes(),
-      "miss_ordinals must have shape [2, 8, 256]");
-  const auto compact_shape =
-      at::IntArrayRef({kKVHeads, kSelectedCapacity});
-  TORCH_CHECK(
-      selected_chunk_ids.sizes() == compact_shape &&
-          value_miss_chunk_ids.sizes() == compact_shape,
-      "selected and value-miss chunk ids must have shape [8, 256]");
-  TORCH_CHECK(
-      value_miss_lengths.sizes() == at::IntArrayRef({kKVHeads}) &&
-          descriptor_generation.sizes() == at::IntArrayRef({1}) &&
-          descriptor_validity.sizes() == at::IntArrayRef({1}),
-      "value descriptor rows or generation have invalid shapes");
-  TORCH_CHECK(
-      mapped_host_pointer > 0 && mapped_host_pointer % kVectorBytes == 0,
-      "mapped host pointer is invalid");
-  TORCH_CHECK(
-      prompt_chunk_capacity >= 1 && prompt_tokens >= 1 &&
-          prompt_tokens <= prompt_chunk_capacity * kChunkSize,
-      "mapped host prompt bounds are invalid");
-  TORCH_CHECK(
-      prompt_chunk_capacity <=
-          std::numeric_limits<int64_t>::max() / kKVHeads / kChunkBytes,
-      "mapped host byte range overflows int64");
-  TORCH_CHECK(
-      mapped_host_bytes >= kKVHeads * prompt_chunk_capacity * kChunkBytes,
-      "mapped host byte range is smaller than its declared shape");
-  TORCH_CHECK(expected_generation >= 0, "expected_generation must be nonnegative");
+  const PlanGeometry value_geometry = validate_mapped_value_a100(
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      mapped_host_bytes,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      plan_capacity,
+      destination_key_values);
   const auto device = component_kinds.device();
-  const at::Tensor* tensors[] = {
-      &miss_ordinals,
-      &selected_chunk_ids,
-      &value_miss_chunk_ids,
-      &value_miss_lengths,
-      &descriptor_generation,
-      &descriptor_validity,
-  };
-  for (const at::Tensor* tensor : tensors) {
-    TORCH_CHECK(
-        tensor->device() == device,
-        "all A100 mapped-value tensors must share one CUDA device");
-  }
   c10::cuda::CUDAGuard device_guard(device);
   check_sm80(component_kinds);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  shadowkv_place_value_a100_kernel<ValueSource::kMappedHost>
-      <<<kKVHeads * kSelectedCapacity, kVectorsPerChunk, 0, stream>>>(
-          component_kinds.data_ptr<int8_t>(),
-          source_slots.data_ptr<int32_t>(),
-          destination_slots.data_ptr<int32_t>(),
-          miss_ordinals.data_ptr<int32_t>(),
-          selected_chunk_ids.data_ptr<int32_t>(),
-          selected_lengths.data_ptr<int32_t>(),
-          plan_slots.data_ptr<int32_t>(),
-          planner_error_codes.data_ptr<int32_t>(),
-          reinterpret_cast<const uint4*>(
-              temporal_key_values.data_ptr<at::BFloat16>()),
-          value_miss_chunk_ids.data_ptr<int32_t>(),
-          value_miss_lengths.data_ptr<int32_t>(),
-          descriptor_generation.data_ptr<int64_t>(),
-          descriptor_validity.data_ptr<uint8_t>(),
-          expected_generation,
-          geometry.temporal_chunks_per_component,
-          static_cast<int>(plan_capacity),
-          reinterpret_cast<const uint4*>(
-              static_cast<uintptr_t>(mapped_host_pointer)),
-          static_cast<int>(prompt_chunk_capacity),
-          static_cast<int>(prompt_tokens),
-          reinterpret_cast<uint4*>(
-              destination_key_values.data_ptr<at::BFloat16>()));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  cudaStream_t value_stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t key_stream = reinterpret_cast<cudaStream_t>(reconstruction_stream);
+  int key_stream_device = -1;
+  C10_CUDA_CHECK(cudaStreamGetDevice(key_stream, &key_stream_device));
+  TORCH_CHECK(
+      key_stream_device == device.index(),
+      "A100 fused reconstruction stream must target the plan CUDA device");
+  TORCH_CHECK(
+      key_stream != value_stream,
+      "A100 fused reconstruction and mapped-value streams must be distinct");
+
+  launch_mapped_value_a100(
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      value_geometry,
+      plan_capacity,
+      destination_key_values,
+      value_stream);
+
+  const c10::cuda::CUDAStream external_key_stream =
+      c10::cuda::getStreamFromExternal(key_stream, device.index());
+  c10::cuda::CUDAStreamGuard key_stream_guard(external_key_stream);
+  launch_fused_key_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      key_geometry,
+      plan_capacity,
+      destination_key_values,
+      key_stream);
 }

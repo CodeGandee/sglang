@@ -824,6 +824,124 @@ def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
     reason="the installed wheel has no SM80 fused-key child",
 )
 @pytest.mark.parametrize("mode", ["all-hit", "mixed", "all-miss"])
+def test_shadowkv_a100_combined_mapped_value_and_fused_key_matches_split(mode):
+    torch.manual_seed(20260930 + len(mode))
+    u = (torch.randn((2048, 160), device="cuda") * 0.0625).to(torch.bfloat16)
+    sv = (torch.randn((8, 160, 128), device="cuda") * 0.0625).to(torch.bfloat16)
+    inverse = 1.0 / (
+        500_000.0 ** (torch.arange(0, 128, 2, device="cuda", dtype=torch.float32) / 128)
+    )
+    positions = torch.arange(2048, dtype=torch.float32, device="cuda")
+    angles = positions[:, None] * inverse
+    cosine = angles.cos().contiguous()
+    sine = angles.sin().contiguous()
+    plan, temporal_values = _a100_fused_key_case(mode)
+    descriptor_generation = torch.tensor([7], dtype=torch.int64, device="cuda")
+    descriptor_validity = torch.ones((1,), dtype=torch.uint8, device="cuda")
+    host_values = (
+        torch.arange(8 * 256 * 8 * 128, dtype=torch.int32)
+        .remainder_(8192)
+        .to(torch.bfloat16)
+        .view(8, 256, 8, 128)
+        .pin_memory()
+    )
+    mapped_region = sgl_kernel.shadowkv_resolve_mapped_host_region(
+        host_values,
+        device="cuda",
+    )
+    gathered_u = torch.empty((8, 2048, 160), dtype=torch.bfloat16, device="cuda")
+    expected = torch.full(
+        (2, 8, 256, 8, 128),
+        29,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    actual = torch.full_like(expected, 31)
+
+    sgl_kernel.shadowkv_fused_key_a100(
+        u,
+        sv,
+        gathered_u,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        plan_capacity=1,
+        out=expected,
+    )
+    sgl_kernel.shadowkv_place_value_mapped_host_a100(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        plan.value_miss_chunk_ids,
+        plan.value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        mapped_region,
+        prompt_tokens=2048,
+        expected_generation=7,
+        plan_capacity=1,
+        out=expected,
+    )
+
+    caller_stream = torch.cuda.current_stream()
+    mapped_stream = torch.cuda.Stream()
+    reconstruction_stream = torch.cuda.Stream()
+    mapped_stream.wait_stream(caller_stream)
+    reconstruction_stream.wait_stream(caller_stream)
+    with torch.cuda.stream(mapped_stream):
+        actual_keys, actual_values = sgl_kernel.shadowkv_fused_key_mapped_value_a100(
+            u,
+            sv,
+            gathered_u,
+            cosine,
+            sine,
+            plan.component_kinds,
+            plan.source_slots,
+            plan.destination_slots,
+            plan.miss_ordinals,
+            plan.selected_chunk_ids,
+            plan.selected_lengths,
+            plan.plan_slots,
+            plan.error_codes,
+            temporal_values,
+            plan.value_miss_chunk_ids,
+            plan.value_miss_lengths,
+            descriptor_generation,
+            descriptor_validity,
+            mapped_region,
+            reconstruction_stream,
+            prompt_tokens=2048,
+            expected_generation=7,
+            plan_capacity=1,
+            out=actual,
+        )
+    caller_stream.wait_stream(mapped_stream)
+    caller_stream.wait_stream(reconstruction_stream)
+
+    assert actual_keys.data_ptr() == actual[0].data_ptr()
+    assert actual_values.data_ptr() == actual[1].data_ptr()
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    not sgl_kernel.shadowkv_a100_fused_key_kernels_available(),
+    reason="the installed wheel has no SM80 fused-key child",
+)
+@pytest.mark.parametrize("mode", ["all-hit", "mixed", "all-miss"])
 def test_shadowkv_a100_value_only_placement_matches_plan_reference(mode):
     torch.manual_seed(20260920 + len(mode))
     plan, temporal_values = _a100_fused_key_case(mode)

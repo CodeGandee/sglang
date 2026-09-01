@@ -144,6 +144,7 @@ def shadowkv_a100_fused_key_kernels_available() -> bool:
         hasattr(torch.ops.sgl_kernel, name)
         for name in (
             "shadowkv_fused_key_sm80_a100_v2",
+            "shadowkv_fused_key_mapped_value_sm80_a100_v3",
             "shadowkv_place_value_sm80_a100_v1",
             "shadowkv_place_value_miss_only_sm80_a100_v1",
             "shadowkv_place_value_mapped_host_sm80_a100_v1",
@@ -336,6 +337,62 @@ def _launch_shadowkv_place_value_mapped_host_a100(
         prompt_tokens,
         expected_generation,
         plan_capacity,
+        destination_key_values,
+    )
+
+
+def _launch_shadowkv_fused_key_mapped_value_a100(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    gathered_u: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    mapped_host_region: ShadowKVMappedHostRegion,
+    prompt_tokens: int,
+    expected_generation: int,
+    plan_capacity: int,
+    reconstruction_stream: int,
+    destination_key_values: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_fused_key_mapped_value_sm80_a100_v3.default(
+        u,
+        sv,
+        gathered_u,
+        cosine,
+        sine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        mapped_host_region.device_pointer,
+        mapped_host_region.byte_length,
+        mapped_host_region.prompt_chunk_capacity,
+        prompt_tokens,
+        expected_generation,
+        plan_capacity,
+        reconstruction_stream,
         destination_key_values,
     )
 
@@ -546,7 +603,7 @@ def _validate_a100_fused_plan(
     return device
 
 
-def shadowkv_fused_key_a100(
+def _validate_a100_fused_key_inputs(
     u: torch.Tensor,
     sv: torch.Tensor,
     gathered_u: torch.Tensor,
@@ -564,9 +621,7 @@ def shadowkv_fused_key_a100(
     *,
     plan_capacity: int,
     out: torch.Tensor,
-) -> torch.Tensor:
-    """Place K hits and reconstruct K misses directly into an A100 plan slot."""
-
+) -> torch.device:
     _require_tensor("u", u, dtype=torch.bfloat16, dimensions=2)
     _require_tensor("sv", sv, dtype=torch.bfloat16, dimensions=3)
     _require_tensor("gathered_u", gathered_u, dtype=torch.bfloat16, dimensions=3)
@@ -617,6 +672,48 @@ def shadowkv_fused_key_a100(
         )
     ):
         raise ValueError("all A100 fused-key tensors must share one CUDA device")
+    return device
+
+
+def shadowkv_fused_key_a100(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    gathered_u: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    *,
+    plan_capacity: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Place K hits and reconstruct K misses directly into an A100 plan slot."""
+
+    _validate_a100_fused_key_inputs(
+        u,
+        sv,
+        gathered_u,
+        cosine,
+        sine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        plan_capacity=plan_capacity,
+        out=out,
+    )
     _launch_shadowkv_fused_key_a100(
         u,
         sv,
@@ -722,6 +819,59 @@ def _validate_a100_value_descriptor(
         raise ValueError("expected_generation must be nonnegative")
 
 
+def _validate_a100_mapped_value_inputs(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    mapped_host_region: ShadowKVMappedHostRegion,
+    *,
+    prompt_tokens: int,
+    expected_generation: int,
+    plan_capacity: int,
+    out: torch.Tensor,
+) -> torch.device:
+    device = _validate_a100_fused_plan(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        out,
+        plan_capacity=plan_capacity,
+    )
+    _validate_a100_value_descriptor(
+        miss_ordinals,
+        selected_chunk_ids,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        device=device,
+        expected_generation=expected_generation,
+    )
+    if not isinstance(mapped_host_region, ShadowKVMappedHostRegion):
+        raise TypeError("mapped_host_region must be a ShadowKVMappedHostRegion")
+    if mapped_host_region.device != device:
+        raise ValueError("mapped host region must target the plan CUDA device")
+    if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int):
+        raise TypeError("prompt_tokens must be an integer")
+    if not 1 <= prompt_tokens <= mapped_host_region.prompt_chunk_capacity * 8:
+        raise ValueError("prompt_tokens exceed the mapped host region")
+    return device
+
+
 def shadowkv_place_value_miss_only_a100(
     component_kinds: torch.Tensor,
     source_slots: torch.Tensor,
@@ -820,35 +970,26 @@ def shadowkv_place_value_mapped_host_a100(
 ) -> torch.Tensor:
     """Place mapped-host V misses and temporal V hits beside completed fused K."""
 
-    device = _validate_a100_fused_plan(
+    _validate_a100_mapped_value_inputs(
         component_kinds,
         source_slots,
         destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
         selected_lengths,
         plan_slots,
         planner_error_codes,
         temporal_key_values,
-        out,
-        plan_capacity=plan_capacity,
-    )
-    _validate_a100_value_descriptor(
-        miss_ordinals,
-        selected_chunk_ids,
         value_miss_chunk_ids,
         value_miss_lengths,
         descriptor_generation,
         descriptor_validity,
-        device=device,
+        mapped_host_region,
+        prompt_tokens=prompt_tokens,
         expected_generation=expected_generation,
+        plan_capacity=plan_capacity,
+        out=out,
     )
-    if not isinstance(mapped_host_region, ShadowKVMappedHostRegion):
-        raise TypeError("mapped_host_region must be a ShadowKVMappedHostRegion")
-    if mapped_host_region.device != device:
-        raise ValueError("mapped host region must target the plan CUDA device")
-    if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int):
-        raise TypeError("prompt_tokens must be an integer")
-    if not 1 <= prompt_tokens <= mapped_host_region.prompt_chunk_capacity * 8:
-        raise ValueError("prompt_tokens exceed the mapped host region")
     _launch_shadowkv_place_value_mapped_host_a100(
         component_kinds,
         source_slots,
@@ -870,6 +1011,112 @@ def shadowkv_place_value_mapped_host_a100(
         out,
     )
     return out[1].view(8, 2048, 128)
+
+
+def shadowkv_fused_key_mapped_value_a100(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    gathered_u: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    mapped_host_region: ShadowKVMappedHostRegion,
+    reconstruction_stream: torch.cuda.Stream,
+    *,
+    prompt_tokens: int,
+    expected_generation: int,
+    plan_capacity: int,
+    out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch mapped V and exact fused K back-to-back on distinct A100 streams."""
+
+    device = _validate_a100_fused_key_inputs(
+        u,
+        sv,
+        gathered_u,
+        cosine,
+        sine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        plan_capacity=plan_capacity,
+        out=out,
+    )
+    _validate_a100_mapped_value_inputs(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        mapped_host_region,
+        prompt_tokens=prompt_tokens,
+        expected_generation=expected_generation,
+        plan_capacity=plan_capacity,
+        out=out,
+    )
+    if not isinstance(reconstruction_stream, torch.cuda.Stream):
+        raise TypeError("reconstruction_stream must be a torch.cuda.Stream")
+    if reconstruction_stream.device != device:
+        raise ValueError("reconstruction_stream must target the plan CUDA device")
+    reconstruction_stream_id = int(reconstruction_stream.cuda_stream)
+    if reconstruction_stream_id == int(torch.cuda.current_stream(device).cuda_stream):
+        raise ValueError("reconstruction and mapped-value streams must be distinct")
+    _launch_shadowkv_fused_key_mapped_value_a100(
+        u,
+        sv,
+        gathered_u,
+        cosine,
+        sine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        mapped_host_region,
+        prompt_tokens,
+        expected_generation,
+        plan_capacity,
+        reconstruction_stream_id,
+        out,
+    )
+    return (
+        out[0].view(8, 2048, 128),
+        out[1].view(8, 2048, 128),
+    )
 
 
 def shadowkv_reconstruct_rope(
