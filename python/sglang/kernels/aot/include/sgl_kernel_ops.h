@@ -144,6 +144,28 @@ void shadowkv_plan_device(
     at::Tensor& miss_ordinals,
     at::Tensor& counts,
     at::Tensor& error_codes);
+void shadowkv_plan_device_v2(
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& exact_chunk_ids,
+    const at::Tensor& exact_lengths,
+    const at::Tensor& temporal_chunk_ids,
+    const at::Tensor& temporal_component_validity,
+    const at::Tensor& temporal_publication_generations,
+    const at::Tensor& temporal_request_generations,
+    const at::Tensor& temporal_layout_generations,
+    const at::Tensor& row_indices,
+    const at::Tensor& row_generations,
+    const at::Tensor& plan_slots,
+    int64_t plan_capacity,
+    at::Tensor& component_kinds,
+    at::Tensor& source_slots,
+    at::Tensor& destination_slots,
+    at::Tensor& miss_ordinals,
+    at::Tensor& counts,
+    at::Tensor& error_codes,
+    at::Tensor& value_miss_chunk_ids,
+    at::Tensor& value_miss_lengths);
 void shadowkv_place_device(
     const at::Tensor& component_kinds,
     const at::Tensor& source_slots,

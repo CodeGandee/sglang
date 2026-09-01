@@ -170,6 +170,21 @@ def _device_plan_reference(arguments, plan_capacity):
     return kinds, sources, destinations, misses, counts
 
 
+def _value_miss_descriptor_reference(arguments, plan_reference):
+    selected = arguments[0]
+    kinds, _, _, miss_ordinals, counts = plan_reference
+    rows, selected_capacity = selected.shape
+    chunk_ids = torch.full(
+        (rows, selected_capacity), -1, dtype=torch.int32, device="cuda"
+    )
+    for row in range(rows):
+        for selected_ordinal in range(selected_capacity):
+            if kinds[1, row, selected_ordinal].item() == 2:
+                miss_ordinal = miss_ordinals[1, row, selected_ordinal].item()
+                chunk_ids[row, miss_ordinal] = selected[row, selected_ordinal]
+    return chunk_ids, counts[1, :, 1].clone()
+
+
 def _device_plan_arguments():
     selected = torch.tensor([[8, 5, 8, 99, 6]], dtype=torch.int32, device="cuda")
     selected_lengths = torch.tensor([5], dtype=torch.int32, device="cuda")
@@ -670,6 +685,9 @@ def test_shadowkv_plan_device_matches_component_aware_readable_contract():
 
     actual = sgl_kernel.shadowkv_plan_device(*arguments, plan_capacity=2)
     repeated = sgl_kernel.shadowkv_plan_device(*arguments, plan_capacity=2)
+    parallel = sgl_kernel.shadowkv_plan_device_v2(*arguments, plan_capacity=2)
+    parallel_repeated = sgl_kernel.shadowkv_plan_device_v2(*arguments, plan_capacity=2)
+    expected_value_misses = _value_miss_descriptor_reference(arguments, expected)
 
     assert not actual.error_codes.any().item()
     assert torch.equal(actual.component_kinds, expected[0])
@@ -681,6 +699,17 @@ def test_shadowkv_plan_device_matches_component_aware_readable_contract():
     assert actual.selected_chunk_ids.data_ptr() == arguments[0].data_ptr()
     assert actual.row_indices.data_ptr() == arguments[9].data_ptr()
     assert actual.plan_slots.data_ptr() == arguments[11].data_ptr()
+    assert torch.equal(parallel.component_kinds, expected[0])
+    assert torch.equal(parallel.source_slots, expected[1])
+    assert torch.equal(parallel.destination_slots, expected[2])
+    assert torch.equal(parallel.miss_ordinals, expected[3])
+    assert torch.equal(parallel.counts, expected[4])
+    assert torch.equal(parallel.value_miss_chunk_ids, expected_value_misses[0])
+    assert torch.equal(parallel.value_miss_lengths, expected_value_misses[1])
+    assert torch.equal(
+        parallel.value_miss_chunk_ids, parallel_repeated.value_miss_chunk_ids
+    )
+    assert torch.equal(parallel.component_kinds, parallel_repeated.component_kinds)
 
 
 @pytest.mark.parametrize("mode", ["all-hit", "all-miss", "asymmetric"])
@@ -909,6 +938,10 @@ def test_shadowkv_plan_device_matches_random_ragged_and_stale_owner_rows():
     expected = _device_plan_reference(arguments, plan_capacity)
 
     actual = sgl_kernel.shadowkv_plan_device(*arguments, plan_capacity=plan_capacity)
+    parallel = sgl_kernel.shadowkv_plan_device_v2(
+        *arguments, plan_capacity=plan_capacity
+    )
+    expected_value_misses = _value_miss_descriptor_reference(arguments, expected)
 
     assert not actual.error_codes.any().item()
     assert torch.equal(actual.component_kinds, expected[0])
@@ -916,6 +949,13 @@ def test_shadowkv_plan_device_matches_random_ragged_and_stale_owner_rows():
     assert torch.equal(actual.destination_slots, expected[2])
     assert torch.equal(actual.miss_ordinals, expected[3])
     assert torch.equal(actual.counts, expected[4])
+    assert torch.equal(parallel.component_kinds, expected[0])
+    assert torch.equal(parallel.source_slots, expected[1])
+    assert torch.equal(parallel.destination_slots, expected[2])
+    assert torch.equal(parallel.miss_ordinals, expected[3])
+    assert torch.equal(parallel.counts, expected[4])
+    assert torch.equal(parallel.value_miss_chunk_ids, expected_value_misses[0])
+    assert torch.equal(parallel.value_miss_lengths, expected_value_misses[1])
 
 
 @pytest.mark.parametrize(
@@ -948,6 +988,7 @@ def test_shadowkv_plan_device_defers_row_errors(mutation, error_code):
         arguments[6][0, 0, 1, 1, 0] = 9
 
     plan = sgl_kernel.shadowkv_plan_device(*arguments, plan_capacity=2)
+    parallel = sgl_kernel.shadowkv_plan_device_v2(*arguments, plan_capacity=2)
 
     assert plan.error_codes.cpu().tolist() == [error_code]
     assert torch.equal(plan.component_kinds, torch.full_like(plan.component_kinds, -1))
@@ -957,6 +998,18 @@ def test_shadowkv_plan_device_defers_row_errors(mutation, error_code):
     )
     assert torch.equal(plan.miss_ordinals, torch.full_like(plan.miss_ordinals, -1))
     assert torch.equal(plan.counts, torch.zeros_like(plan.counts))
+    assert parallel.error_codes.cpu().tolist() == [error_code]
+    assert torch.equal(
+        parallel.component_kinds, torch.full_like(parallel.component_kinds, -1)
+    )
+    assert torch.equal(
+        parallel.value_miss_chunk_ids,
+        torch.full_like(parallel.value_miss_chunk_ids, -1),
+    )
+    assert torch.equal(
+        parallel.value_miss_lengths,
+        torch.zeros_like(parallel.value_miss_lengths),
+    )
 
 
 def test_shadowkv_plan_device_preserves_guard_regions():
@@ -1009,6 +1062,41 @@ def test_shadowkv_plan_device_preserves_guard_regions():
         assert torch.equal(storage[:guard], torch.full_like(storage[:guard], fill))
         assert torch.equal(storage[-guard:], torch.full_like(storage[-guard:], fill))
 
+    value_id_storage, value_ids = guarded((rows, selected_capacity), torch.int32, 1002)
+    value_length_storage, value_lengths = guarded((rows,), torch.int32, 1003)
+    parallel_outputs = sgl_kernel.ShadowKVDevicePlanV2Outputs(
+        component_kinds=kinds,
+        source_slots=sources,
+        destination_slots=destinations,
+        miss_ordinals=misses,
+        counts=counts,
+        error_codes=errors,
+        value_miss_chunk_ids=value_ids,
+        value_miss_lengths=value_lengths,
+    )
+    parallel = sgl_kernel.shadowkv_plan_device_v2(
+        *arguments,
+        plan_capacity=2,
+        out=parallel_outputs,
+    )
+    expected_value_misses = _value_miss_descriptor_reference(arguments, expected)
+    assert parallel.value_miss_chunk_ids.data_ptr() == value_ids.data_ptr()
+    assert parallel.value_miss_lengths.data_ptr() == value_lengths.data_ptr()
+    assert torch.equal(value_ids, expected_value_misses[0])
+    assert torch.equal(value_lengths, expected_value_misses[1])
+    for storage, fill in (
+        (kind_storage, 99),
+        (source_storage, 997),
+        (destination_storage, 998),
+        (miss_storage, 999),
+        (count_storage, 1000),
+        (error_storage, 1001),
+        (value_id_storage, 1002),
+        (value_length_storage, 1003),
+    ):
+        assert torch.equal(storage[:guard], torch.full_like(storage[:guard], fill))
+        assert torch.equal(storage[-guard:], torch.full_like(storage[-guard:], fill))
+
     with pytest.raises(ValueError, match="out.error_codes must have shape"):
         sgl_kernel.shadowkv_plan_device(
             *arguments,
@@ -1030,3 +1118,6 @@ def test_shadowkv_plan_device_wrapper_has_no_error_materialization():
     source = inspect.getsource(sgl_kernel.shadowkv_plan_device)
     assert ".cpu(" not in source
     assert ".item(" not in source
+    parallel_source = inspect.getsource(sgl_kernel.shadowkv_plan_device_v2)
+    assert ".cpu(" not in parallel_source
+    assert ".item(" not in parallel_source

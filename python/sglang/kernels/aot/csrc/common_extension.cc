@@ -66,6 +66,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "miss_ordinals, Tensor! counts, Tensor! error_codes) -> ()");
   m.impl("shadowkv_plan_device", torch::kCUDA, &shadowkv_plan_device);
   m.def(
+      "shadowkv_plan_device_v2(Tensor selected_chunk_ids, Tensor selected_lengths, Tensor exact_chunk_ids, Tensor "
+      "exact_lengths, Tensor temporal_chunk_ids, Tensor temporal_component_validity, Tensor "
+      "temporal_publication_generations, Tensor temporal_request_generations, Tensor "
+      "temporal_layout_generations, Tensor row_indices, Tensor row_generations, Tensor plan_slots, int "
+      "plan_capacity, Tensor! component_kinds, Tensor! source_slots, Tensor! destination_slots, Tensor! "
+      "miss_ordinals, Tensor! counts, Tensor! error_codes, Tensor! value_miss_chunk_ids, Tensor! "
+      "value_miss_lengths) -> ()");
+  m.impl("shadowkv_plan_device_v2", torch::kCUDA, &shadowkv_plan_device_v2);
+  m.def(
       "shadowkv_place_device(Tensor component_kinds, Tensor source_slots, Tensor destination_slots, Tensor "
       "plan_slots, Tensor! planner_error_codes, Tensor temporal_key_values, Tensor compatibility_key_values, int "
       "plan_capacity, Tensor! destination_key_values) -> ()");
