@@ -48,7 +48,8 @@ constexpr int kVectorBytes = sizeof(uint4);
 constexpr int kChunkBytes = kChunkElements * sizeof(at::BFloat16);
 constexpr int kVectorsPerChunk = kChunkBytes / kVectorBytes;
 
-static_assert(kVectorsPerChunk == kThreads);
+static_assert(kVectorsPerChunk <= kThreads);
+static_assert(kThreads <= 1024 && kThreads % 32 == 0);
 
 void check_tensor(
     const at::Tensor& tensor,
