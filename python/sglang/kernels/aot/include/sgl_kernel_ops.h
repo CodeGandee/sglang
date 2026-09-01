@@ -166,6 +166,10 @@ void shadowkv_plan_device_v2(
     at::Tensor& error_codes,
     at::Tensor& value_miss_chunk_ids,
     at::Tensor& value_miss_lengths);
+void shadowkv_publish_value_descriptor(
+    at::Tensor& descriptor_generation,
+    at::Tensor& descriptor_validity,
+    int64_t generation);
 void shadowkv_place_device(
     const at::Tensor& component_kinds,
     const at::Tensor& source_slots,

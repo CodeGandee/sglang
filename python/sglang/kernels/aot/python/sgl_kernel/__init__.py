@@ -121,6 +121,7 @@ else:
         shadowkv_plan_device_v2,
         shadowkv_plan_reuse,
         shadowkv_publish_device,
+        shadowkv_publish_value_descriptor,
         shadowkv_reconstruct,
         shadowkv_reconstruct_rope,
     )
@@ -212,6 +213,7 @@ else:
         "shadowkv_place_device",
         "shadowkv_place_device_miss_only",
         "shadowkv_publish_device",
+        "shadowkv_publish_value_descriptor",
         "shadowkv_reconstruct",
         "shadowkv_reconstruct_rope",
         "sgl_per_token_group_quant_8bit",

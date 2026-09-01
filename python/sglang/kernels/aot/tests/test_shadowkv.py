@@ -734,6 +734,20 @@ def test_shadowkv_plan_device_matches_component_aware_readable_contract():
     assert torch.equal(parallel.component_kinds, parallel_repeated.component_kinds)
 
 
+def test_shadowkv_publish_value_descriptor_sets_generation_before_validity():
+    generation = torch.full((1,), -1, dtype=torch.int64, device="cuda")
+    validity = torch.zeros((1,), dtype=torch.uint8, device="cuda")
+
+    sgl_kernel.shadowkv_publish_value_descriptor(
+        generation,
+        validity,
+        generation=17,
+    )
+
+    assert generation.item() == 17
+    assert validity.item() == 1
+
+
 @pytest.mark.parametrize("mode", ["all-hit", "all-miss", "asymmetric"])
 def test_shadowkv_place_device_populates_each_stable_destination_once(mode):
     plan, temporal_values, compatibility, exact, exact_lengths = (

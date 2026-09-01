@@ -107,6 +107,7 @@ def shadowkv_kernels_available() -> bool:
         and hasattr(torch.ops.sgl_kernel, "shadowkv_place_device_miss_only")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_device")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_device_v2")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_publish_value_descriptor")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_reuse")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_publish_device")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_packed_gqa")
@@ -650,6 +651,38 @@ def shadowkv_plan_device_v2(
         error_codes=out.error_codes,
         value_miss_chunk_ids=out.value_miss_chunk_ids,
         value_miss_lengths=out.value_miss_lengths,
+    )
+
+
+def shadowkv_publish_value_descriptor(
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    *,
+    generation: int,
+) -> None:
+    """Publish one compact descriptor generation and set validity last."""
+
+    _require_tensor(
+        "descriptor_generation", descriptor_generation, dtype=torch.int64, dimensions=1
+    )
+    _require_tensor(
+        "descriptor_validity", descriptor_validity, dtype=torch.uint8, dimensions=1
+    )
+    if descriptor_generation.shape != (1,) or descriptor_validity.shape != (1,):
+        raise ValueError("descriptor generation and validity must have shape [1]")
+    if descriptor_generation.device != descriptor_validity.device:
+        raise ValueError(
+            "descriptor generation and validity must share one CUDA device"
+        )
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise TypeError("generation must be an integer")
+    if generation < 0:
+        raise ValueError("generation must be nonnegative")
+    _require_b200(descriptor_generation.device)
+    torch.ops.sgl_kernel.shadowkv_publish_value_descriptor.default(
+        descriptor_generation,
+        descriptor_validity,
+        generation,
     )
 
 

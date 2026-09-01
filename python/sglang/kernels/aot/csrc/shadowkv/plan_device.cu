@@ -697,6 +697,15 @@ __global__ void shadowkv_plan_device_v2_kernel(
   }
 }
 
+__global__ void shadowkv_publish_value_descriptor_kernel(
+    int64_t generation,
+    int64_t* __restrict__ descriptor_generation,
+    uint8_t* __restrict__ descriptor_validity) {
+  descriptor_generation[0] = generation;
+  __threadfence();
+  descriptor_validity[0] = 1;
+}
+
 }  // namespace
 
 void shadowkv_plan_device(
@@ -962,5 +971,29 @@ void shadowkv_plan_device_v2(
       error_codes.data_ptr<int32_t>(),
       value_miss_chunk_ids.data_ptr<int32_t>(),
       value_miss_lengths.data_ptr<int32_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void shadowkv_publish_value_descriptor(
+    at::Tensor& descriptor_generation,
+    at::Tensor& descriptor_validity,
+    int64_t generation) {
+  check_tensor(descriptor_generation, "descriptor_generation", at::ScalarType::Long, 1);
+  check_tensor(descriptor_validity, "descriptor_validity", at::ScalarType::Byte, 1);
+  TORCH_CHECK(
+      descriptor_generation.numel() == 1 && descriptor_validity.numel() == 1,
+      "descriptor generation and validity must contain one slot scalar");
+  TORCH_CHECK(generation >= 0, "value descriptor generation must be nonnegative");
+  TORCH_CHECK(
+      descriptor_generation.device() == descriptor_validity.device(),
+      "value descriptor generation and validity must share one CUDA device");
+  const auto device = descriptor_generation.device();
+  c10::cuda::CUDAGuard device_guard(device);
+  check_b200(descriptor_generation);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  shadowkv_publish_value_descriptor_kernel<<<1, 1, 0, stream>>>(
+      generation,
+      descriptor_generation.data_ptr<int64_t>(),
+      descriptor_validity.data_ptr<uint8_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
