@@ -674,6 +674,148 @@ def test_shadowkv_reconstruct_rejects_unsupported_input(mutation, message):
         sgl_kernel.shadowkv_reconstruct(u, sv, positions)
 
 
+def _a100_fused_key_case(mode):
+    selected = torch.arange(256, dtype=torch.int32, device="cuda").repeat(8, 1)
+    selected_lengths = torch.tensor(
+        [256, 255, 254, 253, 252, 251, 250, 249],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    exact = torch.full((8, 1), -1, dtype=torch.int32, device="cuda")
+    exact_lengths = torch.zeros((8,), dtype=torch.int32, device="cuda")
+    temporal_ids = selected.view(1, 1, 8, 256).clone()
+    validity = torch.zeros((2, 1, 1, 8, 256), dtype=torch.uint8, device="cuda")
+    if mode == "all-hit":
+        validity[0].fill_(1)
+    elif mode == "mixed":
+        validity[0, :, :, :, ::2].fill_(1)
+    elif mode != "all-miss":
+        raise AssertionError(f"unknown fused-key mode {mode}")
+    publications = torch.full((2, 1, 1, 8, 256), -1, dtype=torch.int64, device="cuda")
+    publications.masked_fill_(validity == 1, 0)
+    row_indices = torch.stack(
+        (
+            torch.zeros(8, dtype=torch.int32, device="cuda"),
+            torch.zeros(8, dtype=torch.int32, device="cuda"),
+            torch.arange(8, dtype=torch.int32, device="cuda"),
+        ),
+        dim=1,
+    )
+    row_generations = torch.tensor(
+        [[7, 3, 1] for _ in range(8)], dtype=torch.int64, device="cuda"
+    )
+    plan = sgl_kernel.shadowkv_plan_device_v2(
+        selected,
+        selected_lengths,
+        exact,
+        exact_lengths,
+        temporal_ids,
+        validity,
+        publications,
+        torch.tensor([7], dtype=torch.int64, device="cuda"),
+        torch.tensor([3], dtype=torch.int64, device="cuda"),
+        row_indices,
+        row_generations,
+        torch.zeros(8, dtype=torch.int32, device="cuda"),
+        plan_capacity=1,
+    )
+    temporal_values = (
+        torch.randn((2, 1, 1, 8, 256, 8, 128), device="cuda") * 0.125
+    ).to(torch.bfloat16)
+    return plan, temporal_values
+
+
+@pytest.mark.skipif(
+    not sgl_kernel.shadowkv_a100_fused_key_kernels_available(),
+    reason="the installed wheel has no SM80 fused-key child",
+)
+@pytest.mark.parametrize("mode", ["all-hit", "mixed", "all-miss"])
+def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
+    torch.manual_seed(20260902 + len(mode))
+    u = (torch.randn((2048, 160), device="cuda") * 0.0625).to(torch.bfloat16)
+    sv = (torch.randn((8, 160, 128), device="cuda") * 0.0625).to(torch.bfloat16)
+    inverse = 1.0 / (
+        500_000.0 ** (torch.arange(0, 128, 2, device="cuda", dtype=torch.float32) / 128)
+    )
+    positions = torch.arange(2048, dtype=torch.float32, device="cuda")
+    angles = positions[:, None] * inverse
+    cosine = angles.cos().contiguous()
+    sine = angles.sin().contiguous()
+    plan, temporal_values = _a100_fused_key_case(mode)
+    output = torch.full(
+        (2, 8, 256, 8, 128),
+        23,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    selected_positions = (
+        plan.selected_chunk_ids.to(torch.int64)[..., None] * 8
+        + torch.arange(8, dtype=torch.int64, device="cuda")
+    ).reshape(8, 2048)
+    pre_rope = torch.einsum("hnr,hrd->hnd", u[selected_positions], sv).float()
+    selected_cosine = cosine[selected_positions]
+    selected_sine = sine[selected_positions]
+    expected_misses = (
+        pre_rope * torch.cat((selected_cosine, selected_cosine), dim=-1)
+        + torch.cat((-pre_rope[..., 64:], pre_rope[..., :64]), dim=-1)
+        * torch.cat((selected_sine, selected_sine), dim=-1)
+    ).to(torch.bfloat16)
+    expected = torch.zeros((8, 256, 8, 128), dtype=torch.bfloat16, device="cuda")
+    temporal_chunks = temporal_values.view(2, -1, 8, 128)
+    for head in range(8):
+        for selected in range(256):
+            kind = plan.component_kinds[0, head, selected].item()
+            if kind == 1:
+                source = plan.source_slots[0, head, selected].item()
+                expected[head, selected].copy_(temporal_chunks[0, source])
+            elif kind == 2:
+                start = selected * 8
+                expected[head, selected].copy_(expected_misses[head, start : start + 8])
+
+    actual = sgl_kernel.shadowkv_fused_key_a100(
+        u,
+        sv,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        plan_capacity=1,
+        out=output,
+    )
+    repeated = output.clone()
+    sgl_kernel.shadowkv_fused_key_a100(
+        u,
+        sv,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        plan_capacity=1,
+        out=repeated,
+    )
+
+    assert actual.data_ptr() == output[0].data_ptr()
+    assert torch.count_nonzero(plan.error_codes).item() == 0
+    assert torch.equal(output[1], torch.full_like(output[1], 23))
+    assert torch.equal(repeated[0], output[0])
+    torch.testing.assert_close(output[0], expected, rtol=4e-2, atol=4e-2)
+
+
 @pytest.mark.parametrize(
     "previous,previous_lengths,current,current_lengths,exact,exact_lengths,cached,current_generation,max_reuse",
     [
@@ -1496,9 +1638,7 @@ def test_shape_and_budget_guards_run_before_operator_launch(monkeypatch):
 def test_public_dispatch_matches_legacy_compatibility_wrappers():
     u = torch.zeros((8, 160), dtype=torch.bfloat16, device="cuda")
     positions = torch.tensor([[0, 7]], dtype=torch.int64, device="cuda")
-    reconstruct_sv = torch.zeros(
-        (1, 160, 128), dtype=torch.bfloat16, device="cuda"
-    )
+    reconstruct_sv = torch.zeros((1, 160, 128), dtype=torch.bfloat16, device="cuda")
     rope_sv = torch.zeros((1, 160, 64), dtype=torch.bfloat16, device="cuda")
     inverse = torch.ones((32,), dtype=torch.float32, device="cuda")
     torch.testing.assert_close(

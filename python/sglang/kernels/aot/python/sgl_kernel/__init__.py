@@ -110,6 +110,7 @@ else:
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
+
     def shadowkv_kernels_available():
         """Return whether all optional ShadowKV native operators are loaded."""
 
@@ -141,10 +142,15 @@ else:
             ShadowKVDevicePlanV2Outputs,
             ShadowKVMappedHostRegion,
             ShadowKVReusePlan,
+            shadowkv_a100_fused_key_kernels_available,
+            shadowkv_fused_key_a100,
             shadowkv_packed_gqa,
             shadowkv_place_device,
             shadowkv_place_device_mapped_host,
             shadowkv_place_device_miss_only,
+            shadowkv_place_value_a100,
+            shadowkv_place_value_mapped_host_a100,
+            shadowkv_place_value_miss_only_a100,
             shadowkv_plan_device,
             shadowkv_plan_device_v2,
             shadowkv_plan_reuse,
@@ -238,10 +244,15 @@ else:
         "shadowkv_plan_device",
         "shadowkv_plan_device_v2",
         "shadowkv_plan_reuse",
+        "shadowkv_a100_fused_key_kernels_available",
+        "shadowkv_fused_key_a100",
         "shadowkv_packed_gqa",
         "shadowkv_place_device",
         "shadowkv_place_device_mapped_host",
         "shadowkv_place_device_miss_only",
+        "shadowkv_place_value_a100",
+        "shadowkv_place_value_mapped_host_a100",
+        "shadowkv_place_value_miss_only_a100",
         "shadowkv_publish_device",
         "shadowkv_publish_value_descriptor",
         "shadowkv_reconstruct",

@@ -137,6 +137,20 @@ def shadowkv_kernels_available() -> bool:
     )
 
 
+def shadowkv_a100_fused_key_kernels_available() -> bool:
+    """Return whether the optional SM80 fused-key child is installed."""
+
+    return all(
+        hasattr(torch.ops.sgl_kernel, name)
+        for name in (
+            "shadowkv_fused_key_sm80_a100_v1",
+            "shadowkv_place_value_sm80_a100_v1",
+            "shadowkv_place_value_miss_only_sm80_a100_v1",
+            "shadowkv_place_value_mapped_host_sm80_a100_v1",
+        )
+    )
+
+
 def _launch_shadowkv_packed_gqa(
     query: torch.Tensor,
     keys: torch.Tensor,
@@ -175,6 +189,152 @@ def _launch_shadowkv_reconstruct(
 ) -> None:
     torch.ops.sgl_kernel.shadowkv_reconstruct_generic_aot_v1.default(
         u, sv, positions, out
+    )
+
+
+def _launch_shadowkv_fused_key_a100(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    plan_capacity: int,
+    destination_key_values: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v1.default(
+        u,
+        sv,
+        cosine,
+        sine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        plan_capacity,
+        destination_key_values,
+    )
+
+
+def _launch_shadowkv_place_value_a100(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    compatibility_key_values: torch.Tensor,
+    plan_capacity: int,
+    destination_key_values: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_place_value_sm80_a100_v1.default(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        compatibility_key_values,
+        plan_capacity,
+        destination_key_values,
+    )
+
+
+def _launch_shadowkv_place_value_miss_only_a100(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    expected_generation: int,
+    plan_capacity: int,
+    value_miss_key_values: torch.Tensor,
+    destination_key_values: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_place_value_miss_only_sm80_a100_v1.default(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        expected_generation,
+        plan_capacity,
+        value_miss_key_values,
+        destination_key_values,
+    )
+
+
+def _launch_shadowkv_place_value_mapped_host_a100(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    mapped_host_region: ShadowKVMappedHostRegion,
+    prompt_tokens: int,
+    expected_generation: int,
+    plan_capacity: int,
+    destination_key_values: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_place_value_mapped_host_sm80_a100_v1.default(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        mapped_host_region.device_pointer,
+        mapped_host_region.byte_length,
+        mapped_host_region.prompt_chunk_capacity,
+        prompt_tokens,
+        expected_generation,
+        plan_capacity,
+        destination_key_values,
     )
 
 
@@ -311,6 +471,390 @@ def _require_tensor(
         raise ValueError(f"{name} must be a CUDA tensor")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
+
+
+def _require_a100_fused_device(device: torch.device) -> None:
+    if not shadowkv_a100_fused_key_kernels_available():
+        raise RuntimeError(
+            "the installed sglang-kernel wheel has no A100 fused-key child"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("A100 fused-key kernels require a visible NVIDIA GPU")
+    capability = torch.cuda.get_device_capability(device)
+    if capability != (8, 0):
+        raise RuntimeError(
+            f"A100 fused-key kernels require compute capability 8.0; found {capability}"
+        )
+
+
+def _validate_a100_fused_plan(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    destination_key_values: torch.Tensor,
+    *,
+    plan_capacity: int,
+) -> torch.device:
+    specifications = (
+        ("component_kinds", component_kinds, torch.int8, 3),
+        ("source_slots", source_slots, torch.int32, 3),
+        ("destination_slots", destination_slots, torch.int32, 3),
+        ("selected_lengths", selected_lengths, torch.int32, 1),
+        ("plan_slots", plan_slots, torch.int32, 1),
+        ("planner_error_codes", planner_error_codes, torch.int32, 1),
+        ("temporal_key_values", temporal_key_values, torch.bfloat16, 7),
+        ("destination_key_values", destination_key_values, torch.bfloat16, 5),
+    )
+    for name, tensor, dtype, dimensions in specifications:
+        _require_tensor(name, tensor, dtype=dtype, dimensions=dimensions)
+    plan_shape = (2, 8, 256)
+    if component_kinds.shape != plan_shape:
+        raise ValueError("component_kinds must have shape [2, 8, 256]")
+    if source_slots.shape != plan_shape or destination_slots.shape != plan_shape:
+        raise ValueError("source and destination slots must have shape [2, 8, 256]")
+    if (
+        selected_lengths.shape != (8,)
+        or plan_slots.shape != (8,)
+        or planner_error_codes.shape != (8,)
+    ):
+        raise ValueError("plan rows must have shape [8]")
+    if (
+        temporal_key_values.shape[0] != 2
+        or temporal_key_values.shape[3] != 8
+        or temporal_key_values.shape[5:] != (8, 128)
+    ):
+        raise ValueError(
+            "temporal_key_values must have shape "
+            "[2, requests, layers, 8, temporal, 8, 128]"
+        )
+    if destination_key_values.shape != (2, 8, 256, 8, 128):
+        raise ValueError("destination_key_values must have shape [2, 8, 256, 8, 128]")
+    if isinstance(plan_capacity, bool) or not isinstance(plan_capacity, int):
+        raise TypeError("plan_capacity must be an integer")
+    if plan_capacity < 1:
+        raise ValueError("plan_capacity must be positive")
+    device = component_kinds.device
+    if any(tensor.device != device for _, tensor, _, _ in specifications):
+        raise ValueError("all A100 fused-plan tensors must share one CUDA device")
+    _require_a100_fused_device(device)
+    return device
+
+
+def shadowkv_fused_key_a100(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    *,
+    plan_capacity: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Place K hits and reconstruct K misses directly into an A100 plan slot."""
+
+    _require_tensor("u", u, dtype=torch.bfloat16, dimensions=2)
+    _require_tensor("sv", sv, dtype=torch.bfloat16, dimensions=3)
+    _require_tensor("cosine", cosine, dtype=torch.float32, dimensions=2)
+    _require_tensor("sine", sine, dtype=torch.float32, dimensions=2)
+    _require_tensor("miss_ordinals", miss_ordinals, dtype=torch.int32, dimensions=3)
+    _require_tensor(
+        "selected_chunk_ids", selected_chunk_ids, dtype=torch.int32, dimensions=2
+    )
+    device = _validate_a100_fused_plan(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        out,
+        plan_capacity=plan_capacity,
+    )
+    if not 1 <= u.shape[0] <= 8192 or u.shape[1] != 160:
+        raise ValueError("u must have shape [1..8192, 160]")
+    if sv.shape != (8, 160, 128):
+        raise ValueError("sv must have shape [8, 160, 128]")
+    if (
+        cosine.shape[0] < u.shape[0]
+        or cosine.shape[0] > 8192
+        or cosine.shape[1] != 64
+        or sine.shape != cosine.shape
+    ):
+        raise ValueError("cosine and sine must share shape [u_tokens..8192, 64]")
+    if miss_ordinals.shape != (2, 8, 256):
+        raise ValueError("miss_ordinals must have shape [2, 8, 256]")
+    if selected_chunk_ids.shape != (8, 256):
+        raise ValueError("selected_chunk_ids must have shape [8, 256]")
+    if any(
+        tensor.device != device
+        for tensor in (u, sv, cosine, sine, miss_ordinals, selected_chunk_ids)
+    ):
+        raise ValueError("all A100 fused-key tensors must share one CUDA device")
+    _launch_shadowkv_fused_key_a100(
+        u,
+        sv,
+        cosine,
+        sine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        plan_capacity,
+        out,
+    )
+    return out[0].view(8, 2048, 128)
+
+
+def shadowkv_place_value_a100(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    compatibility_key_values: torch.Tensor,
+    *,
+    plan_capacity: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Place compatibility V hits and misses without touching fused K output."""
+
+    device = _validate_a100_fused_plan(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        out,
+        plan_capacity=plan_capacity,
+    )
+    _require_tensor(
+        "compatibility_key_values",
+        compatibility_key_values,
+        dtype=torch.bfloat16,
+        dimensions=5,
+    )
+    if compatibility_key_values.shape != (2, 8, 256, 8, 128):
+        raise ValueError("compatibility_key_values must have shape [2, 8, 256, 8, 128]")
+    if compatibility_key_values.device != device:
+        raise ValueError("compatibility values must share the plan CUDA device")
+    _launch_shadowkv_place_value_a100(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        compatibility_key_values,
+        plan_capacity,
+        out,
+    )
+    return out[1].view(8, 2048, 128)
+
+
+def _validate_a100_value_descriptor(
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    *,
+    device: torch.device,
+    expected_generation: int,
+) -> None:
+    specifications = (
+        ("miss_ordinals", miss_ordinals, torch.int32, 3, (2, 8, 256)),
+        ("selected_chunk_ids", selected_chunk_ids, torch.int32, 2, (8, 256)),
+        ("value_miss_chunk_ids", value_miss_chunk_ids, torch.int32, 2, (8, 256)),
+        ("value_miss_lengths", value_miss_lengths, torch.int32, 1, (8,)),
+        ("descriptor_generation", descriptor_generation, torch.int64, 1, (1,)),
+        ("descriptor_validity", descriptor_validity, torch.uint8, 1, (1,)),
+    )
+    for name, tensor, dtype, dimensions, shape in specifications:
+        _require_tensor(name, tensor, dtype=dtype, dimensions=dimensions)
+        if tensor.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+        if tensor.device != device:
+            raise ValueError(f"{name} must share the plan CUDA device")
+    if isinstance(expected_generation, bool) or not isinstance(
+        expected_generation, int
+    ):
+        raise TypeError("expected_generation must be an integer")
+    if expected_generation < 0:
+        raise ValueError("expected_generation must be nonnegative")
+
+
+def shadowkv_place_value_miss_only_a100(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    value_miss_key_values: torch.Tensor,
+    *,
+    expected_generation: int,
+    plan_capacity: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Place compact V misses and temporal V hits beside completed fused K."""
+
+    device = _validate_a100_fused_plan(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        out,
+        plan_capacity=plan_capacity,
+    )
+    _validate_a100_value_descriptor(
+        miss_ordinals,
+        selected_chunk_ids,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        device=device,
+        expected_generation=expected_generation,
+    )
+    _require_tensor(
+        "value_miss_key_values",
+        value_miss_key_values,
+        dtype=torch.bfloat16,
+        dimensions=4,
+    )
+    if value_miss_key_values.shape != (8, 256, 8, 128):
+        raise ValueError("value_miss_key_values must have shape [8, 256, 8, 128]")
+    if value_miss_key_values.device != device:
+        raise ValueError("value misses must share the plan CUDA device")
+    _launch_shadowkv_place_value_miss_only_a100(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        expected_generation,
+        plan_capacity,
+        value_miss_key_values,
+        out,
+    )
+    return out[1].view(8, 2048, 128)
+
+
+def shadowkv_place_value_mapped_host_a100(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    mapped_host_region: ShadowKVMappedHostRegion,
+    *,
+    prompt_tokens: int,
+    expected_generation: int,
+    plan_capacity: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Place mapped-host V misses and temporal V hits beside completed fused K."""
+
+    device = _validate_a100_fused_plan(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        out,
+        plan_capacity=plan_capacity,
+    )
+    _validate_a100_value_descriptor(
+        miss_ordinals,
+        selected_chunk_ids,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        device=device,
+        expected_generation=expected_generation,
+    )
+    if not isinstance(mapped_host_region, ShadowKVMappedHostRegion):
+        raise TypeError("mapped_host_region must be a ShadowKVMappedHostRegion")
+    if mapped_host_region.device != device:
+        raise ValueError("mapped host region must target the plan CUDA device")
+    if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int):
+        raise TypeError("prompt_tokens must be an integer")
+    if not 1 <= prompt_tokens <= mapped_host_region.prompt_chunk_capacity * 8:
+        raise ValueError("prompt_tokens exceed the mapped host region")
+    _launch_shadowkv_place_value_mapped_host_a100(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        mapped_host_region,
+        prompt_tokens,
+        expected_generation,
+        plan_capacity,
+        out,
+    )
+    return out[1].view(8, 2048, 128)
 
 
 def shadowkv_reconstruct_rope(
