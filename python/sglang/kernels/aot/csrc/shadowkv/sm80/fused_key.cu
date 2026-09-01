@@ -857,12 +857,10 @@ PlanGeometry validate_fused_key_a100(
   return geometry;
 }
 
-void launch_fused_key_a100(
+void launch_prepare_key_a100(
     const at::Tensor& u,
-    const at::Tensor& sv,
     at::Tensor& gathered_u,
     const at::Tensor& cosine,
-    const at::Tensor& sine,
     const at::Tensor& component_kinds,
     const at::Tensor& source_slots,
     const at::Tensor& destination_slots,
@@ -871,10 +869,8 @@ void launch_fused_key_a100(
     const at::Tensor& selected_lengths,
     const at::Tensor& plan_slots,
     at::Tensor& planner_error_codes,
-    const at::Tensor& temporal_key_values,
     const PlanGeometry& geometry,
     int64_t plan_capacity,
-    at::Tensor& destination_key_values,
     cudaStream_t stream) {
   TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
   shadowkv_prepare_key_bmm_a100_kernel
@@ -895,9 +891,34 @@ void launch_fused_key_a100(
       reinterpret_cast<__nv_bfloat16*>(
           gathered_u.data_ptr<at::BFloat16>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_key_bmm_a100(
+    const at::Tensor& sv,
+    const at::Tensor& gathered_u,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
   at::Tensor key_destination = destination_key_values.select(0, 0).view(
       {kKVHeads, kSelectedCapacity * kChunkSize, kHeadDimension});
   at::bmm_out(key_destination, gathered_u, sv);
+}
+
+void launch_finalize_key_a100(
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const PlanGeometry& geometry,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
   shadowkv_finalize_key_bmm_a100_kernel
       <<<kKVHeads * kSelectedCapacity, kHeadDimension, 0, stream>>>(
           cosine.data_ptr<float>(),
@@ -916,6 +937,57 @@ void launch_fused_key_a100(
           reinterpret_cast<uint4*>(
               destination_key_values.data_ptr<at::BFloat16>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_fused_key_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const PlanGeometry& geometry,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  launch_prepare_key_a100(
+      u,
+      gathered_u,
+      cosine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      geometry,
+      plan_capacity,
+      stream);
+  launch_key_bmm_a100(sv, gathered_u, destination_key_values, stream);
+  launch_finalize_key_a100(
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      geometry,
+      plan_capacity,
+      destination_key_values,
+      stream);
 }
 
 PlanGeometry validate_mapped_value_a100(
@@ -1469,4 +1541,147 @@ void shadowkv_fused_key_mapped_value_a100(
       plan_capacity,
       destination_key_values,
       key_stream);
+}
+
+void shadowkv_fused_key_mapped_value_staged_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t mapped_host_bytes,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    int64_t plan_capacity,
+    int64_t reconstruction_stream,
+    at::Tensor& destination_key_values) {
+  const PlanGeometry key_geometry = validate_fused_key_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      plan_capacity,
+      destination_key_values);
+  const PlanGeometry value_geometry = validate_mapped_value_a100(
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      mapped_host_bytes,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      plan_capacity,
+      destination_key_values);
+  const auto device = component_kinds.device();
+  c10::cuda::CUDAGuard device_guard(device);
+  check_sm80(component_kinds);
+  cudaStream_t value_stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t key_stream = reinterpret_cast<cudaStream_t>(reconstruction_stream);
+  int key_stream_device = -1;
+  C10_CUDA_CHECK(cudaStreamGetDevice(key_stream, &key_stream_device));
+  TORCH_CHECK(
+      key_stream_device == device.index(),
+      "A100 fused reconstruction stream must target the plan CUDA device");
+  TORCH_CHECK(
+      key_stream != value_stream,
+      "A100 fused reconstruction and mapped-value streams must be distinct");
+
+  const c10::cuda::CUDAStream external_key_stream =
+      c10::cuda::getStreamFromExternal(key_stream, device.index());
+  {
+    c10::cuda::CUDAStreamGuard key_stream_guard(external_key_stream);
+    launch_prepare_key_a100(
+        u,
+        gathered_u,
+        cosine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        key_geometry,
+        plan_capacity,
+        key_stream);
+  }
+
+  launch_mapped_value_a100(
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      value_geometry,
+      plan_capacity,
+      destination_key_values,
+      value_stream);
+
+  {
+    c10::cuda::CUDAStreamGuard key_stream_guard(external_key_stream);
+    launch_key_bmm_a100(sv, gathered_u, destination_key_values, key_stream);
+    launch_finalize_key_a100(
+        cosine,
+        sine,
+        component_kinds,
+        source_slots,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        key_geometry,
+        plan_capacity,
+        destination_key_values,
+        key_stream);
+  }
 }

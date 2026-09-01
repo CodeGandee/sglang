@@ -145,6 +145,7 @@ def shadowkv_a100_fused_key_kernels_available() -> bool:
         for name in (
             "shadowkv_fused_key_sm80_a100_v2",
             "shadowkv_fused_key_mapped_value_sm80_a100_v3",
+            "shadowkv_fused_key_mapped_value_sm80_a100_v4",
             "shadowkv_place_value_sm80_a100_v1",
             "shadowkv_place_value_miss_only_sm80_a100_v1",
             "shadowkv_place_value_mapped_host_sm80_a100_v1",
@@ -367,7 +368,7 @@ def _launch_shadowkv_fused_key_mapped_value_a100(
     reconstruction_stream: int,
     destination_key_values: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.shadowkv_fused_key_mapped_value_sm80_a100_v3.default(
+    torch.ops.sgl_kernel.shadowkv_fused_key_mapped_value_sm80_a100_v4.default(
         u,
         sv,
         gathered_u,
@@ -1040,7 +1041,7 @@ def shadowkv_fused_key_mapped_value_a100(
     plan_capacity: int,
     out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch mapped V and exact fused K back-to-back on distinct A100 streams."""
+    """Launch key prepare, mapped V, then exact BMM/finalize on A100 streams."""
 
     device = _validate_a100_fused_key_inputs(
         u,
