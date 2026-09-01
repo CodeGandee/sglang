@@ -9,6 +9,7 @@
 void shadowkv_fused_key_a100(
     const at::Tensor& u,
     const at::Tensor& sv,
+    at::Tensor& gathered_u,
     const at::Tensor& cosine,
     const at::Tensor& sine,
     const at::Tensor& component_kinds,

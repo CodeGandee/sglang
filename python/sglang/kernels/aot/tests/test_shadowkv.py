@@ -748,6 +748,7 @@ def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
         dtype=torch.bfloat16,
         device="cuda",
     )
+    gathered_u = torch.empty((8, 2048, 160), dtype=torch.bfloat16, device="cuda")
 
     selected_positions = (
         plan.selected_chunk_ids.to(torch.int64)[..., None] * 8
@@ -776,6 +777,7 @@ def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
     actual = sgl_kernel.shadowkv_fused_key_a100(
         u,
         sv,
+        gathered_u,
         cosine,
         sine,
         plan.component_kinds,
@@ -794,6 +796,7 @@ def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
     sgl_kernel.shadowkv_fused_key_a100(
         u,
         sv,
+        gathered_u,
         cosine,
         sine,
         plan.component_kinds,

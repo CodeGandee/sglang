@@ -143,7 +143,7 @@ def shadowkv_a100_fused_key_kernels_available() -> bool:
     return all(
         hasattr(torch.ops.sgl_kernel, name)
         for name in (
-            "shadowkv_fused_key_sm80_a100_v1",
+            "shadowkv_fused_key_sm80_a100_v2",
             "shadowkv_place_value_sm80_a100_v1",
             "shadowkv_place_value_miss_only_sm80_a100_v1",
             "shadowkv_place_value_mapped_host_sm80_a100_v1",
@@ -195,6 +195,7 @@ def _launch_shadowkv_reconstruct(
 def _launch_shadowkv_fused_key_a100(
     u: torch.Tensor,
     sv: torch.Tensor,
+    gathered_u: torch.Tensor,
     cosine: torch.Tensor,
     sine: torch.Tensor,
     component_kinds: torch.Tensor,
@@ -209,9 +210,10 @@ def _launch_shadowkv_fused_key_a100(
     plan_capacity: int,
     destination_key_values: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v1.default(
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v2.default(
         u,
         sv,
+        gathered_u,
         cosine,
         sine,
         component_kinds,
@@ -547,6 +549,7 @@ def _validate_a100_fused_plan(
 def shadowkv_fused_key_a100(
     u: torch.Tensor,
     sv: torch.Tensor,
+    gathered_u: torch.Tensor,
     cosine: torch.Tensor,
     sine: torch.Tensor,
     component_kinds: torch.Tensor,
@@ -566,6 +569,7 @@ def shadowkv_fused_key_a100(
 
     _require_tensor("u", u, dtype=torch.bfloat16, dimensions=2)
     _require_tensor("sv", sv, dtype=torch.bfloat16, dimensions=3)
+    _require_tensor("gathered_u", gathered_u, dtype=torch.bfloat16, dimensions=3)
     _require_tensor("cosine", cosine, dtype=torch.float32, dimensions=2)
     _require_tensor("sine", sine, dtype=torch.float32, dimensions=2)
     _require_tensor("miss_ordinals", miss_ordinals, dtype=torch.int32, dimensions=3)
@@ -587,6 +591,8 @@ def shadowkv_fused_key_a100(
         raise ValueError("u must have shape [1..8192, 160]")
     if sv.shape != (8, 160, 128):
         raise ValueError("sv must have shape [8, 160, 128]")
+    if gathered_u.shape != (8, 2048, 160):
+        raise ValueError("gathered_u must have shape [8, 2048, 160]")
     if (
         cosine.shape[0] < u.shape[0]
         or cosine.shape[0] > 8192
@@ -600,12 +606,21 @@ def shadowkv_fused_key_a100(
         raise ValueError("selected_chunk_ids must have shape [8, 256]")
     if any(
         tensor.device != device
-        for tensor in (u, sv, cosine, sine, miss_ordinals, selected_chunk_ids)
+        for tensor in (
+            u,
+            sv,
+            gathered_u,
+            cosine,
+            sine,
+            miss_ordinals,
+            selected_chunk_ids,
+        )
     ):
         raise ValueError("all A100 fused-key tensors must share one CUDA device")
     _launch_shadowkv_fused_key_a100(
         u,
         sv,
+        gathered_u,
         cosine,
         sine,
         component_kinds,
