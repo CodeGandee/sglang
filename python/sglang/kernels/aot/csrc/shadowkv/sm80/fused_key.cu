@@ -57,11 +57,14 @@ constexpr int kChunkElements = kChunkSize * kHeadDimension;
 constexpr int kVectorBytes = sizeof(uint4);
 constexpr int kChunkBytes = kChunkElements * sizeof(at::BFloat16);
 constexpr int kVectorsPerChunk = kChunkBytes / kVectorBytes;
+constexpr int kValueEntries = kKVHeads * kSelectedCapacity;
+constexpr int kThrottledMappedValueBlocks = 512;
 
 static_assert(kVectorsPerChunk <= kThreads);
 static_assert(kThreads <= 1024 && kThreads % 32 == 0);
 static_assert(kSelectedCapacity % kChunksPerKeyBlock == 0);
 static_assert(kRowsPerKeyBlock == 128 && kThreads == 256);
+static_assert(kValueEntries % kThrottledMappedValueBlocks == 0);
 
 void check_tensor(
     const at::Tensor& tensor,
@@ -674,106 +677,108 @@ __global__ void shadowkv_place_value_a100_kernel(
     int prompt_chunk_capacity,
     int prompt_tokens,
     uint4* __restrict__ destination_key_values) {
-  const int entry = blockIdx.x;
-  const int selected = entry % kSelectedCapacity;
-  const int head = entry / kSelectedCapacity;
-  const int64_t plan_offset =
-      static_cast<int64_t>(kKVHeads) * kSelectedCapacity + entry;
-  const int8_t kind = component_kinds[plan_offset];
-  const int source_slot = source_slots[plan_offset];
-  const int destination_slot = destination_slots[plan_offset];
-  const int miss_ordinal =
-      miss_ordinals == nullptr ? -1 : miss_ordinals[plan_offset];
-  const int selected_length = selected_lengths[head];
-  const int plan_slot = plan_slots[head];
-  const bool row_valid =
-      planner_error_codes[head] == 0 && plan_slot >= 0 &&
-      plan_slot < plan_capacity && selected_length >= 0 &&
-      selected_length <= kSelectedCapacity;
-  const bool active_ordinal = selected < selected_length;
-  const int64_t expected_destination =
-      ((static_cast<int64_t>(plan_capacity) + plan_slot) * kKVHeads + head) *
-          kSelectedCapacity +
-      selected;
-  const bool hit_valid =
-      active_ordinal && kind == kHit &&
-      source_slot >= temporal_chunks_per_component &&
-      source_slot < 2 * temporal_chunks_per_component &&
-      (Source == ValueSource::kCompatibility || miss_ordinal == -1);
-  bool miss_valid =
-      active_ordinal && kind == kMiss && source_slot == -1;
-  int source_chunk = selected;
-  if constexpr (Source != ValueSource::kCompatibility) {
-    const bool descriptor_ready =
-        descriptor_validity[0] == 1 &&
-        descriptor_generation[0] == expected_generation;
-    const int miss_length = value_miss_lengths[head];
-    miss_valid =
-        miss_valid && descriptor_ready && miss_ordinal >= 0 &&
-        miss_ordinal < miss_length && miss_length >= 0 &&
-        miss_length <= kSelectedCapacity &&
-        value_miss_chunk_ids[static_cast<int64_t>(head) * kSelectedCapacity +
-                             miss_ordinal] ==
-            selected_chunk_ids[static_cast<int64_t>(head) *
-                                   kSelectedCapacity +
-                               selected];
-    source_chunk = miss_ordinal;
-    if constexpr (Source == ValueSource::kMappedHost) {
-      source_chunk = selected_chunk_ids[
-          static_cast<int64_t>(head) * kSelectedCapacity + selected];
-      miss_valid =
-          miss_valid && source_chunk >= 0 &&
-          source_chunk < prompt_chunk_capacity &&
-          (static_cast<int64_t>(source_chunk) + 1) * kChunkSize <=
-              prompt_tokens;
-    }
-  }
-  const bool inactive_valid =
-      kind == kInactive && source_slot == -1 && destination_slot == -1 &&
-      (Source == ValueSource::kCompatibility || miss_ordinal == -1);
-  const bool destination_valid = destination_slot == expected_destination;
-  const bool active =
-      row_valid && destination_valid && (hit_valid || miss_valid);
   if (threadIdx.x >= kVectorsPerChunk) {
     return;
   }
-  const int64_t destination_vector =
-      (static_cast<int64_t>(kKVHeads) * kSelectedCapacity + entry) *
-          kVectorsPerChunk +
-      threadIdx.x;
-  if (!active) {
-    destination_key_values[destination_vector] = uint4{0, 0, 0, 0};
-    mark_invalid(
-        planner_error_codes,
-        head,
-        row_valid && !inactive_valid);
-    return;
-  }
-  if (hit_valid) {
-    destination_key_values[destination_vector] =
-        temporal_key_values[
-            static_cast<int64_t>(source_slot) * kVectorsPerChunk +
-            threadIdx.x];
-    return;
-  }
-  int64_t source_vector = 0;
-  if constexpr (Source == ValueSource::kCompatibility) {
-    source_vector =
+  for (int entry = blockIdx.x; entry < kValueEntries; entry += gridDim.x) {
+    const int selected = entry % kSelectedCapacity;
+    const int head = entry / kSelectedCapacity;
+    const int64_t plan_offset =
+        static_cast<int64_t>(kKVHeads) * kSelectedCapacity + entry;
+    const int8_t kind = component_kinds[plan_offset];
+    const int source_slot = source_slots[plan_offset];
+    const int destination_slot = destination_slots[plan_offset];
+    const int miss_ordinal =
+        miss_ordinals == nullptr ? -1 : miss_ordinals[plan_offset];
+    const int selected_length = selected_lengths[head];
+    const int plan_slot = plan_slots[head];
+    const bool row_valid =
+        planner_error_codes[head] == 0 && plan_slot >= 0 &&
+        plan_slot < plan_capacity && selected_length >= 0 &&
+        selected_length <= kSelectedCapacity;
+    const bool active_ordinal = selected < selected_length;
+    const int64_t expected_destination =
+        ((static_cast<int64_t>(plan_capacity) + plan_slot) * kKVHeads + head) *
+            kSelectedCapacity +
+        selected;
+    const bool hit_valid =
+        active_ordinal && kind == kHit &&
+        source_slot >= temporal_chunks_per_component &&
+        source_slot < 2 * temporal_chunks_per_component &&
+        (Source == ValueSource::kCompatibility || miss_ordinal == -1);
+    bool miss_valid =
+        active_ordinal && kind == kMiss && source_slot == -1;
+    int source_chunk = selected;
+    if constexpr (Source != ValueSource::kCompatibility) {
+      const bool descriptor_ready =
+          descriptor_validity[0] == 1 &&
+          descriptor_generation[0] == expected_generation;
+      const int miss_length = value_miss_lengths[head];
+      miss_valid =
+          miss_valid && descriptor_ready && miss_ordinal >= 0 &&
+          miss_ordinal < miss_length && miss_length >= 0 &&
+          miss_length <= kSelectedCapacity &&
+          value_miss_chunk_ids[static_cast<int64_t>(head) *
+                                   kSelectedCapacity +
+                               miss_ordinal] ==
+              selected_chunk_ids[static_cast<int64_t>(head) *
+                                     kSelectedCapacity +
+                                 selected];
+      source_chunk = miss_ordinal;
+      if constexpr (Source == ValueSource::kMappedHost) {
+        source_chunk = selected_chunk_ids[
+            static_cast<int64_t>(head) * kSelectedCapacity + selected];
+        miss_valid =
+            miss_valid && source_chunk >= 0 &&
+            source_chunk < prompt_chunk_capacity &&
+            (static_cast<int64_t>(source_chunk) + 1) * kChunkSize <=
+                prompt_tokens;
+      }
+    }
+    const bool inactive_valid =
+        kind == kInactive && source_slot == -1 && destination_slot == -1 &&
+        (Source == ValueSource::kCompatibility || miss_ordinal == -1);
+    const bool destination_valid = destination_slot == expected_destination;
+    const bool active =
+        row_valid && destination_valid && (hit_valid || miss_valid);
+    const int64_t destination_vector =
         (static_cast<int64_t>(kKVHeads) * kSelectedCapacity + entry) *
             kVectorsPerChunk +
         threadIdx.x;
-  } else if constexpr (Source == ValueSource::kCompactMiss) {
-    source_vector =
-        (static_cast<int64_t>(head) * kSelectedCapacity + source_chunk) *
-            kVectorsPerChunk +
-        threadIdx.x;
-  } else {
-    source_vector =
-        (static_cast<int64_t>(head) * prompt_chunk_capacity + source_chunk) *
-            kVectorsPerChunk +
-        threadIdx.x;
+    if (!active) {
+      destination_key_values[destination_vector] = uint4{0, 0, 0, 0};
+      mark_invalid(
+          planner_error_codes,
+          head,
+          row_valid && !inactive_valid);
+      continue;
+    }
+    if (hit_valid) {
+      destination_key_values[destination_vector] =
+          temporal_key_values[
+              static_cast<int64_t>(source_slot) * kVectorsPerChunk +
+              threadIdx.x];
+      continue;
+    }
+    int64_t source_vector = 0;
+    if constexpr (Source == ValueSource::kCompatibility) {
+      source_vector =
+          (static_cast<int64_t>(kKVHeads) * kSelectedCapacity + entry) *
+              kVectorsPerChunk +
+          threadIdx.x;
+    } else if constexpr (Source == ValueSource::kCompactMiss) {
+      source_vector =
+          (static_cast<int64_t>(head) * kSelectedCapacity + source_chunk) *
+              kVectorsPerChunk +
+          threadIdx.x;
+    } else {
+      source_vector =
+          (static_cast<int64_t>(head) * prompt_chunk_capacity + source_chunk) *
+              kVectorsPerChunk +
+          threadIdx.x;
+    }
+    destination_key_values[destination_vector] = value_source[source_vector];
   }
-  destination_key_values[destination_vector] = value_source[source_vector];
 }
 
 PlanGeometry validate_fused_key_a100(
@@ -1094,9 +1099,10 @@ void launch_mapped_value_a100(
     const PlanGeometry& geometry,
     int64_t plan_capacity,
     at::Tensor& destination_key_values,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int grid_blocks = kValueEntries) {
   shadowkv_place_value_a100_kernel<ValueSource::kMappedHost>
-      <<<kKVHeads * kSelectedCapacity, kVectorsPerChunk, 0, stream>>>(
+      <<<grid_blocks, kVectorsPerChunk, 0, stream>>>(
           component_kinds.data_ptr<int8_t>(),
           source_slots.data_ptr<int32_t>(),
           destination_slots.data_ptr<int32_t>(),
@@ -1543,7 +1549,7 @@ void shadowkv_fused_key_mapped_value_a100(
       key_stream);
 }
 
-void shadowkv_fused_key_mapped_value_staged_a100(
+static void launch_fused_key_mapped_value_staged_a100(
     const at::Tensor& u,
     const at::Tensor& sv,
     at::Tensor& gathered_u,
@@ -1569,7 +1575,8 @@ void shadowkv_fused_key_mapped_value_staged_a100(
     int64_t expected_generation,
     int64_t plan_capacity,
     int64_t reconstruction_stream,
-    at::Tensor& destination_key_values) {
+    at::Tensor& destination_key_values,
+    int mapped_value_grid_blocks) {
   const PlanGeometry key_geometry = validate_fused_key_a100(
       u,
       sv,
@@ -1664,7 +1671,8 @@ void shadowkv_fused_key_mapped_value_staged_a100(
       value_geometry,
       plan_capacity,
       destination_key_values,
-      value_stream);
+      value_stream,
+      mapped_value_grid_blocks);
 
   {
     c10::cuda::CUDAStreamGuard key_stream_guard(external_key_stream);
@@ -1684,4 +1692,118 @@ void shadowkv_fused_key_mapped_value_staged_a100(
         destination_key_values,
         key_stream);
   }
+}
+
+void shadowkv_fused_key_mapped_value_staged_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t mapped_host_bytes,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    int64_t plan_capacity,
+    int64_t reconstruction_stream,
+    at::Tensor& destination_key_values) {
+  launch_fused_key_mapped_value_staged_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      mapped_host_bytes,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      plan_capacity,
+      reconstruction_stream,
+      destination_key_values,
+      kValueEntries);
+}
+
+void shadowkv_fused_key_mapped_value_throttled_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t mapped_host_bytes,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    int64_t plan_capacity,
+    int64_t reconstruction_stream,
+    at::Tensor& destination_key_values) {
+  launch_fused_key_mapped_value_staged_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      mapped_host_bytes,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      plan_capacity,
+      reconstruction_stream,
+      destination_key_values,
+      kThrottledMappedValueBlocks);
 }
