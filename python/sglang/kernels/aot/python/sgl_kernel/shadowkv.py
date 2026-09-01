@@ -296,23 +296,6 @@ def _require_supported_device(device: torch.device) -> None:
         )
 
 
-def _require_b200(device: torch.device) -> None:
-    """Require the exact device envelope of the B200-only operators."""
-
-    if not shadowkv_kernels_available():
-        raise RuntimeError(
-            "the installed sglang-kernel wheel was built without optional ShadowKV kernels"
-        )
-    if not torch.cuda.is_available():
-        raise RuntimeError("this ShadowKV operator requires a visible NVIDIA B200")
-    capability = torch.cuda.get_device_capability(device)
-    if capability != (10, 0):
-        raise RuntimeError(
-            "this ShadowKV operator requires NVIDIA B200 compute capability 10.0; "
-            f"found {capability}"
-        )
-
-
 def _require_tensor(
     name: str,
     tensor: torch.Tensor,
@@ -525,7 +508,7 @@ def _validate_shadowkv_plan_inputs(
     device = selected_chunk_ids.device
     if any(tensor.device != device for _, tensor, _, _ in inputs):
         raise ValueError("all device-plan tensors must share one CUDA device")
-    _require_b200(device)
+    _require_supported_device(device)
     return rows, selected_capacity, device
 
 
@@ -791,7 +774,7 @@ def shadowkv_publish_value_descriptor(
         raise TypeError("generation must be an integer")
     if generation < 0:
         raise ValueError("generation must be nonnegative")
-    _require_b200(descriptor_generation.device)
+    _require_supported_device(descriptor_generation.device)
     torch.ops.sgl_kernel.shadowkv_publish_value_descriptor_generic_aot_v1.default(
         descriptor_generation,
         descriptor_validity,
@@ -825,7 +808,7 @@ def shadowkv_resolve_mapped_host_region(
         raise ValueError("mapped host values require a CUDA destination device")
     if resolved_device.index is None:
         resolved_device = torch.device("cuda", torch.cuda.current_device())
-    _require_b200(resolved_device)
+    _require_supported_device(resolved_device)
     pointer = int(
         torch.ops.sgl_kernel.shadowkv_resolve_mapped_host_pointer_generic_aot_v1.default(
             host_values,
@@ -906,7 +889,7 @@ def shadowkv_place_device(
     device = component_kinds.device
     if any(tensor.device != device for _, tensor, _, _ in inputs):
         raise ValueError("all placement tensors must share one CUDA device")
-    _require_b200(device)
+    _require_supported_device(device)
     torch.ops.sgl_kernel.shadowkv_place_device_generic_aot_v1.default(
         component_kinds,
         source_slots,
@@ -1018,7 +1001,7 @@ def shadowkv_place_device_miss_only(
     device = component_kinds.device
     if any(tensor.device != device for _, tensor, _, _ in inputs):
         raise ValueError("all miss-only placement tensors must share one CUDA device")
-    _require_b200(device)
+    _require_supported_device(device)
     torch.ops.sgl_kernel.shadowkv_place_device_miss_only_generic_aot_v1.default(
         component_kinds,
         source_slots,
@@ -1144,7 +1127,7 @@ def shadowkv_place_device_mapped_host(
         raise ValueError("all mapped-host placement tensors must share one CUDA device")
     if mapped_host_region.device != device:
         raise ValueError("mapped host region belongs to another CUDA device")
-    _require_b200(device)
+    _require_supported_device(device)
     torch.ops.sgl_kernel.shadowkv_place_device_mapped_host_generic_aot_v1.default(
         component_kinds,
         source_slots,
@@ -1288,7 +1271,7 @@ def shadowkv_publish_device(
     device = selected_chunk_ids.device
     if any(tensor.device != device for _, tensor, _, _ in inputs):
         raise ValueError("all publication tensors must share one CUDA device")
-    _require_b200(device)
+    _require_supported_device(device)
     torch.ops.sgl_kernel.shadowkv_publish_device_generic_aot_v1.default(
         selected_chunk_ids,
         selected_lengths,
