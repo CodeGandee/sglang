@@ -2,6 +2,7 @@
 
 #include <torch/library.h>
 
+#include "sgl_kernel_ops.h"
 #include "shadowkv/sm80/fused_key.h"
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
