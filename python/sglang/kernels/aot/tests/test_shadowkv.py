@@ -843,7 +843,7 @@ def test_shadowkv_a100_value_only_placement_matches_plan_reference(mode):
             elif kind == 2:
                 expected[head, selected].copy_(compatibility[1, head, selected])
 
-    guard = 257
+    guard = 256
     elements = compatibility.numel()
     guarded = torch.full(
         (guard + elements + guard,),
