@@ -15,25 +15,51 @@ def _configure(
     sm90_variant: bool,
     sm100_variant: bool,
     bf16: bool = True,
-    specialization_arch: str = "",
-    specialization_sources: str = "",
+    target_architecture: str | None = None,
+    build_input_sha256: str | None = None,
+    bundle_ids: str | None = None,
+    native_sources: str | None = None,
+    expected_symbols: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if enabled:
+        if target_architecture is None:
+            target_architecture = f"sm{cuda_arch}"
+        if build_input_sha256 is None:
+            build_input_sha256 = "a" * 64
+        if bundle_ids is None:
+            bundle_ids = "shadowkv.runtime.generic-aot.v1"
+        if native_sources is None:
+            native_sources = ";".join(
+                (
+                    "csrc/shadowkv/bindings/shadowkv_extension.cc",
+                    "csrc/shadowkv/generic/packed_gqa.cu",
+                    "csrc/shadowkv/generic/plan_reuse.cu",
+                    "csrc/shadowkv/generic/reconstruct_rope.cu",
+                )
+            )
+        if expected_symbols is None:
+            expected_symbols = "shadowkv_packed_gqa_generic_aot_v1"
     values = {
         "SGL_KERNEL_ENABLE_SHADOWKV": enabled,
         "SGL_KERNEL_CUDA_ARCH": cuda_arch,
         "SGL_KERNEL_BUILD_SM90_VARIANT": sm90_variant,
         "SGL_KERNEL_BUILD_SM100_VARIANT": sm100_variant,
         "SGL_KERNEL_ENABLE_BF16": bf16,
-        "SGL_KERNEL_SHADOWKV_SPECIALIZATION_ARCH": specialization_arch,
-        "SGL_KERNEL_SHADOWKV_SPECIALIZATION_SOURCES": specialization_sources,
+        "SGL_KERNEL_SHADOWKV_TARGET_ARCHITECTURE": target_architecture or "",
+        "SGL_KERNEL_SHADOWKV_BUILD_INPUT_SHA256": build_input_sha256 or "",
+        "SGL_KERNEL_SHADOWKV_BUNDLE_IDS": bundle_ids or "",
+        "SGL_KERNEL_SHADOWKV_NATIVE_SOURCES": native_sources or "",
+        "SGL_KERNEL_SHADOWKV_EXPECTED_SYMBOLS": expected_symbols or "",
     }
     assignments = "\n".join(
         f"set({name} {'ON' if value is True else 'OFF' if value is False else value})"
         for name, value in values.items()
     )
     source = (
-        assignments
-        + f'\ninclude("{SHADOWKV_CMAKE.as_posix()}")\n'
+        f'set(PROJECT_SOURCE_DIR "{AOT_ROOT.as_posix()}")\n'
+        + f'include("{SHADOWKV_CMAKE.as_posix()}")\n'
+        + assignments
+        + "\n"
         + "sgl_configure_shadowkv_sources(SHADOWKV_GENERIC_SOURCES SHADOWKV_BINDING_SOURCES SHADOWKV_SPECIALIZED_SOURCES)\n"
         + 'message(STATUS "shadowkv-generic=${SHADOWKV_GENERIC_SOURCES}")\n'
         + 'message(STATUS "shadowkv-bindings=${SHADOWKV_BINDING_SOURCES}")\n'
@@ -67,13 +93,23 @@ def test_enabled_precise_profiles_export_shadowkv_sources(cuda_arch):
     assert "shadowkv-specialized=" in output
 
 
-def test_disabled_profile_exports_no_shadowkv_sources():
+@pytest.mark.parametrize(
+    "cuda_arch,sm90_variant,sm100_variant,bf16",
+    [
+        ("80", False, True, True),
+        ("90a", True, False, False),
+        ("100a", False, True, True),
+    ],
+)
+def test_disabled_profile_exports_no_shadowkv_sources(
+    cuda_arch, sm90_variant, sm100_variant, bf16
+):
     result = _configure(
         enabled=False,
-        cuda_arch="90a",
-        sm90_variant=True,
-        sm100_variant=False,
-        bf16=False,
+        cuda_arch=cuda_arch,
+        sm90_variant=sm90_variant,
+        sm100_variant=sm100_variant,
+        bf16=bf16,
     )
     assert result.returncode == 0, result.stderr
     output = result.stdout + result.stderr
@@ -85,7 +121,7 @@ def test_disabled_profile_exports_no_shadowkv_sources():
 @pytest.mark.parametrize(
     "cuda_arch,sm90_variant,sm100_variant,bf16,message",
     [
-        ("90a", False, True, True, "generic candidate"),
+        ("90a", False, True, True, "contradicts"),
         ("80", True, True, True, "only the precise SM100"),
         ("100a", False, False, True, "only the precise SM100"),
         ("80", False, True, False, "requires BF16"),
@@ -100,36 +136,47 @@ def test_enabled_inconsistent_profiles_fail_configuration(
         sm90_variant=sm90_variant,
         sm100_variant=sm100_variant,
         bf16=bf16,
+        target_architecture="sm80" if cuda_arch == "90a" else None,
     )
     assert result.returncode != 0
     assert message in " ".join(result.stderr.split())
 
 
 @pytest.mark.parametrize(
-    "specialization_arch,specialization_sources,message",
+    "field,value,message",
     [
-        ("80", "", "requires a non-empty specialized source set"),
-        ("", "csrc/shadowkv/sm80/example.cu", "require an exact specialization"),
-        (
-            "100a",
-            "csrc/shadowkv/sm100a/example.cu",
-            "contradicts build target",
-        ),
+        ("build_input_sha256", "bad", "canonical build-input SHA-256"),
+        ("bundle_ids", "", "at least one effective bundle"),
+        ("native_sources", "../outside.cu", "Unsafe ShadowKV native source"),
+        ("native_sources", "csrc/common_extension.cc", "outside csrc/shadowkv"),
+        ("expected_symbols", "", "manifest-derived internal symbols"),
     ],
 )
-def test_contradictory_specialization_configuration_fails(
-    specialization_arch, specialization_sources, message
-):
+def test_invalid_manifest_derived_configuration_fails(field, value, message):
+    overrides = {field: value}
     result = _configure(
         enabled=True,
         cuda_arch="80",
         sm90_variant=False,
         sm100_variant=True,
-        specialization_arch=specialization_arch,
-        specialization_sources=specialization_sources,
+        **overrides,
     )
     assert result.returncode != 0
     assert message in " ".join(result.stderr.split())
+
+
+def test_disabled_profile_rejects_stale_bundle_inputs():
+    result = _configure(
+        enabled=False,
+        cuda_arch="80",
+        sm90_variant=False,
+        sm100_variant=True,
+        bundle_ids="shadowkv.runtime.generic-aot.v1",
+    )
+    assert result.returncode != 0
+    assert "stale bundle input SGL_KERNEL_SHADOWKV_BUNDLE_IDS" in " ".join(
+        result.stderr.split()
+    )
 
 
 def test_generic_and_specialized_source_layout_is_explicit():
