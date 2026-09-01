@@ -45,12 +45,13 @@ constexpr int kPlannerThreads = 256;
 constexpr int kMaximumSelectedCapacity = 256;
 constexpr int kMaximumExactCapacity = 64;
 
-void check_b200(const at::Tensor& tensor) {
+void check_supported_device(const at::Tensor& tensor) {
   cudaDeviceProp properties{};
   C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, tensor.get_device()));
   TORCH_CHECK(
-      properties.major == 10 && properties.minor == 0,
-      "shadowkv_plan_device requires NVIDIA B200 compute capability 10.0; found ",
+      (properties.major == 8 && properties.minor == 0) ||
+          (properties.major == 10 && properties.minor == 0),
+      "shadowkv_plan_device requires NVIDIA A100 compute capability 8.0 or B200 compute capability 10.0; found ",
       properties.major,
       ".",
       properties.minor);
@@ -845,7 +846,7 @@ void shadowkv_plan_device(
       temporal_capacity,
   };
   c10::cuda::CUDAGuard device_guard(device);
-  check_b200(selected_chunk_ids);
+  check_supported_device(selected_chunk_ids);
   if (dimensions.rows == 0) {
     return;
   }
@@ -937,7 +938,7 @@ void shadowkv_plan_device_v2(
       "all shadowkv_plan_device_v2 tensors must share one CUDA device");
 
   c10::cuda::CUDAGuard device_guard(device);
-  check_b200(selected_chunk_ids);
+  check_supported_device(selected_chunk_ids);
   if (dimensions.rows == 0) {
     return;
   }
@@ -989,7 +990,7 @@ void shadowkv_publish_value_descriptor(
       "value descriptor generation and validity must share one CUDA device");
   const auto device = descriptor_generation.device();
   c10::cuda::CUDAGuard device_guard(device);
-  check_b200(descriptor_generation);
+  check_supported_device(descriptor_generation);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   shadowkv_publish_value_descriptor_kernel<<<1, 1, 0, stream>>>(
       generation,

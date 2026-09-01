@@ -42,12 +42,13 @@ constexpr int kVectorsPerChunk = kChunkBytes / kVectorBytes;
 static_assert(kChunkBytes % kVectorBytes == 0);
 static_assert(kVectorsPerChunk == kCopyThreads);
 
-void check_b200(const at::Tensor& tensor) {
+void check_supported_device(const at::Tensor& tensor) {
   cudaDeviceProp properties{};
   C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, tensor.get_device()));
   TORCH_CHECK(
-      properties.major == 10 && properties.minor == 0,
-      "shadowkv_place_device requires NVIDIA B200 compute capability 10.0; found ",
+      (properties.major == 8 && properties.minor == 0) ||
+          (properties.major == 10 && properties.minor == 0),
+      "shadowkv_place_device requires NVIDIA A100 compute capability 8.0 or B200 compute capability 10.0; found ",
       properties.major,
       ".",
       properties.minor);
@@ -75,8 +76,9 @@ void check_mapped_host_device(int device_index) {
   cudaDeviceProp properties{};
   C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, device_index));
   TORCH_CHECK(
-      properties.major == 10 && properties.minor == 0,
-      "ShadowKV mapped-host access requires NVIDIA B200 compute capability 10.0");
+      (properties.major == 8 && properties.minor == 0) ||
+          (properties.major == 10 && properties.minor == 0),
+      "ShadowKV mapped-host access requires NVIDIA A100 compute capability 8.0 or B200 compute capability 10.0");
   TORCH_CHECK(properties.canMapHostMemory != 0, "selected CUDA device cannot map host memory");
   TORCH_CHECK(properties.unifiedAddressing != 0, "selected CUDA device lacks unified virtual addressing");
 }
@@ -461,7 +463,7 @@ void shadowkv_place_device(
   }
 
   c10::cuda::CUDAGuard device_guard(device);
-  check_b200(component_kinds);
+  check_supported_device(component_kinds);
   const int64_t entries = kComponents * kv_heads * selected_capacity;
   TORCH_CHECK(entries <= std::numeric_limits<int>::max(), "placement grid exceeds CUDA launch bounds");
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -591,7 +593,7 @@ void shadowkv_place_device_miss_only(
   }
 
   c10::cuda::CUDAGuard device_guard(device);
-  check_b200(component_kinds);
+  check_supported_device(component_kinds);
   const int64_t entries = kComponents * kv_heads * selected_capacity;
   TORCH_CHECK(entries <= std::numeric_limits<int>::max(), "placement grid exceeds CUDA launch bounds");
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -743,7 +745,7 @@ void shadowkv_place_device_mapped_host(
   }
 
   c10::cuda::CUDAGuard device_guard(device);
-  check_b200(component_kinds);
+  check_supported_device(component_kinds);
   check_mapped_host_device(component_kinds.get_device());
   const int64_t entries = kComponents * kv_heads * selected_capacity;
   TORCH_CHECK(entries <= std::numeric_limits<int>::max(), "placement grid exceeds CUDA launch bounds");

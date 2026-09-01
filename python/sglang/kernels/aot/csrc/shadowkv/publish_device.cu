@@ -40,12 +40,13 @@ constexpr int kVectorsPerChunk = kChunkBytes / kVectorBytes;
 static_assert(kChunkBytes % kVectorBytes == 0);
 static_assert(kVectorsPerChunk == 128);
 
-void check_b200(const at::Tensor& tensor) {
+void check_supported_device(const at::Tensor& tensor) {
   cudaDeviceProp properties{};
   C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, tensor.get_device()));
   TORCH_CHECK(
-      properties.major == 10 && properties.minor == 0,
-      "shadowkv_publish_device requires NVIDIA B200 compute capability 10.0; found ",
+      (properties.major == 8 && properties.minor == 0) ||
+          (properties.major == 10 && properties.minor == 0),
+      "shadowkv_publish_device requires NVIDIA A100 compute capability 8.0 or B200 compute capability 10.0; found ",
       properties.major,
       ".",
       properties.minor);
@@ -293,7 +294,7 @@ void shadowkv_publish_device(
   }
 
   c10::cuda::CUDAGuard device_guard(device);
-  check_b200(selected_chunk_ids);
+  check_supported_device(selected_chunk_ids);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   shadowkv_publish_device_kernel<<<static_cast<int>(kv_heads), kThreads, 0, stream>>>(
       selected_chunk_ids.data_ptr<int32_t>(),
