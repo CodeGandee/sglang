@@ -22,6 +22,12 @@ limitations under the License.
 #include <mma.h>
 #include <torch/all.h>
 
+#include "cutlass/bfloat16.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/kernel/default_gemm.h"
+#include "cutlass/gemm/threadblock/threadblock_swizzle.h"
+#include "cutlass/layout/matrix.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -60,11 +66,55 @@ constexpr int kVectorsPerChunk = kChunkBytes / kVectorBytes;
 constexpr int kValueEntries = kKVHeads * kSelectedCapacity;
 constexpr int kThrottledMappedValueBlocks = 512;
 
+// This fixed SM80 shape is part of the Llama 3.1 8B specialization contract.
+// It uses the CUTLASS headers already fetched by the AOT build and does not
+// depend on the external ShadowKV reference checkout at build or run time.
+using ShadowKVCutlassElement = cutlass::bfloat16_t;
+using ShadowKVCutlassAccumulator = float;
+using ShadowKVCutlassOutputOp =
+    cutlass::epilogue::thread::LinearCombination<
+        ShadowKVCutlassElement,
+        128 / cutlass::sizeof_bits<ShadowKVCutlassElement>::value,
+        ShadowKVCutlassAccumulator,
+        ShadowKVCutlassAccumulator>;
+using ShadowKVMissGemmDefault = cutlass::gemm::kernel::DefaultGemm<
+    ShadowKVCutlassElement,
+    cutlass::layout::RowMajor,
+    8,
+    ShadowKVCutlassElement,
+    cutlass::layout::RowMajor,
+    8,
+    ShadowKVCutlassElement,
+    cutlass::layout::RowMajor,
+    ShadowKVCutlassAccumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 64, 64>,
+    cutlass::gemm::GemmShape<64, 32, 64>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    ShadowKVCutlassOutputOp,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    3,
+    false,
+    cutlass::arch::OpMultiplyAdd,
+    cutlass::gemm::SharedMemoryClearOption::kNone,
+    false,
+    false,
+    true>;
+using ShadowKVMissGemmKernel = typename ShadowKVMissGemmDefault::GemmKernel;
+constexpr int kMissGemmThreads = ShadowKVMissGemmKernel::kThreadCount;
+constexpr size_t kMissGemmScatterOffset =
+    (sizeof(ShadowKVMissGemmKernel::SharedStorage) + alignof(int32_t) - 1) &
+    ~(alignof(int32_t) - 1);
+constexpr size_t kMissGemmSharedBytes =
+    kMissGemmScatterOffset + (kRowsPerKeyBlock + 1) * sizeof(int32_t);
+
 static_assert(kVectorsPerChunk <= kThreads);
 static_assert(kThreads <= 1024 && kThreads % 32 == 0);
 static_assert(kSelectedCapacity % kChunksPerKeyBlock == 0);
 static_assert(kRowsPerKeyBlock == 128 && kThreads == 256);
 static_assert(kValueEntries % kThrottledMappedValueBlocks == 0);
+static_assert(kMissGemmThreads == 128);
 
 void check_tensor(
     const at::Tensor& tensor,
@@ -79,6 +129,18 @@ void check_tensor(
       dimensions,
       " dimensions");
   TORCH_CHECK(tensor.scalar_type() == dtype, name, " has an invalid dtype");
+}
+
+void check_alignment(
+    const at::Tensor& tensor,
+    const char* name,
+    uintptr_t alignment) {
+  TORCH_CHECK(
+      reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0,
+      name,
+      " must be ",
+      alignment,
+      "-byte aligned");
 }
 
 void check_sm80(const at::Tensor& tensor) {
@@ -117,6 +179,8 @@ PlanGeometry check_plan_tensors(
   check_tensor(planner_error_codes, "planner_error_codes", at::ScalarType::Int, 1);
   check_tensor(temporal_key_values, "temporal_key_values", at::ScalarType::BFloat16, 7);
   check_tensor(destination_key_values, "destination_key_values", at::ScalarType::BFloat16, 5);
+  check_alignment(temporal_key_values, "temporal_key_values", kVectorBytes);
+  check_alignment(destination_key_values, "destination_key_values", kVectorBytes);
 
   const auto plan_shape = at::IntArrayRef({kComponents, kKVHeads, kSelectedCapacity});
   TORCH_CHECK(component_kinds.sizes() == plan_shape, "component_kinds must have shape [2, 8, 256]");
@@ -554,6 +618,345 @@ __global__ void shadowkv_prepare_key_bmm_a100_kernel(
   }
 }
 
+__global__ void shadowkv_prepare_key_miss_only_a100_kernel(
+    const __nv_bfloat16* __restrict__ u,
+    const int8_t* __restrict__ component_kinds,
+    const int32_t* __restrict__ source_slots,
+    const int32_t* __restrict__ destination_slots,
+    const int32_t* __restrict__ miss_ordinals,
+    const int32_t* __restrict__ selected_chunk_ids,
+    const int32_t* __restrict__ selected_lengths,
+    const int32_t* __restrict__ plan_slots,
+    int32_t* __restrict__ planner_error_codes,
+    const uint4* __restrict__ temporal_key_values,
+    int u_tokens,
+    int rope_rows,
+    int64_t temporal_chunks_per_component,
+    int plan_capacity,
+    __nv_bfloat16* __restrict__ gathered_u,
+    uint4* __restrict__ destination_key_values) {
+  const int head = blockIdx.x;
+  const int selected = threadIdx.x;
+  __shared__ int32_t seen_ordinals[kSelectedCapacity];
+  __shared__ int32_t hit_count;
+  __shared__ int32_t miss_count;
+
+  seen_ordinals[selected] = 0;
+  if (selected == 0) {
+    hit_count = 0;
+    miss_count = 0;
+  }
+  __syncthreads();
+
+  const int64_t plan_offset =
+      static_cast<int64_t>(head) * kSelectedCapacity + selected;
+  const int8_t kind = component_kinds[plan_offset];
+  const int source_slot = source_slots[plan_offset];
+  const int destination_slot = destination_slots[plan_offset];
+  const int miss_ordinal = miss_ordinals[plan_offset];
+  const int selected_chunk = selected_chunk_ids[plan_offset];
+  const int selected_length = selected_lengths[head];
+  const int plan_slot = plan_slots[head];
+  const bool plan_row_valid =
+      planner_error_codes[head] == 0 && plan_slot >= 0 &&
+      plan_slot < plan_capacity && selected_length >= 0 &&
+      selected_length <= kSelectedCapacity;
+  if (selected == 0 && planner_error_codes[head] == 0 && !plan_row_valid) {
+    atomicCAS(
+        planner_error_codes + head,
+        0,
+        kInvalidPlacementDescriptor);
+  }
+  const bool active_ordinal = selected < selected_length;
+  const int64_t expected_destination =
+      (static_cast<int64_t>(plan_slot) * kKVHeads + head) *
+          kSelectedCapacity +
+      selected;
+  const bool inactive_valid =
+      kind == kInactive && source_slot == -1 && destination_slot == -1 &&
+      miss_ordinal == -1;
+  const bool hit_valid =
+      active_ordinal && kind == kHit && source_slot >= 0 &&
+      source_slot < temporal_chunks_per_component && miss_ordinal == -1 &&
+      destination_slot == expected_destination;
+  const bool miss_valid =
+      active_ordinal && kind == kMiss && source_slot == -1 &&
+      miss_ordinal >= 0 && miss_ordinal < kSelectedCapacity &&
+      selected_chunk >= 0 &&
+      (static_cast<int64_t>(selected_chunk) + 1) * kChunkSize <= u_tokens &&
+      (static_cast<int64_t>(selected_chunk) + 1) * kChunkSize <= rope_rows &&
+      destination_slot == expected_destination;
+  const bool entry_valid =
+      plan_row_valid && (inactive_valid || hit_valid || miss_valid) &&
+      (active_ordinal || inactive_valid);
+
+  if (!entry_valid) {
+    if (plan_row_valid) {
+      atomicCAS(
+          planner_error_codes + head,
+          0,
+          kInvalidPlacementDescriptor);
+    }
+  } else if (hit_valid) {
+    atomicAdd(&hit_count, 1);
+  } else if (miss_valid) {
+    atomicAdd(&miss_count, 1);
+    if (atomicCAS(seen_ordinals + miss_ordinal, 0, 1) != 0) {
+      atomicCAS(
+          planner_error_codes + head,
+          0,
+          kInvalidPlacementDescriptor);
+    }
+  }
+  __syncthreads();
+
+  if (plan_row_valid) {
+    const bool ordinal_present = seen_ordinals[selected] != 0;
+    const bool ordinal_expected = selected < miss_count;
+    if (ordinal_present != ordinal_expected ||
+        hit_count + miss_count > selected_length) {
+      atomicCAS(
+          planner_error_codes + head,
+          0,
+          kInvalidPlacementDescriptor);
+    }
+  }
+  __syncthreads();
+  if (planner_error_codes[head] != 0) {
+    return;
+  }
+
+  for (int work = threadIdx.x;
+       work < kSelectedCapacity * kVectorsPerChunk;
+       work += blockDim.x) {
+    const int work_selected = work / kVectorsPerChunk;
+    const int vector = work - work_selected * kVectorsPerChunk;
+    const int64_t work_plan_offset =
+        static_cast<int64_t>(head) * kSelectedCapacity + work_selected;
+    const int8_t work_kind = component_kinds[work_plan_offset];
+    const int64_t destination_vector = work_plan_offset * kVectorsPerChunk + vector;
+    if (work_kind == kHit) {
+      destination_key_values[destination_vector] =
+          temporal_key_values[
+              static_cast<int64_t>(source_slots[work_plan_offset]) *
+                  kVectorsPerChunk +
+              vector];
+    } else if (work_kind == kInactive) {
+      destination_key_values[destination_vector] = uint4{0, 0, 0, 0};
+    }
+  }
+
+  constexpr int kGatherElementsPerSelected = kChunkSize * kRank;
+  for (int work = threadIdx.x;
+       work < kSelectedCapacity * kGatherElementsPerSelected;
+       work += blockDim.x) {
+    const int work_selected = work / kGatherElementsPerSelected;
+    const int local = work - work_selected * kGatherElementsPerSelected;
+    const int64_t work_plan_offset =
+        static_cast<int64_t>(head) * kSelectedCapacity + work_selected;
+    if (component_kinds[work_plan_offset] != kMiss) {
+      continue;
+    }
+    const int token = local / kRank;
+    const int rank = local - token * kRank;
+    const int ordinal = miss_ordinals[work_plan_offset];
+    const int chunk = selected_chunk_ids[work_plan_offset];
+    gathered_u[
+        ((static_cast<int64_t>(head) * kSelectedCapacity + ordinal) *
+             kChunkSize +
+         token) *
+            kRank +
+        rank] =
+        u[(static_cast<int64_t>(chunk) * kChunkSize + token) * kRank + rank];
+  }
+}
+
+__global__ void shadowkv_reconstruct_key_misses_a100_kernel(
+    const ShadowKVCutlassElement* __restrict__ gathered_u,
+    const ShadowKVCutlassElement* __restrict__ sv,
+    const float* __restrict__ cosine,
+    const float* __restrict__ sine,
+    const int8_t* __restrict__ component_kinds,
+    const int32_t* __restrict__ miss_ordinals,
+    const int32_t* __restrict__ selected_chunk_ids,
+    int32_t* __restrict__ planner_error_codes,
+    ShadowKVCutlassElement* __restrict__ destination_key_values) {
+  extern __shared__ __align__(16) unsigned char shared_bytes[];
+  auto* shared_storage =
+      reinterpret_cast<ShadowKVMissGemmKernel::SharedStorage*>(shared_bytes);
+  int32_t* scatter_rows =
+      reinterpret_cast<int32_t*>(shared_bytes + kMissGemmScatterOffset);
+  int32_t* shared_miss_count = scatter_rows + kRowsPerKeyBlock;
+
+  const int head = blockIdx.x;
+  const int key_block = blockIdx.y;
+  const int miss_base = key_block * kChunksPerKeyBlock;
+  if (threadIdx.x == 0) {
+    *shared_miss_count = 0;
+  }
+  if (threadIdx.x < kRowsPerKeyBlock) {
+    scatter_rows[threadIdx.x] = -1;
+  }
+  __syncthreads();
+  if (planner_error_codes[head] != 0) {
+    return;
+  }
+
+  for (int selected = threadIdx.x;
+       selected < kSelectedCapacity;
+       selected += blockDim.x) {
+    const int64_t plan_offset =
+        static_cast<int64_t>(head) * kSelectedCapacity + selected;
+    if (component_kinds[plan_offset] == kMiss) {
+      atomicAdd(shared_miss_count, 1);
+    }
+  }
+  __syncthreads();
+  const int miss_count = *shared_miss_count;
+  if (miss_base >= miss_count) {
+    return;
+  }
+  const int active_chunks = min(kChunksPerKeyBlock, miss_count - miss_base);
+  const int active_rows = active_chunks * kChunkSize;
+
+  for (int selected = threadIdx.x;
+       selected < kSelectedCapacity;
+       selected += blockDim.x) {
+    const int64_t plan_offset =
+        static_cast<int64_t>(head) * kSelectedCapacity + selected;
+    if (component_kinds[plan_offset] == kMiss) {
+      const int ordinal = miss_ordinals[plan_offset];
+      if (ordinal < miss_base || ordinal >= miss_base + active_chunks) {
+        continue;
+      }
+      const int local_chunk = ordinal - miss_base;
+#pragma unroll
+      for (int token = 0; token < kChunkSize; ++token) {
+        scatter_rows[local_chunk * kChunkSize + token] =
+            selected * kChunkSize + token;
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x < active_rows && scatter_rows[threadIdx.x] < 0) {
+    atomicCAS(
+        planner_error_codes + head,
+        0,
+        kInvalidPlacementDescriptor);
+  }
+  __syncthreads();
+  if (planner_error_codes[head] != 0) {
+    return;
+  }
+
+  using Mma = typename ShadowKVMissGemmKernel::Mma;
+  using Epilogue = typename ShadowKVMissGemmKernel::Epilogue;
+  const int thread = threadIdx.x;
+  const int warp = cutlass::canonical_warp_idx_sync();
+  const int lane = thread & 31;
+  const cutlass::MatrixCoord problem_a(active_rows, kRank);
+  const cutlass::MatrixCoord origin(0, 0);
+  ShadowKVCutlassElement* head_destination =
+      destination_key_values +
+      static_cast<int64_t>(head) * kSelectedCapacity * kChunkSize *
+          kHeadDimension;
+  for (int column_base = 0;
+       column_base < kHeadDimension;
+       column_base += Mma::Shape::kN) {
+    const cutlass::MatrixCoord problem_b(kRank, Mma::Shape::kN);
+    const cutlass::MatrixCoord problem_output(active_rows, Mma::Shape::kN);
+    typename Mma::IteratorA::Params params_a{
+        cutlass::layout::RowMajor(kRank)};
+    typename Mma::IteratorA iterator_a(
+        params_a,
+        const_cast<ShadowKVCutlassElement*>(
+            gathered_u +
+            (static_cast<int64_t>(head) * kSelectedCapacity + miss_base) *
+                kChunkSize * kRank),
+        problem_a,
+        thread,
+        origin);
+    typename Mma::IteratorB::Params params_b{
+        cutlass::layout::RowMajor(kHeadDimension)};
+    typename Mma::IteratorB iterator_b(
+        params_b,
+        const_cast<ShadowKVCutlassElement*>(
+            sv + static_cast<int64_t>(head) * kRank * kHeadDimension +
+            column_base),
+        problem_b,
+        thread,
+        origin);
+    Mma mma(shared_storage->main_loop, thread, warp, lane);
+    typename Mma::FragmentC accumulators;
+    accumulators.clear();
+    mma(
+        (kRank + Mma::Shape::kK - 1) / Mma::Shape::kK,
+        accumulators,
+        iterator_a,
+        iterator_b,
+        accumulators);
+
+    ShadowKVCutlassOutputOp output_op(
+        typename ShadowKVCutlassOutputOp::Params(1.0f, 0.0f));
+    typename Epilogue::OutputTileIterator::Params output_params{
+        cutlass::layout::RowMajor(kHeadDimension)};
+    typename Epilogue::OutputTileIterator destination_iterator(
+        output_params,
+        head_destination + column_base,
+        problem_output,
+        thread,
+        origin,
+        scatter_rows);
+    typename Epilogue::OutputTileIterator source_iterator(
+        output_params,
+        head_destination + column_base,
+        problem_output,
+        thread,
+        origin,
+        scatter_rows);
+    Epilogue epilogue(shared_storage->epilogue, thread, warp, lane);
+    epilogue(output_op, destination_iterator, accumulators, source_iterator);
+    __syncthreads();
+  }
+
+  __nv_bfloat16* destination =
+      reinterpret_cast<__nv_bfloat16*>(destination_key_values);
+  for (int pair = threadIdx.x;
+       pair < active_rows * kHalfHeadDimension;
+       pair += blockDim.x) {
+    const int local_row = pair / kHalfHeadDimension;
+    const int frequency = pair - local_row * kHalfHeadDimension;
+    const int destination_row = scatter_rows[local_row];
+    const int selected_slot = destination_row / kChunkSize;
+    const int token = destination_row - selected_slot * kChunkSize;
+    const int selected_chunk = selected_chunk_ids[
+        static_cast<int64_t>(head) * kSelectedCapacity + selected_slot];
+    const int64_t position =
+        static_cast<int64_t>(selected_chunk) * kChunkSize + token;
+    const int64_t destination_base =
+        (static_cast<int64_t>(head) * kSelectedCapacity * kChunkSize +
+         destination_row) *
+        kHeadDimension;
+    const float first =
+        __bfloat162float(destination[destination_base + frequency]);
+    const float second = __bfloat162float(
+        destination[destination_base + kHalfHeadDimension + frequency]);
+    const int64_t frequency_offset =
+        position * kHalfHeadDimension + frequency;
+    const float cosine_value = cosine[frequency_offset];
+    const float sine_value = sine[frequency_offset];
+    destination[destination_base + frequency] = __float2bfloat16_rn(
+        __fadd_rn(
+            __fmul_rn(first, cosine_value),
+            __fmul_rn(-second, sine_value)));
+    destination[destination_base + kHalfHeadDimension + frequency] =
+        __float2bfloat16_rn(
+            __fadd_rn(
+                __fmul_rn(second, cosine_value),
+                __fmul_rn(first, sine_value)));
+  }
+}
+
 __global__ void shadowkv_finalize_key_bmm_a100_kernel(
     const float* __restrict__ cosine,
     const float* __restrict__ sine,
@@ -805,6 +1208,9 @@ PlanGeometry validate_fused_key_a100(
   check_tensor(sine, "sine", at::ScalarType::Float, 2);
   check_tensor(miss_ordinals, "miss_ordinals", at::ScalarType::Int, 3);
   check_tensor(selected_chunk_ids, "selected_chunk_ids", at::ScalarType::Int, 2);
+  check_alignment(u, "u", kVectorBytes);
+  check_alignment(sv, "sv", kVectorBytes);
+  check_alignment(gathered_u, "gathered_u", kVectorBytes);
   const PlanGeometry geometry = check_plan_tensors(
       component_kinds,
       source_slots,
@@ -895,6 +1301,85 @@ void launch_prepare_key_a100(
       static_cast<int>(plan_capacity),
       reinterpret_cast<__nv_bfloat16*>(
           gathered_u.data_ptr<at::BFloat16>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_prepare_key_miss_only_a100(
+    const at::Tensor& u,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const PlanGeometry& geometry,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
+  shadowkv_prepare_key_miss_only_a100_kernel<<<kKVHeads, kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(u.data_ptr<at::BFloat16>()),
+      component_kinds.data_ptr<int8_t>(),
+      source_slots.data_ptr<int32_t>(),
+      destination_slots.data_ptr<int32_t>(),
+      miss_ordinals.data_ptr<int32_t>(),
+      selected_chunk_ids.data_ptr<int32_t>(),
+      selected_lengths.data_ptr<int32_t>(),
+      plan_slots.data_ptr<int32_t>(),
+      planner_error_codes.data_ptr<int32_t>(),
+      reinterpret_cast<const uint4*>(
+          temporal_key_values.data_ptr<at::BFloat16>()),
+      static_cast<int>(u.size(0)),
+      static_cast<int>(cosine.size(0)),
+      geometry.temporal_chunks_per_component,
+      static_cast<int>(plan_capacity),
+      reinterpret_cast<__nv_bfloat16*>(
+          gathered_u.data_ptr<at::BFloat16>()),
+      reinterpret_cast<uint4*>(
+          destination_key_values.data_ptr<at::BFloat16>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_reconstruct_key_misses_a100(
+    const at::Tensor& sv,
+    const at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    at::Tensor& planner_error_codes,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
+  static const bool shared_memory_configured = []() {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        shadowkv_reconstruct_key_misses_a100_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(kMissGemmSharedBytes)));
+    return true;
+  }();
+  TORCH_INTERNAL_ASSERT(shared_memory_configured);
+  const dim3 grid(kKVHeads, kKeyBlocksPerHead);
+  shadowkv_reconstruct_key_misses_a100_kernel
+      <<<grid, kMissGemmThreads, kMissGemmSharedBytes, stream>>>(
+          reinterpret_cast<const ShadowKVCutlassElement*>(
+              gathered_u.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const ShadowKVCutlassElement*>(
+              sv.data_ptr<at::BFloat16>()),
+          cosine.data_ptr<float>(),
+          sine.data_ptr<float>(),
+          component_kinds.data_ptr<int8_t>(),
+          miss_ordinals.data_ptr<int32_t>(),
+          selected_chunk_ids.data_ptr<int32_t>(),
+          planner_error_codes.data_ptr<int32_t>(),
+          reinterpret_cast<ShadowKVCutlassElement*>(
+              destination_key_values.data_ptr<at::BFloat16>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -991,6 +1476,55 @@ void launch_fused_key_a100(
       temporal_key_values,
       geometry,
       plan_capacity,
+      destination_key_values,
+      stream);
+}
+
+void launch_fused_key_miss_only_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const PlanGeometry& geometry,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  launch_prepare_key_miss_only_a100(
+      u,
+      gathered_u,
+      cosine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      geometry,
+      plan_capacity,
+      destination_key_values,
+      stream);
+  launch_reconstruct_key_misses_a100(
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      miss_ordinals,
+      selected_chunk_ids,
+      planner_error_codes,
       destination_key_values,
       stream);
 }
@@ -1170,6 +1704,65 @@ void shadowkv_fused_key_a100(
   check_sm80(u);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   launch_fused_key_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      geometry,
+      plan_capacity,
+      destination_key_values,
+      stream);
+}
+
+void shadowkv_fused_key_miss_only_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values) {
+  const PlanGeometry geometry = validate_fused_key_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      plan_capacity,
+      destination_key_values);
+  const auto device = u.device();
+  c10::cuda::CUDAGuard device_guard(device);
+  check_sm80(u);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  launch_fused_key_miss_only_a100(
       u,
       sv,
       gathered_u,
@@ -1576,7 +2169,8 @@ static void launch_fused_key_mapped_value_staged_a100(
     int64_t plan_capacity,
     int64_t reconstruction_stream,
     at::Tensor& destination_key_values,
-    int mapped_value_grid_blocks) {
+    int mapped_value_grid_blocks,
+    bool miss_only_key) {
   const PlanGeometry key_geometry = validate_fused_key_a100(
       u,
       sv,
@@ -1633,21 +2227,41 @@ static void launch_fused_key_mapped_value_staged_a100(
       c10::cuda::getStreamFromExternal(key_stream, device.index());
   {
     c10::cuda::CUDAStreamGuard key_stream_guard(external_key_stream);
-    launch_prepare_key_a100(
-        u,
-        gathered_u,
-        cosine,
-        component_kinds,
-        source_slots,
-        destination_slots,
-        miss_ordinals,
-        selected_chunk_ids,
-        selected_lengths,
-        plan_slots,
-        planner_error_codes,
-        key_geometry,
-        plan_capacity,
-        key_stream);
+    if (miss_only_key) {
+      launch_prepare_key_miss_only_a100(
+          u,
+          gathered_u,
+          cosine,
+          component_kinds,
+          source_slots,
+          destination_slots,
+          miss_ordinals,
+          selected_chunk_ids,
+          selected_lengths,
+          plan_slots,
+          planner_error_codes,
+          temporal_key_values,
+          key_geometry,
+          plan_capacity,
+          destination_key_values,
+          key_stream);
+    } else {
+      launch_prepare_key_a100(
+          u,
+          gathered_u,
+          cosine,
+          component_kinds,
+          source_slots,
+          destination_slots,
+          miss_ordinals,
+          selected_chunk_ids,
+          selected_lengths,
+          plan_slots,
+          planner_error_codes,
+          key_geometry,
+          plan_capacity,
+          key_stream);
+    }
   }
 
   launch_mapped_value_a100(
@@ -1676,21 +2290,35 @@ static void launch_fused_key_mapped_value_staged_a100(
 
   {
     c10::cuda::CUDAStreamGuard key_stream_guard(external_key_stream);
-    launch_key_bmm_a100(sv, gathered_u, destination_key_values, key_stream);
-    launch_finalize_key_a100(
-        cosine,
-        sine,
-        component_kinds,
-        source_slots,
-        selected_chunk_ids,
-        selected_lengths,
-        plan_slots,
-        planner_error_codes,
-        temporal_key_values,
-        key_geometry,
-        plan_capacity,
-        destination_key_values,
-        key_stream);
+    if (miss_only_key) {
+      launch_reconstruct_key_misses_a100(
+          sv,
+          gathered_u,
+          cosine,
+          sine,
+          component_kinds,
+          miss_ordinals,
+          selected_chunk_ids,
+          planner_error_codes,
+          destination_key_values,
+          key_stream);
+    } else {
+      launch_key_bmm_a100(sv, gathered_u, destination_key_values, key_stream);
+      launch_finalize_key_a100(
+          cosine,
+          sine,
+          component_kinds,
+          source_slots,
+          selected_chunk_ids,
+          selected_lengths,
+          plan_slots,
+          planner_error_codes,
+          temporal_key_values,
+          key_geometry,
+          plan_capacity,
+          destination_key_values,
+          key_stream);
+    }
   }
 }
 
@@ -1748,7 +2376,8 @@ void shadowkv_fused_key_mapped_value_staged_a100(
       plan_capacity,
       reconstruction_stream,
       destination_key_values,
-      kValueEntries);
+      kValueEntries,
+      false);
 }
 
 void shadowkv_fused_key_mapped_value_throttled_a100(
@@ -1805,5 +2434,64 @@ void shadowkv_fused_key_mapped_value_throttled_a100(
       plan_capacity,
       reconstruction_stream,
       destination_key_values,
-      kThrottledMappedValueBlocks);
+      kThrottledMappedValueBlocks,
+      false);
+}
+
+void shadowkv_fused_key_mapped_value_miss_only_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t mapped_host_bytes,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    int64_t plan_capacity,
+    int64_t reconstruction_stream,
+    at::Tensor& destination_key_values) {
+  launch_fused_key_mapped_value_staged_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      mapped_host_bytes,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      plan_capacity,
+      reconstruction_stream,
+      destination_key_values,
+      kThrottledMappedValueBlocks,
+      true);
 }

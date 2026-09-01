@@ -674,7 +674,7 @@ def test_shadowkv_reconstruct_rejects_unsupported_input(mutation, message):
         sgl_kernel.shadowkv_reconstruct(u, sv, positions)
 
 
-def _a100_fused_key_case(mode):
+def _a100_fused_key_case(mode, *, miss_counts=None):
     selected = torch.arange(256, dtype=torch.int32, device="cuda").repeat(8, 1)
     selected_lengths = torch.tensor(
         [256, 255, 254, 253, 252, 251, 250, 249],
@@ -683,13 +683,30 @@ def _a100_fused_key_case(mode):
     )
     exact = torch.full((8, 1), -1, dtype=torch.int32, device="cuda")
     exact_lengths = torch.zeros((8,), dtype=torch.int32, device="cuda")
-    temporal_ids = selected.view(1, 1, 8, 256).clone()
+    if mode == "duplicate-exact":
+        selected[:, 1] = selected[:, 0]
+        exact[:, 0] = selected[:, 2]
+        exact_lengths.fill_(1)
+    temporal_ids = (
+        torch.arange(256, dtype=torch.int32, device="cuda")
+        .repeat(8, 1)
+        .view(1, 1, 8, 256)
+    )
     validity = torch.zeros((2, 1, 1, 8, 256), dtype=torch.uint8, device="cuda")
-    if mode == "all-hit":
+    if miss_counts is not None:
+        if mode != "boundary":
+            raise AssertionError("explicit miss counts require boundary mode")
+        if len(miss_counts) != 8 or any(count < 0 or count > 256 for count in miss_counts):
+            raise AssertionError("A100 boundary miss counts must cover eight heads")
+        validity.fill_(1)
+        selected_lengths.fill_(256)
+        for head, count in enumerate(miss_counts):
+            validity[:, :, :, head, :count].fill_(0)
+    elif mode == "all-hit":
         validity.fill_(1)
     elif mode == "mixed":
         validity[:, :, :, :, ::2].fill_(1)
-    elif mode != "all-miss":
+    elif mode not in {"all-miss", "duplicate-exact"}:
         raise AssertionError(f"unknown fused-key mode {mode}")
     publications = torch.full((2, 1, 1, 8, 256), -1, dtype=torch.int64, device="cuda")
     publications.masked_fill_(validity == 1, 0)
@@ -729,7 +746,9 @@ def _a100_fused_key_case(mode):
     not sgl_kernel.shadowkv_a100_fused_key_kernels_available(),
     reason="the installed wheel has no SM80 fused-key child",
 )
-@pytest.mark.parametrize("mode", ["all-hit", "mixed", "all-miss"])
+@pytest.mark.parametrize(
+    "mode", ["all-hit", "mixed", "all-miss", "duplicate-exact"]
+)
 def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
     torch.manual_seed(20260902 + len(mode))
     u = (torch.randn((2048, 160), device="cuda") * 0.0625).to(torch.bfloat16)
@@ -742,13 +761,29 @@ def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
     cosine = angles.cos().contiguous()
     sine = angles.sin().contiguous()
     plan, temporal_values = _a100_fused_key_case(mode)
-    output = torch.full(
-        (2, 8, 256, 8, 128),
+    output_shape = (2, 8, 256, 8, 128)
+    output_elements = math.prod(output_shape)
+    guard_elements = 256
+    output_storage = torch.full(
+        (guard_elements + output_elements + guard_elements,),
         23,
         dtype=torch.bfloat16,
         device="cuda",
     )
-    gathered_u = torch.empty((8, 2048, 160), dtype=torch.bfloat16, device="cuda")
+    output = output_storage[
+        guard_elements : guard_elements + output_elements
+    ].view(output_shape)
+    gathered_shape = (8, 2048, 160)
+    gathered_elements = math.prod(gathered_shape)
+    gathered_storage = torch.full(
+        (guard_elements + gathered_elements + guard_elements,),
+        37,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    gathered_u = gathered_storage[
+        guard_elements : guard_elements + gathered_elements
+    ].view(gathered_shape)
 
     selected_positions = (
         plan.selected_chunk_ids.to(torch.int64)[..., None] * 8
@@ -817,6 +852,208 @@ def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
     assert torch.equal(output[1], torch.full_like(output[1], 23))
     assert torch.equal(repeated[0], output[0])
     torch.testing.assert_close(output[0], expected, rtol=2e-3, atol=2e-3)
+    assert torch.equal(
+        output_storage[:guard_elements],
+        torch.full_like(output_storage[:guard_elements], 23),
+    )
+    assert torch.equal(
+        output_storage[-guard_elements:],
+        torch.full_like(output_storage[-guard_elements:], 23),
+    )
+    assert torch.equal(
+        gathered_storage[:guard_elements],
+        torch.full_like(gathered_storage[:guard_elements], 37),
+    )
+    assert torch.equal(
+        gathered_storage[-guard_elements:],
+        torch.full_like(gathered_storage[-guard_elements:], 37),
+    )
+
+
+@pytest.mark.skipif(
+    not sgl_kernel.shadowkv_a100_fused_key_kernels_available(),
+    reason="the installed wheel has no SM80 fused-key child",
+)
+def test_shadowkv_a100_miss_only_boundaries_match_retained_full_bmm_control():
+    torch.manual_seed(20261004)
+    miss_counts = (0, 1, 15, 16, 17, 255, 256, 127)
+    plan, temporal_values = _a100_fused_key_case(
+        "boundary", miss_counts=miss_counts
+    )
+    u = (torch.randn((2048, 160), device="cuda") * 0.0625).to(torch.bfloat16)
+    sv = (torch.randn((8, 160, 128), device="cuda") * 0.0625).to(torch.bfloat16)
+    inverse = 1.0 / (
+        500_000.0
+        ** (torch.arange(0, 128, 2, device="cuda", dtype=torch.float32) / 128)
+    )
+    angles = torch.arange(2048, dtype=torch.float32, device="cuda")[:, None] * inverse
+    cosine = angles.cos().contiguous()
+    sine = angles.sin().contiguous()
+    full_workspace = torch.empty(
+        (8, 2048, 160), dtype=torch.bfloat16, device="cuda"
+    )
+    full_output = torch.full(
+        (2, 8, 256, 8, 128), 41, dtype=torch.bfloat16, device="cuda"
+    )
+    miss_workspace = torch.full_like(full_workspace, 43)
+    miss_output = torch.full_like(full_output, 47)
+
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v2.default(
+        u,
+        sv,
+        full_workspace,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        1,
+        full_output,
+    )
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v3.default(
+        u,
+        sv,
+        miss_workspace,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        1,
+        miss_output,
+    )
+
+    assert not plan.error_codes.any().item()
+    torch.testing.assert_close(miss_output[0], full_output[0], rtol=2e-3, atol=2e-3)
+    assert torch.equal(miss_output[1], torch.full_like(miss_output[1], 47))
+    assert torch.equal(miss_workspace[0], torch.full_like(miss_workspace[0], 43))
+    for head, expected_misses in enumerate(miss_counts):
+        assert (
+            torch.count_nonzero(plan.component_kinds[0, head] == 2).item()
+            == expected_misses
+        )
+        hit_rows = plan.component_kinds[0, head] == 1
+        assert torch.equal(miss_output[0, head, hit_rows], full_output[0, head, hit_rows])
+
+
+@pytest.mark.skipif(
+    not sgl_kernel.shadowkv_a100_fused_key_kernels_available(),
+    reason="the installed wheel has no SM80 fused-key child",
+)
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "duplicate-miss-ordinal",
+        "missing-miss-ordinal",
+        "invalid-plan-slot",
+        "oversized-selected-length",
+        "invalid-hit-source",
+        "invalid-selected-chunk",
+    ],
+)
+def test_shadowkv_a100_miss_only_rejects_invalid_plan_before_write(mutation):
+    torch.manual_seed(20261005)
+    mode = "all-hit" if mutation == "invalid-hit-source" else "all-miss"
+    plan, temporal_values = _a100_fused_key_case(mode)
+    if mutation == "duplicate-miss-ordinal":
+        plan.miss_ordinals[0, 0, 1] = 0
+    elif mutation == "missing-miss-ordinal":
+        plan.miss_ordinals[0, 0, 1] = 2
+    elif mutation == "invalid-plan-slot":
+        plan.plan_slots[0] = -1
+    elif mutation == "oversized-selected-length":
+        plan.selected_lengths[0] = 257
+    elif mutation == "invalid-hit-source":
+        plan.source_slots[0, 0, 0] = 1 << 30
+    elif mutation == "invalid-selected-chunk":
+        plan.selected_chunk_ids[0, 0] = 256
+    else:
+        raise AssertionError(f"unknown invalid-plan mutation {mutation}")
+    u = torch.zeros((2048, 160), dtype=torch.bfloat16, device="cuda")
+    sv = torch.zeros((8, 160, 128), dtype=torch.bfloat16, device="cuda")
+    cosine = torch.ones((2048, 64), dtype=torch.float32, device="cuda")
+    sine = torch.zeros_like(cosine)
+    gathered_u = torch.full(
+        (8, 2048, 160), 53, dtype=torch.bfloat16, device="cuda"
+    )
+    output = torch.full(
+        (2, 8, 256, 8, 128), 59, dtype=torch.bfloat16, device="cuda"
+    )
+
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v3.default(
+        u,
+        sv,
+        gathered_u,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        1,
+        output,
+    )
+
+    assert plan.error_codes[0].item() != 0
+    assert torch.equal(output[0, 0], torch.full_like(output[0, 0], 59))
+    assert torch.equal(gathered_u[0], torch.full_like(gathered_u[0], 53))
+
+
+@pytest.mark.skipif(
+    not sgl_kernel.shadowkv_a100_fused_key_kernels_available(),
+    reason="the installed wheel has no SM80 fused-key child",
+)
+def test_shadowkv_a100_miss_only_rejects_misaligned_destination_before_launch():
+    plan, temporal_values = _a100_fused_key_case("all-hit")
+    u = torch.zeros((2048, 160), dtype=torch.bfloat16, device="cuda")
+    sv = torch.zeros((8, 160, 128), dtype=torch.bfloat16, device="cuda")
+    cosine = torch.ones((2048, 64), dtype=torch.float32, device="cuda")
+    sine = torch.zeros_like(cosine)
+    gathered_u = torch.empty(
+        (8, 2048, 160), dtype=torch.bfloat16, device="cuda"
+    )
+    output_elements = 2 * 8 * 256 * 8 * 128
+    output_storage = torch.empty(
+        (output_elements + 1,), dtype=torch.bfloat16, device="cuda"
+    )
+    output = output_storage[1:].view(2, 8, 256, 8, 128)
+
+    with pytest.raises(RuntimeError, match="destination_key_values must be 16-byte aligned"):
+        torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v3.default(
+            u,
+            sv,
+            gathered_u,
+            cosine,
+            sine,
+            plan.component_kinds,
+            plan.source_slots,
+            plan.destination_slots,
+            plan.miss_ordinals,
+            plan.selected_chunk_ids,
+            plan.selected_lengths,
+            plan.plan_slots,
+            plan.error_codes,
+            temporal_values,
+            1,
+            output,
+        )
 
 
 @pytest.mark.skipif(

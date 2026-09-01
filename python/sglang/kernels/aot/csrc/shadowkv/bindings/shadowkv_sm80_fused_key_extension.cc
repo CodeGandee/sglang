@@ -16,6 +16,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       torch::kCUDA,
       &shadowkv_fused_key_a100);
   m.def(
+      "shadowkv_fused_key_sm80_a100_v3(Tensor u, Tensor sv, Tensor! gathered_u, Tensor cosine, Tensor sine, Tensor component_kinds, "
+      "Tensor source_slots, Tensor destination_slots, Tensor miss_ordinals, Tensor selected_chunk_ids, Tensor "
+      "selected_lengths, Tensor plan_slots, Tensor! planner_error_codes, Tensor temporal_key_values, int "
+      "plan_capacity, Tensor! destination_key_values) -> ()");
+  m.impl(
+      "shadowkv_fused_key_sm80_a100_v3",
+      torch::kCUDA,
+      &shadowkv_fused_key_miss_only_a100);
+  m.def(
       "shadowkv_place_value_sm80_a100_v1(Tensor component_kinds, Tensor source_slots, Tensor destination_slots, "
       "Tensor selected_lengths, Tensor plan_slots, Tensor! planner_error_codes, Tensor temporal_key_values, "
       "Tensor compatibility_key_values, int plan_capacity, Tensor! destination_key_values) -> ()");
@@ -80,4 +89,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "shadowkv_fused_key_mapped_value_sm80_a100_v5",
       torch::kCUDA,
       &shadowkv_fused_key_mapped_value_throttled_a100);
+  m.def(
+      "shadowkv_fused_key_mapped_value_sm80_a100_v6(Tensor u, Tensor sv, Tensor! gathered_u, Tensor cosine, "
+      "Tensor sine, Tensor component_kinds, Tensor source_slots, Tensor destination_slots, Tensor miss_ordinals, "
+      "Tensor selected_chunk_ids, Tensor selected_lengths, Tensor plan_slots, Tensor! planner_error_codes, Tensor "
+      "temporal_key_values, Tensor value_miss_chunk_ids, Tensor value_miss_lengths, Tensor descriptor_generation, "
+      "Tensor descriptor_validity, int mapped_host_pointer, int mapped_host_bytes, int prompt_chunk_capacity, int "
+      "prompt_tokens, int expected_generation, int plan_capacity, int reconstruction_stream, Tensor! "
+      "destination_key_values) -> ()");
+  m.impl(
+      "shadowkv_fused_key_mapped_value_sm80_a100_v6",
+      torch::kCUDA,
+      &shadowkv_fused_key_mapped_value_miss_only_a100);
 }
