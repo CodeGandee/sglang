@@ -296,6 +296,23 @@ def _require_supported_device(device: torch.device) -> None:
         )
 
 
+def _require_b200(device: torch.device) -> None:
+    """Require the exact device envelope of the B200-only operators."""
+
+    if not shadowkv_kernels_available():
+        raise RuntimeError(
+            "the installed sglang-kernel wheel was built without optional ShadowKV kernels"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("this ShadowKV operator requires a visible NVIDIA B200")
+    capability = torch.cuda.get_device_capability(device)
+    if capability != (10, 0):
+        raise RuntimeError(
+            "this ShadowKV operator requires NVIDIA B200 compute capability 10.0; "
+            f"found {capability}"
+        )
+
+
 def _require_tensor(
     name: str,
     tensor: torch.Tensor,
