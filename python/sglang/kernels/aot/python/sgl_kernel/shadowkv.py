@@ -104,6 +104,7 @@ def shadowkv_kernels_available() -> bool:
         hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct_rope")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_place_device")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_place_device_miss_only")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_device")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_device_v2")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_reuse")
@@ -726,6 +727,126 @@ def shadowkv_place_device(
         temporal_key_values,
         compatibility_key_values,
         plan_capacity,
+        destination_key_values,
+    )
+    return destination_key_values
+
+
+def shadowkv_place_device_miss_only(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    reconstructed_keys: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    value_miss_key_values: torch.Tensor,
+    destination_key_values: torch.Tensor,
+    *,
+    expected_generation: int,
+    plan_capacity: int,
+) -> torch.Tensor:
+    """Place D2D hits, reconstructed K misses, and compact V misses directly."""
+
+    inputs = (
+        ("component_kinds", component_kinds, torch.int8, 3),
+        ("source_slots", source_slots, torch.int32, 3),
+        ("destination_slots", destination_slots, torch.int32, 3),
+        ("miss_ordinals", miss_ordinals, torch.int32, 3),
+        ("selected_chunk_ids", selected_chunk_ids, torch.int32, 2),
+        ("plan_slots", plan_slots, torch.int32, 1),
+        ("planner_error_codes", planner_error_codes, torch.int32, 1),
+        ("temporal_key_values", temporal_key_values, torch.bfloat16, 7),
+        ("reconstructed_keys", reconstructed_keys, torch.bfloat16, 4),
+        ("value_miss_chunk_ids", value_miss_chunk_ids, torch.int32, 2),
+        ("value_miss_lengths", value_miss_lengths, torch.int32, 1),
+        ("descriptor_generation", descriptor_generation, torch.int64, 1),
+        ("descriptor_validity", descriptor_validity, torch.uint8, 1),
+        ("value_miss_key_values", value_miss_key_values, torch.bfloat16, 4),
+        ("destination_key_values", destination_key_values, torch.bfloat16, 5),
+    )
+    for name, tensor, dtype, dimensions in inputs:
+        _require_tensor(name, tensor, dtype=dtype, dimensions=dimensions)
+    if component_kinds.shape[0] != 2:
+        raise ValueError("component_kinds must have shape [2, heads, selected]")
+    heads, selected_capacity = component_kinds.shape[1:]
+    component_shape = (2, heads, selected_capacity)
+    compact_shape = (heads, selected_capacity)
+    if not 1 <= selected_capacity <= 256 or heads < 1:
+        raise ValueError("placement heads and selected capacity are outside bounds")
+    if any(
+        tensor.shape != component_shape
+        for tensor in (source_slots, destination_slots, miss_ordinals)
+    ):
+        raise ValueError("placement plan tensors must share shape [2, heads, selected]")
+    if (
+        selected_chunk_ids.shape != compact_shape
+        or value_miss_chunk_ids.shape != compact_shape
+    ):
+        raise ValueError(
+            "selected and value-miss ids must have shape [heads, selected]"
+        )
+    if (
+        plan_slots.shape != (heads,)
+        or planner_error_codes.shape != (heads,)
+        or value_miss_lengths.shape != (heads,)
+    ):
+        raise ValueError("placement row tensors must have shape [heads]")
+    if descriptor_generation.shape != (1,) or descriptor_validity.shape != (1,):
+        raise ValueError("descriptor generation and validity must have shape [1]")
+    if temporal_key_values.shape[0] != 2 or temporal_key_values.shape[3] != heads:
+        raise ValueError("temporal K/V component or head dimensions differ")
+    if temporal_key_values.shape[-2:] != (8, 128):
+        raise ValueError("temporal K/V must use chunk_size=8 and head_dim=128")
+    expected_compact_values = (heads, selected_capacity, 8, 128)
+    if reconstructed_keys.shape != expected_compact_values:
+        raise ValueError(
+            f"reconstructed_keys must have shape {expected_compact_values}"
+        )
+    if value_miss_key_values.shape != expected_compact_values:
+        raise ValueError(
+            f"value_miss_key_values must have shape {expected_compact_values}"
+        )
+    expected_output = (2, heads, selected_capacity, 8, 128)
+    if destination_key_values.shape != expected_output:
+        raise ValueError(f"destination_key_values must have shape {expected_output}")
+    if isinstance(expected_generation, bool) or not isinstance(
+        expected_generation, int
+    ):
+        raise TypeError("expected_generation must be an integer")
+    if expected_generation < 0:
+        raise ValueError("expected_generation must be nonnegative")
+    if isinstance(plan_capacity, bool) or not isinstance(plan_capacity, int):
+        raise TypeError("plan_capacity must be an integer")
+    if plan_capacity < 1:
+        raise ValueError("plan_capacity must be positive")
+    device = component_kinds.device
+    if any(tensor.device != device for _, tensor, _, _ in inputs):
+        raise ValueError("all miss-only placement tensors must share one CUDA device")
+    _require_b200(device)
+    torch.ops.sgl_kernel.shadowkv_place_device_miss_only.default(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        reconstructed_keys,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        expected_generation,
+        plan_capacity,
+        value_miss_key_values,
         destination_key_values,
     )
     return destination_key_values

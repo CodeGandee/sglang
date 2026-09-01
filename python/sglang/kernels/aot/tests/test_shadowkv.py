@@ -218,7 +218,7 @@ def _device_plan_arguments():
     )
 
 
-def _device_placement_arguments(mode):
+def _device_placement_plan_arguments(mode):
     selected = torch.tensor(
         [[8, 5, 8, 99, 6], [4, 7, 4, 99, 9]],
         dtype=torch.int32,
@@ -257,7 +257,17 @@ def _device_placement_arguments(mode):
         torch.tensor([[7, 3, 9], [7, 3, 9]], dtype=torch.int64, device="cuda"),
         torch.tensor([1, 1], dtype=torch.int32, device="cuda"),
     )
-    plan = sgl_kernel.shadowkv_plan_device(*planner_arguments, plan_capacity=2)
+    return planner_arguments, exact, exact_lengths
+
+
+def _device_placement_arguments(mode, *, parallel=False):
+    planner_arguments, exact, exact_lengths = _device_placement_plan_arguments(mode)
+    planner = (
+        sgl_kernel.shadowkv_plan_device_v2
+        if parallel
+        else sgl_kernel.shadowkv_plan_device
+    )
+    plan = planner(*planner_arguments, plan_capacity=2)
     temporal_values = torch.empty(
         (2, 1, 2, 2, 3, 8, 128), dtype=torch.bfloat16, device="cuda"
     )
@@ -295,6 +305,18 @@ def _device_placement_reference(plan, temporal_values, compatibility):
                         compatibility[component, head, selected]
                     )
     return expected
+
+
+def _miss_only_placement_inputs(plan, compatibility):
+    reconstructed_keys = compatibility[0].clone()
+    value_misses = torch.full_like(compatibility[1], 37)
+    for head in range(plan.component_kinds.shape[1]):
+        for selected in range(plan.component_kinds.shape[2]):
+            if plan.component_kinds[1, head, selected].item() != 2:
+                continue
+            miss_ordinal = plan.miss_ordinals[1, head, selected].item()
+            value_misses[head, miss_ordinal].copy_(compatibility[1, head, selected])
+    return reconstructed_keys, value_misses
 
 
 def _packed_gqa_reference(query, keys, values, lengths):
@@ -792,6 +814,99 @@ def test_shadowkv_place_device_populates_each_stable_destination_once(mode):
     assert torch.equal(published_values[1, 0, 1, 1, 0], actual[1, 1, 0])
     assert torch.equal(published_values[1, 0, 1, 1, 1], actual[1, 1, 1])
     assert torch.equal(published_values[1, 0, 1, 1, 2], actual[1, 1, 4])
+
+
+@pytest.mark.parametrize("mode", ["all-hit", "all-miss", "asymmetric"])
+def test_shadowkv_place_device_miss_only_matches_full_selected_control(mode):
+    plan, temporal_values, compatibility, _, _ = _device_placement_arguments(
+        mode, parallel=True
+    )
+    reconstructed_keys, value_misses = _miss_only_placement_inputs(plan, compatibility)
+    expected = _device_placement_reference(plan, temporal_values, compatibility)
+    guard_elements = 256
+    output_elements = compatibility.numel()
+    guarded = torch.full(
+        (output_elements + 2 * guard_elements,),
+        41,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = guarded.narrow(0, guard_elements, output_elements).view_as(compatibility)
+    generation = torch.tensor([11], dtype=torch.int64, device="cuda")
+    validity_flag = torch.ones((1,), dtype=torch.uint8, device="cuda")
+    value_misses_before = value_misses.clone()
+
+    actual = sgl_kernel.shadowkv_place_device_miss_only(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        reconstructed_keys,
+        plan.value_miss_chunk_ids,
+        plan.value_miss_lengths,
+        generation,
+        validity_flag,
+        value_misses,
+        output,
+        expected_generation=11,
+        plan_capacity=2,
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    assert torch.equal(actual, expected)
+    assert torch.equal(value_misses, value_misses_before)
+    assert torch.equal(
+        guarded[:guard_elements], torch.full_like(guarded[:guard_elements], 41)
+    )
+    assert torch.equal(
+        guarded[-guard_elements:], torch.full_like(guarded[-guard_elements:], 41)
+    )
+    expected_misses = plan.counts[1, :, 1].sum().item()
+    assert plan.value_miss_lengths.sum().item() == expected_misses
+    if mode == "all-hit":
+        assert expected_misses == 0
+
+
+def test_shadowkv_place_device_miss_only_rejects_stale_descriptor():
+    plan, temporal_values, compatibility, _, _ = _device_placement_arguments("all-miss")
+    reconstructed_keys, value_misses = _miss_only_placement_inputs(plan, compatibility)
+    output = torch.full_like(compatibility, 43)
+    descriptor_ids = torch.full(
+        plan.selected_chunk_ids.shape,
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    descriptor_lengths = torch.zeros(
+        plan.selected_chunk_ids.shape[0], dtype=torch.int32, device="cuda"
+    )
+
+    sgl_kernel.shadowkv_place_device_miss_only(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        reconstructed_keys,
+        descriptor_ids,
+        descriptor_lengths,
+        torch.tensor([10], dtype=torch.int64, device="cuda"),
+        torch.ones((1,), dtype=torch.uint8, device="cuda"),
+        value_misses,
+        output,
+        expected_generation=11,
+        plan_capacity=2,
+    )
+
+    assert not torch.count_nonzero(output).item()
+    assert plan.error_codes.cpu().tolist() == [8, 8]
 
 
 def test_shadowkv_place_device_zeroes_invalid_rows_and_destinations():
