@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <limits>
 
+#include "shadowkv/common/device_contract.cuh"
 #include "utils.h"
 
 namespace {
@@ -34,17 +35,6 @@ constexpr int kGatherThreads = 256;
 
 bool supported_general_rank(int64_t rank) {
   return rank == 64 || rank == 128 || rank == 160 || rank == 256;
-}
-
-void check_b200(const at::Tensor& tensor) {
-  cudaDeviceProp properties{};
-  C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, tensor.get_device()));
-  TORCH_CHECK(
-      properties.major == 10 && properties.minor == 0,
-      "shadowkv_reconstruct_rope requires NVIDIA B200 compute capability 10.0; found ",
-      properties.major,
-      ".",
-      properties.minor);
 }
 
 __global__ void shadowkv_reconstruct_rope_kernel(
@@ -161,7 +151,9 @@ void shadowkv_reconstruct(
   TORCH_CHECK(u.size(0) > 0, "u must contain at least one token");
 
   c10::cuda::CUDAGuard device_guard(u.device());
-  check_b200(u);
+  sglang::shadowkv::check_operation_device(
+      u,
+      "shadowkv_reconstruct");
   if (positions.numel() == 0) {
     return;
   }
@@ -247,7 +239,9 @@ void shadowkv_reconstruct_rope(
   TORCH_CHECK(u.size(0) > 0, "u must contain at least one token");
 
   c10::cuda::CUDAGuard device_guard(u.device());
-  check_b200(u);
+  sglang::shadowkv::check_operation_device(
+      u,
+      "shadowkv_reconstruct_rope");
   if (positions.numel() == 0) {
     return;
   }
@@ -259,7 +253,7 @@ void shadowkv_reconstruct_rope(
       sv.size(0) * positions.size(1) <= static_cast<int64_t>(std::numeric_limits<int>::max()),
       "reconstruction grid exceeds the CUDA launch bound");
 
-  // Use the same B200 BF16 tensor-core matrix product as the readable Torch
+  // Use the same BF16 tensor-core matrix product as the readable Torch
   // contract. It accumulates in FP32 and materializes BF16 before the custom
   // RoPE kernel, avoiding reduction-order drift across autoregressive steps.
   const at::Tensor gathered_u = u.index({positions});

@@ -85,7 +85,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.kernels.registry import register_kernel
+from sglang.kernels.registry import register_kernel, registry
 from sglang.kernels.spec import (
     CapabilityRequirement,
     FormatSignature,
@@ -248,6 +248,12 @@ class FusedOpTraceRecord(msgspec.Struct, frozen=True):
     op: str
     backend: str
     tensor_args: Tuple[str, ...]  # e.g. "torch.bfloat16[128, 4096]"
+    implementation_id: str = ""
+    provider: str = ""
+    specialization: str = "unspecified"
+    architecture: Optional[str] = None
+    envelope: str = ""
+    rejection_reasons: Tuple[str, ...] = ()
 
 
 _trace_enabled: bool = False
@@ -302,11 +308,29 @@ def _dispatch_label(method: Callable) -> str:
 
 
 def _record_trace(op: BaseFusedOp, label: str, args: tuple, kwargs: dict) -> None:
+    implementation_id = label
+    specialization = "unspecified"
+    try:
+        backend = KernelBackend(label)
+    except ValueError:
+        provider = label
+    else:
+        provider = backend.value
+        matches = [spec for spec in registry.get(op.op) if spec.backend is backend]
+        if len(matches) == 1:
+            implementation_id = matches[0].identity
+            specialization = matches[0].specialization.value
+    tensor_args = _describe_tensors(args, kwargs)
     _trace_records.append(
         FusedOpTraceRecord(
             op=op.op or type(op).__name__,
             backend=label,
-            tensor_args=_describe_tensors(args, kwargs),
+            tensor_args=tensor_args,
+            implementation_id=implementation_id,
+            provider=provider,
+            specialization=specialization,
+            architecture=_platform().architecture,
+            envelope=", ".join(tensor_args),
         )
     )
 

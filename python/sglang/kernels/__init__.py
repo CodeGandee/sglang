@@ -35,42 +35,64 @@ from sglang.kernels.fused_op import (
     set_fused_op_backend,
 )
 from sglang.kernels.registry import KernelRegistry, register_kernel, registry
-from sglang.kernels.selector import get_kernel, select_kernel
+from sglang.kernels.selector import (
+    CandidateRejection,
+    KernelSelection,
+    KernelSelectionError,
+    KernelSelectionPolicy,
+    get_kernel,
+    select_kernel,
+    select_kernel_candidate,
+)
 from sglang.kernels.spec import (
     CapabilityRequirement,
     DeviceType,
     FormatSignature,
     KernelBackend,
+    KernelExecutionProperties,
+    KernelInputEnvelope,
     KernelSpec,
+    KernelSpecialization,
     PlatformInfo,
     capabilities_satisfied,
+    cuda_architecture_name,
 )
 
 # Importing the operator groups populates the registry (metadata only). Kept
 # after the core imports above (and guarded from isort reordering) so those
 # modules are fully initialized first.
-from sglang.kernels import ops  # noqa: E402  # isort: skip
+from sglang.kernels import ops  # isort: skip
 
 __all__ = [
-    "ops",
     "BaseFusedOp",
+    "CandidateRejection",
     "CapabilityRequirement",
     "DeviceType",
-    "capabilities_satisfied",
     "FormatSignature",
     "FusedOpTraceRecord",
     "KernelBackend",
+    "KernelExecutionProperties",
+    "KernelInputEnvelope",
     "KernelRegistry",
+    "KernelSelection",
+    "KernelSelectionError",
+    "KernelSelectionPolicy",
     "KernelSpec",
+    "KernelSpecialization",
     "PlatformInfo",
+    "capabilities_satisfied",
     "clear_fused_op_trace",
+    "cuda_architecture_name",
     "disable_fused_op_trace",
     "enable_fused_op_trace",
     "get_fused_op_backend",
     "get_fused_op_trace",
     "get_kernel",
+    "ops",
     "register_fused_op",
     "register_kernel",
     "registry",
     "select_kernel",
+    "select_kernel_candidate",
+    "set_fused_op_backend",
 ]

@@ -258,7 +258,6 @@ void shadowkv_packed_gqa(
     at::Tensor& weights,
     at::Tensor& output);
 #endif
-
 /*
  * From csrc/infllm_v2
  */

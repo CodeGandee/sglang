@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <limits>
 
+#include "shadowkv/common/device_contract.cuh"
 #include "utils.h"
 
 namespace {
@@ -33,17 +34,6 @@ constexpr int32_t kInvalidChunk = 2;
 constexpr int kPlannerThreads = 256;
 constexpr int kMaximumChunkWidth = 256;
 constexpr int kMaximumExactWidth = 64;
-
-void check_b200(const at::Tensor& tensor) {
-  cudaDeviceProp properties{};
-  C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, tensor.get_device()));
-  TORCH_CHECK(
-      properties.major == 10 && properties.minor == 0,
-      "shadowkv_plan_reuse requires NVIDIA B200 compute capability 10.0; found ",
-      properties.major,
-      ".",
-      properties.minor);
-}
 
 __global__ void shadowkv_plan_reuse_kernel(
     const int64_t* __restrict__ previous_chunks,
@@ -274,7 +264,9 @@ void shadowkv_plan_reuse(
   TORCH_CHECK(rows <= static_cast<int64_t>(std::numeric_limits<int>::max()), "planner row count exceeds launch bound");
 
   c10::cuda::CUDAGuard device_guard(device);
-  check_b200(current_chunks);
+  sglang::shadowkv::check_operation_device(
+      current_chunks,
+      "shadowkv_plan_reuse");
   if (rows == 0) {
     return;
   }

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import importlib
 from enum import Enum
-from typing import Callable, ClassVar, FrozenSet, Optional, Tuple, Union
+from typing import Any, Callable, ClassVar, FrozenSet, Optional, Tuple, Union
 
 import msgspec
 
@@ -61,6 +61,32 @@ class DeviceType(str, Enum):
     # TODO(RFC #29630): XPU / MUSA / ... as backends land.
 
 
+class KernelSpecialization(str, Enum):
+    """How an implementation relates to an accelerator architecture.
+
+    ``UNSPECIFIED`` preserves the metadata contract for registrations created
+    before implementation identities were introduced. New architecture-aware
+    registrations must choose ``GENERIC``, ``ARCHITECTURE``, or ``REFERENCE``.
+    A generic implementation is unspecialized, but still declares every exact
+    architecture on which it may be selected.
+    """
+
+    UNSPECIFIED = "unspecified"
+    GENERIC = "generic"
+    ARCHITECTURE = "architecture"
+    REFERENCE = "reference"
+
+
+def cuda_architecture_name(major: int, minor: int = 0) -> str:
+    """Return the exact architecture identity used by SGLang build profiles."""
+    known = {
+        (8, 0): "sm80",
+        (9, 0): "sm90a",
+        (10, 0): "sm100a",
+    }
+    return known.get((major, minor), f"sm{major}{minor}")
+
+
 class PlatformInfo(msgspec.Struct, frozen=True):
     """A minimal snapshot of the runtime accelerator platform.
 
@@ -71,6 +97,8 @@ class PlatformInfo(msgspec.Struct, frozen=True):
     device_type: str = "cpu"  # "cuda", "hip", "cpu", ...
     cuda_arch_major: Optional[int] = None
     cuda_arch_minor: Optional[int] = None
+    device_index: Optional[int] = None
+    architecture_name: Optional[str] = None
 
     @property
     def device(self) -> DeviceType:
@@ -87,12 +115,25 @@ class PlatformInfo(msgspec.Struct, frozen=True):
     def is_hip(self) -> bool:
         return self.device_type == "hip"
 
+    @property
+    def architecture(self) -> Optional[str]:
+        if self.architecture_name is not None:
+            return self.architecture_name
+        if self.is_cuda and self.cuda_arch_major is not None:
+            return cuda_architecture_name(
+                self.cuda_arch_major, self.cuda_arch_minor or 0
+            )
+        return None
+
     @classmethod
-    def detect(cls) -> PlatformInfo:
-        """Build a :class:`PlatformInfo` from the current process.
+    def detect(cls, device: Optional[Any] = None) -> PlatformInfo:
+        """Build a :class:`PlatformInfo` for ``device``.
 
         Never raises: if ``torch`` is missing or no accelerator is visible the
-        default CPU platform is returned.
+        default CPU platform is returned. ``device`` may be a tensor, a
+        ``torch.device``, a CUDA index, or a CUDA device string. Supplying a
+        tensor keeps multi-device dispatch independent from the process-wide
+        current device.
         """
         try:
             import torch
@@ -100,17 +141,35 @@ class PlatformInfo(msgspec.Struct, frozen=True):
             return cls()
 
         try:
+            resolved = getattr(device, "device", device)
+            if isinstance(resolved, int):
+                resolved = torch.device("cuda", resolved)
+            elif resolved is not None:
+                resolved = torch.device(resolved)
+
             if torch.version.hip is not None and torch.cuda.is_available():
-                return cls(device_type="hip")
+                index = None
+                if resolved is not None and resolved.type == "cuda":
+                    index = resolved.index
+                return cls(device_type="hip", device_index=index)
             npu = getattr(torch, "npu", None)
             if npu is not None and npu.is_available():
                 return cls(device_type="npu")
             if torch.cuda.is_available():
-                major, minor = torch.cuda.get_device_capability()
+                if resolved is not None and resolved.type != "cuda":
+                    return cls(device_type=resolved.type)
+                index = (
+                    torch.cuda.current_device()
+                    if resolved is None or resolved.index is None
+                    else resolved.index
+                )
+                major, minor = torch.cuda.get_device_capability(index)
                 return cls(
                     device_type="cuda",
                     cuda_arch_major=major,
                     cuda_arch_minor=minor,
+                    device_index=index,
+                    architecture_name=cuda_architecture_name(major, minor),
                 )
         except Exception:
             pass
@@ -201,6 +260,62 @@ class FormatSignature(msgspec.Struct, frozen=True):
     description: str = ""
 
 
+class KernelInputEnvelope(msgspec.Struct, frozen=True):
+    """Serializable input limits used during initialization-time selection.
+
+    Empty sets and ``None`` limits mean that the descriptor does not restrict
+    that dimension. A request envelope normally contains one value for each
+    known dimension. ``features`` carries stable operation-specific contract
+    tags without forcing the shared registry to know ShadowKV tensor layouts.
+    """
+
+    dtypes: FrozenSet[str] = frozenset()
+    head_dimensions: FrozenSet[int] = frozenset()
+    factor_ranks: FrozenSet[int] = frozenset()
+    max_batch_size: Optional[int] = None
+    max_tokens: Optional[int] = None
+    features: FrozenSet[str] = frozenset()
+    description: str = ""
+
+    def supports(self, request: KernelInputEnvelope) -> bool:
+        def covers(allowed: FrozenSet[Any], requested: FrozenSet[Any]) -> bool:
+            return not allowed or requested.issubset(allowed)
+
+        if not covers(self.dtypes, request.dtypes):
+            return False
+        if not covers(self.head_dimensions, request.head_dimensions):
+            return False
+        if not covers(self.factor_ranks, request.factor_ranks):
+            return False
+        if not covers(self.features, request.features):
+            return False
+        if (
+            self.max_batch_size is not None
+            and request.max_batch_size is not None
+            and request.max_batch_size > self.max_batch_size
+        ):
+            return False
+        if (
+            self.max_tokens is not None
+            and request.max_tokens is not None
+            and request.max_tokens > self.max_tokens
+        ):
+            return False
+        return True
+
+
+class KernelExecutionProperties(msgspec.Struct, frozen=True):
+    """Execution guarantees exposed to the plan resolver."""
+
+    deterministic: bool = False
+    current_stream: bool = True
+    graph_compatible: bool = False
+    supports_eager: bool = True
+    mutates_inputs: bool = False
+    permits_output_aliasing: bool = False
+    workspace_description: str = ""
+
+
 class KernelSpec(msgspec.Struct, frozen=True):
     """A single callable kernel implementation and its metadata.
 
@@ -233,6 +348,55 @@ class KernelSpec(msgspec.Struct, frozen=True):
     capabilities: FrozenSet[CapabilityRequirement] = frozenset()
     format_signature: FormatSignature = msgspec.field(default_factory=FormatSignature)
     description: str = ""
+    operation_revision: str = "legacy-v1"
+    implementation_id: Optional[str] = None
+    specialization: KernelSpecialization = KernelSpecialization.UNSPECIFIED
+    supported_architectures: FrozenSet[str] = frozenset()
+    input_envelope: KernelInputEnvelope = msgspec.field(
+        default_factory=KernelInputEnvelope
+    )
+    execution: KernelExecutionProperties = msgspec.field(
+        default_factory=KernelExecutionProperties
+    )
+    availability_target: Optional[str] = None
+    warmup_target: Optional[str] = None
+    qualification_references: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.op or not self.target:
+            raise ValueError("KernelSpec requires non-empty op and target values")
+        if self.implementation_id is not None and not self.implementation_id:
+            raise ValueError("KernelSpec implementation_id cannot be empty")
+        invalid_architectures = {
+            architecture
+            for architecture in self.supported_architectures
+            if not architecture or architecture.lower() in {"*", "any", "all"}
+        }
+        if invalid_architectures:
+            raise ValueError(
+                "KernelSpec supported_architectures must use exact identities: "
+                f"{sorted(invalid_architectures)}"
+            )
+        if self.specialization in {
+            KernelSpecialization.GENERIC,
+            KernelSpecialization.ARCHITECTURE,
+        }:
+            if self.implementation_id is None:
+                raise ValueError(
+                    "Architecture-aware KernelSpec requires implementation_id"
+                )
+            if not self.supported_architectures:
+                raise ValueError(
+                    "Generic and architecture-specialized KernelSpec entries "
+                    "require explicit supported_architectures"
+                )
+        if (
+            self.specialization is KernelSpecialization.ARCHITECTURE
+            and len(self.supported_architectures) != 1
+        ):
+            raise ValueError(
+                "Architecture-specialized KernelSpec requires exactly one architecture"
+            )
 
     @property
     def group(self) -> str:
@@ -242,9 +406,61 @@ class KernelSpec(msgspec.Struct, frozen=True):
     def name(self) -> str:
         return self.op.split(".", 1)[1] if "." in self.op else self.op
 
-    def is_available(self, platform: PlatformInfo) -> bool:
-        """Whether this backend can run on ``platform`` (metadata-only check)."""
-        return capabilities_satisfied(self.capabilities, platform)
+    @property
+    def provider(self) -> KernelBackend:
+        """Provider provenance, retained under the legacy ``backend`` field."""
+        return self.backend
+
+    @property
+    def identity(self) -> str:
+        """Stable implementation identity, including a legacy-safe default."""
+        return self.implementation_id or self.backend.value
+
+    def rejection_reasons(
+        self,
+        platform: PlatformInfo,
+        *,
+        envelope: Optional[KernelInputEnvelope] = None,
+        require_graph: bool = False,
+    ) -> Tuple[str, ...]:
+        """Return deterministic metadata rejection reasons for one request."""
+        reasons = []
+        if not capabilities_satisfied(self.capabilities, platform):
+            reasons.append("device-capability")
+        if (
+            self.supported_architectures
+            and platform.architecture not in self.supported_architectures
+        ):
+            reasons.append(f"architecture:{platform.architecture or 'unknown'}")
+        if envelope is not None and not self.input_envelope.supports(envelope):
+            reasons.append("input-envelope")
+        if require_graph and not self.execution.graph_compatible:
+            reasons.append("graph-incompatible")
+        if not self.execution.supports_eager and not require_graph:
+            reasons.append("eager-incompatible")
+        return tuple(reasons)
+
+    def is_available(
+        self,
+        platform: PlatformInfo,
+        *,
+        envelope: Optional[KernelInputEnvelope] = None,
+        require_graph: bool = False,
+    ) -> bool:
+        """Whether this implementation can run under the declared request."""
+        return not self.rejection_reasons(
+            platform, envelope=envelope, require_graph=require_graph
+        )
+
+    @staticmethod
+    def _load_target(target: str) -> Callable:
+        module_path, sep, attr = target.partition(":")
+        if not sep or not attr:
+            raise ValueError(f"KernelSpec target must be 'module:attr', got {target!r}")
+        obj = importlib.import_module(module_path)
+        for part in attr.split("."):
+            obj = getattr(obj, part)
+        return obj
 
     def load(self) -> Callable:
         """Import and return the backing callable.
@@ -253,12 +469,44 @@ class KernelSpec(msgspec.Struct, frozen=True):
         backend is not installed on this platform — call sites decide how to
         handle that.
         """
-        module_path, sep, attr = self.target.partition(":")
-        if not sep or not attr:
-            raise ValueError(
-                f"KernelSpec.target must be 'module:attr', got {self.target!r}"
-            )
-        obj = importlib.import_module(module_path)
-        for part in attr.split("."):
-            obj = getattr(obj, part)
-        return obj
+        return self._load_target(self.target)
+
+    def provider_available(self) -> bool:
+        """Evaluate the optional lazy provider probe.
+
+        Inventory never calls this method, so listing candidates stays free of
+        CUDA initialization and provider imports.
+        """
+        if self.availability_target is None:
+            return True
+        return bool(self._load_target(self.availability_target)())
+
+    def warm_up(self, *args: Any, **kwargs: Any) -> None:
+        """Run the optional provider preparation hook before graph capture."""
+        if self.warmup_target is not None:
+            self._load_target(self.warmup_target)(*args, **kwargs)
+
+    def inventory_record(self) -> dict[str, Any]:
+        """Return stable, JSON-compatible metadata without loading providers."""
+        record = msgspec.json.decode(msgspec.json.encode(self))
+        # ``frozenset`` preserves the descriptor's unordered membership
+        # semantics, but its iteration order is not a serialization contract.
+        # Canonicalize every set-backed field before this record reaches build
+        # manifests, provenance hashes, or user-facing inventory output.
+        record["capabilities"] = sorted(
+            record["capabilities"],
+            key=lambda capability: (
+                capability["device"],
+                capability["min_cuda_arch"] or [],
+                capability["max_cuda_arch"] or [],
+            ),
+        )
+        record["supported_architectures"] = sorted(
+            record["supported_architectures"]
+        )
+        envelope = record["input_envelope"]
+        for field in ("dtypes", "head_dimensions", "factor_ranks", "features"):
+            envelope[field] = sorted(envelope[field])
+        record["implementation_id"] = self.identity
+        record["provider"] = self.provider.value
+        return record

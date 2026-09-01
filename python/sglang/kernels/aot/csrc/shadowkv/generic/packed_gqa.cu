@@ -23,6 +23,8 @@ limitations under the License.
 #include <cfloat>
 #include <cstdint>
 #include <limits>
+
+#include "shadowkv/common/device_contract.cuh"
 #include "utils.h"
 
 namespace {
@@ -33,17 +35,6 @@ constexpr int kWarps = kThreads / kWarpSize;
 constexpr int kReferenceGemmInterleavedThreshold = 1760;
 constexpr int kReferenceSoftmaxLargeRowThreshold = 2048;
 constexpr int kReferenceSoftmaxThreads = 1024;
-
-void check_b200(const at::Tensor& tensor) {
-  cudaDeviceProp properties{};
-  C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, tensor.get_device()));
-  TORCH_CHECK(
-      properties.major == 10 && properties.minor == 0,
-      "shadowkv_packed_gqa requires NVIDIA B200 compute capability 10.0; found ",
-      properties.major,
-      ".",
-      properties.minor);
-}
 
 __device__ __forceinline__ float warp_max(float value) {
 #pragma unroll
@@ -72,12 +63,19 @@ __device__ __forceinline__ float block_max(float value, float* shared) {
   value = threadIdx.x < kWarps ? shared[lane] : -FLT_MAX;
   if (warp == 0) {
     value = warp_max(value);
+    // Volta and newer GPUs schedule warp lanes independently. Publish the
+    // shared-memory reads before lane zero reuses reduction[0].
+    __syncwarp();
   }
   if (threadIdx.x == 0) {
     shared[0] = value;
   }
   __syncthreads();
-  return shared[0];
+  const float result = shared[0];
+  // No warp may reuse the shared reduction slots until every thread has
+  // copied the published maximum into a register.
+  __syncthreads();
+  return result;
 }
 
 __device__ __forceinline__ float block_sum(float value, float* shared) {
@@ -91,12 +89,17 @@ __device__ __forceinline__ float block_sum(float value, float* shared) {
   value = threadIdx.x < kWarps ? shared[lane] : 0.0f;
   if (warp == 0) {
     value = warp_sum(value);
+    // Keep the final shared-memory reuse ordered under independent scheduling.
+    __syncwarp();
   }
   if (threadIdx.x == 0) {
     shared[0] = value;
   }
   __syncthreads();
-  return shared[0];
+  const float result = shared[0];
+  // Preserve the same publication contract for every shared reduction.
+  __syncthreads();
+  return result;
 }
 
 template <int HeadDim>
@@ -139,7 +142,7 @@ __global__ void shadowkv_packed_gqa_kernel(
   for (int token = threadIdx.x; token < length; token += blockDim.x) {
     const int64_t key_offset = kv_base + static_cast<int64_t>(token) * HeadDim;
     float score = 0.0f;
-    // The locked B200 PyTorch GEMM switches to sixteen interleaved K-lane
+    // The locked PyTorch GEMM switches to sixteen interleaved K-lane
     // accumulators above this qualified Llama GQA row width. Matching that
     // order prevents small score errors from changing greedy continuations.
     if (length > kReferenceGemmInterleavedThreshold) {
@@ -200,6 +203,9 @@ __global__ void shadowkv_packed_gqa_kernel(
         threadIdx.x < kWarpSize ? reduction[threadIdx.x * kWarpSize] : 0.0f;
     if (threadIdx.x < kWarpSize) {
       warp_total = warp_sum(warp_total);
+      // Every lane must finish reading its warp subtotal before lane zero
+      // overwrites reduction[0] with the block total.
+      __syncwarp();
     }
     if (threadIdx.x == 0) {
       reduction[0] = warp_total;
@@ -317,7 +323,9 @@ void shadowkv_packed_gqa(
       "packed GQA grid exceeds the CUDA launch bound");
 
   c10::cuda::CUDAGuard device_guard(query.device());
-  check_b200(query);
+  sglang::shadowkv::check_operation_device(
+      query,
+      "shadowkv_packed_gqa");
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int blocks = static_cast<int>(query.size(0) * query.size(1));
   if (query.size(2) == 64) {

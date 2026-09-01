@@ -3,6 +3,7 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 
 # utils
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/shadowkv.cmake)
 include(FetchContent)
 
 # CMake
@@ -185,19 +186,7 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SG
 option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
-option(SGL_KERNEL_ENABLE_SHADOWKV         "Build optional B200 ShadowKV kernels" OFF)
-
-if(SGL_KERNEL_ENABLE_SHADOWKV)
-    if(NOT SGL_KERNEL_CUDA_ARCH STREQUAL "100a")
-        message(FATAL_ERROR "SGL_KERNEL_ENABLE_SHADOWKV requires SGL_KERNEL_CUDA_ARCH=100a.")
-    endif()
-    if(NOT SGL_KERNEL_BUILD_SM100_VARIANT)
-        message(FATAL_ERROR "SGL_KERNEL_ENABLE_SHADOWKV requires the SM100 common_ops variant.")
-    endif()
-    if(NOT SGL_KERNEL_ENABLE_BF16)
-        message(FATAL_ERROR "SGL_KERNEL_ENABLE_SHADOWKV requires BF16 support.")
-    endif()
-endif()
+option(SGL_KERNEL_ENABLE_SHADOWKV         "Build optional SM80 or SM100a ShadowKV kernels" OFF)
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -350,17 +339,11 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
-set(SHADOWKV_SOURCES)
-if(SGL_KERNEL_ENABLE_SHADOWKV)
-    list(APPEND SHADOWKV_SOURCES
-        "csrc/shadowkv/packed_gqa.cu"
-        "csrc/shadowkv/place_device.cu"
-        "csrc/shadowkv/plan_device.cu"
-        "csrc/shadowkv/plan_reuse.cu"
-        "csrc/shadowkv/publish_device.cu"
-        "csrc/shadowkv/reconstruct_rope.cu"
-    )
-endif()
+sgl_configure_shadowkv_sources(
+    SHADOWKV_GENERIC_SOURCES
+    SHADOWKV_BINDING_SOURCES
+    SHADOWKV_SPECIALIZED_SOURCES
+)
 
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
@@ -389,7 +372,7 @@ endif()
 # =========================== Common SM100+ Build ============================= #
 # Build SM100+ library with precise math (same namespace, different directory)
 if(SGL_KERNEL_BUILD_SM100_VARIANT)
-    Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES} ${SHADOWKV_SOURCES})
+    Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
     target_compile_options(common_ops_sm100_build PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
     )
@@ -398,9 +381,6 @@ if(SGL_KERNEL_BUILD_SM100_VARIANT)
         OUTPUT_NAME "common_ops"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
     )
-    if(SGL_KERNEL_ENABLE_SHADOWKV)
-        target_compile_definitions(common_ops_sm100_build PRIVATE SGL_KERNEL_ENABLE_SHADOWKV=1)
-    endif()
 endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -424,6 +404,28 @@ if(SGL_KERNEL_BUILD_SM90_VARIANT)
 endif()
 if(SGL_KERNEL_BUILD_SM100_VARIANT)
     target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+endif()
+
+# ======================= Optional ShadowKV Build =========================== #
+# Keep implementation-specific schemas and target-scoped CUDA sources outside
+# common_ops so adding one specialization does not alter unrelated operators.
+if(SGL_KERNEL_ENABLE_SHADOWKV)
+    Python_add_library(
+        shadowkv_ops
+        MODULE
+        USE_SABI ${SKBUILD_SABI_VERSION}
+        WITH_SOABI
+        ${SHADOWKV_BINDING_SOURCES}
+        ${SHADOWKV_GENERIC_SOURCES}
+        ${SHADOWKV_SPECIALIZED_SOURCES}
+    )
+    target_compile_options(shadowkv_ops PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+    )
+    target_compile_definitions(shadowkv_ops PRIVATE SGL_KERNEL_ENABLE_SHADOWKV=1)
+    target_include_directories(shadowkv_ops PRIVATE ${INCLUDES})
+    target_link_libraries(shadowkv_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+    install(TARGETS shadowkv_ops LIBRARY DESTINATION sgl_kernel)
 endif()
 
 # sparse flash attention
