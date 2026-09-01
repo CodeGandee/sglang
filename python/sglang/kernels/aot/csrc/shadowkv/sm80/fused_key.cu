@@ -733,6 +733,9 @@ __global__ void shadowkv_place_value_a100_kernel(
   const bool destination_valid = destination_slot == expected_destination;
   const bool active =
       row_valid && destination_valid && (hit_valid || miss_valid);
+  if (threadIdx.x >= kVectorsPerChunk) {
+    return;
+  }
   const int64_t destination_vector =
       (static_cast<int64_t>(kKVHeads) * kSelectedCapacity + entry) *
           kVectorsPerChunk +
@@ -932,7 +935,7 @@ void shadowkv_place_value_a100(
   check_sm80(component_kinds);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   shadowkv_place_value_a100_kernel<ValueSource::kCompatibility>
-      <<<kKVHeads * kSelectedCapacity, kThreads, 0, stream>>>(
+      <<<kKVHeads * kSelectedCapacity, kVectorsPerChunk, 0, stream>>>(
           component_kinds.data_ptr<int8_t>(),
           source_slots.data_ptr<int32_t>(),
           destination_slots.data_ptr<int32_t>(),
@@ -1032,7 +1035,7 @@ void shadowkv_place_value_miss_only_a100(
   check_sm80(component_kinds);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   shadowkv_place_value_a100_kernel<ValueSource::kCompactMiss>
-      <<<kKVHeads * kSelectedCapacity, kThreads, 0, stream>>>(
+      <<<kKVHeads * kSelectedCapacity, kVectorsPerChunk, 0, stream>>>(
           component_kinds.data_ptr<int8_t>(),
           source_slots.data_ptr<int32_t>(),
           destination_slots.data_ptr<int32_t>(),
@@ -1143,7 +1146,7 @@ void shadowkv_place_value_mapped_host_a100(
   check_sm80(component_kinds);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   shadowkv_place_value_a100_kernel<ValueSource::kMappedHost>
-      <<<kKVHeads * kSelectedCapacity, kThreads, 0, stream>>>(
+      <<<kKVHeads * kSelectedCapacity, kVectorsPerChunk, 0, stream>>>(
           component_kinds.data_ptr<int8_t>(),
           source_slots.data_ptr<int32_t>(),
           destination_slots.data_ptr<int32_t>(),

@@ -686,9 +686,9 @@ def _a100_fused_key_case(mode):
     temporal_ids = selected.view(1, 1, 8, 256).clone()
     validity = torch.zeros((2, 1, 1, 8, 256), dtype=torch.uint8, device="cuda")
     if mode == "all-hit":
-        validity[0].fill_(1)
+        validity.fill_(1)
     elif mode == "mixed":
-        validity[0, :, :, :, ::2].fill_(1)
+        validity[:, :, :, :, ::2].fill_(1)
     elif mode != "all-miss":
         raise AssertionError(f"unknown fused-key mode {mode}")
     publications = torch.full((2, 1, 1, 8, 256), -1, dtype=torch.int64, device="cuda")
@@ -817,6 +817,59 @@ def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
     assert torch.equal(output[1], torch.full_like(output[1], 23))
     assert torch.equal(repeated[0], output[0])
     torch.testing.assert_close(output[0], expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not sgl_kernel.shadowkv_a100_fused_key_kernels_available(),
+    reason="the installed wheel has no SM80 fused-key child",
+)
+@pytest.mark.parametrize("mode", ["all-hit", "mixed", "all-miss"])
+def test_shadowkv_a100_value_only_placement_matches_plan_reference(mode):
+    torch.manual_seed(20260920 + len(mode))
+    plan, temporal_values = _a100_fused_key_case(mode)
+    compatibility = torch.randn(
+        (2, 8, 256, 8, 128),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected = torch.zeros_like(compatibility[1])
+    temporal_chunks = temporal_values.view(2, -1, 8, 128)
+    for head in range(8):
+        for selected in range(256):
+            kind = plan.component_kinds[1, head, selected].item()
+            if kind == 1:
+                source = plan.source_slots[1, head, selected].item()
+                expected[head, selected].copy_(temporal_chunks[1, source - 2048])
+            elif kind == 2:
+                expected[head, selected].copy_(compatibility[1, head, selected])
+
+    guard = 257
+    elements = compatibility.numel()
+    guarded = torch.full(
+        (guard + elements + guard,),
+        19,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = guarded[guard : guard + elements].view_as(compatibility)
+    sgl_kernel.shadowkv_place_value_a100(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        compatibility,
+        plan_capacity=1,
+        out=output,
+    )
+
+    assert not plan.error_codes.any().item()
+    assert torch.equal(output[0], torch.full_like(output[0], 19))
+    assert torch.equal(output[1], expected)
+    assert torch.equal(guarded[:guard], torch.full_like(guarded[:guard], 19))
+    assert torch.equal(guarded[-guard:], torch.full_like(guarded[-guard:], 19))
 
 
 @pytest.mark.parametrize(
