@@ -191,10 +191,16 @@ def test_generic_and_specialized_source_layout_is_explicit():
     assert (common / "device_contract.cuh").is_file()
     assert (common / "operations.h").is_file()
     assert (bindings / "shadowkv_extension.cc").is_file()
-    for architecture in ("sm80", "sm90a", "sm100a"):
+    expected_specialized_sources = {
+        "sm80": {"fused_key.cu"},
+        "sm90a": set(),
+        "sm100a": set(),
+    }
+    for architecture, expected in expected_specialized_sources.items():
         directory = AOT_ROOT / f"csrc/shadowkv/{architecture}"
         assert directory.is_dir()
-        assert list(directory.glob("*.cu")) == []
+        assert {path.name for path in directory.glob("*.cu")} == expected
+    assert (bindings / "shadowkv_sm80_fused_key_extension.cc").is_file()
     source = "\n".join(
         path.read_text(encoding="utf-8") for path in generic.glob("*.cu")
     )

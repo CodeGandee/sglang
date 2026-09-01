@@ -41,8 +41,17 @@ constexpr int kRank = 160;
 constexpr int kHeadDimension = 128;
 constexpr int kHalfHeadDimension = kHeadDimension / 2;
 constexpr int kWmmaTile = 16;
-constexpr int kOutputTiles = kHeadDimension / kWmmaTile;
-constexpr int kThreads = kOutputTiles * 32;
+constexpr int kChunksPerKeyBlock = 16;
+constexpr int kRowsPerKeyBlock = kChunksPerKeyBlock * kChunkSize;
+constexpr int kKeyBlocksPerHead = kSelectedCapacity / kChunksPerKeyBlock;
+constexpr int kWarpRows = 64;
+constexpr int kWarpColumns = 32;
+constexpr int kWarpRowTiles = kWarpRows / kWmmaTile;
+constexpr int kWarpColumnTiles = kWarpColumns / kWmmaTile;
+constexpr int kKeyBlockColumnTiles = kHeadDimension / kWarpColumns;
+constexpr int kKeyBlockRowTiles = kRowsPerKeyBlock / kWarpRows;
+constexpr int kThreads =
+    kKeyBlockColumnTiles * kKeyBlockRowTiles * 32;
 constexpr int kChunkElements = kChunkSize * kHeadDimension;
 constexpr int kVectorBytes = sizeof(uint4);
 constexpr int kChunkBytes = kChunkElements * sizeof(at::BFloat16);
@@ -50,6 +59,8 @@ constexpr int kVectorsPerChunk = kChunkBytes / kVectorBytes;
 
 static_assert(kVectorsPerChunk <= kThreads);
 static_assert(kThreads <= 1024 && kThreads % 32 == 0);
+static_assert(kSelectedCapacity % kChunksPerKeyBlock == 0);
+static_assert(kRowsPerKeyBlock == 128 && kThreads == 256);
 
 void check_tensor(
     const at::Tensor& tensor,
@@ -194,157 +205,271 @@ __global__ void shadowkv_fused_key_a100_kernel(
     int64_t temporal_chunks_per_component,
     int plan_capacity,
     uint4* __restrict__ destination_key_values) {
-  const int entry = blockIdx.x;
-  const int selected = entry % kSelectedCapacity;
-  const int head = entry / kSelectedCapacity;
-  const int vector_index = threadIdx.x;
-  const int64_t plan_offset =
-      static_cast<int64_t>(head) * kSelectedCapacity + selected;
-  const int8_t kind = component_kinds[plan_offset];
-  const int source_slot = source_slots[plan_offset];
-  const int destination_slot = destination_slots[plan_offset];
-  const int miss_ordinal = miss_ordinals[plan_offset];
-  const int selected_chunk = selected_chunk_ids[plan_offset];
+  const int key_block = blockIdx.x % kKeyBlocksPerHead;
+  const int head = blockIdx.x / kKeyBlocksPerHead;
+  const int selected_base = key_block * kChunksPerKeyBlock;
   const int selected_length = selected_lengths[head];
   const int plan_slot = plan_slots[head];
-  const bool row_valid =
+  const bool plan_row_valid =
       planner_error_codes[head] == 0 && plan_slot >= 0 &&
       plan_slot < plan_capacity && selected_length >= 0 &&
       selected_length <= kSelectedCapacity;
-  const bool active_ordinal = selected < selected_length;
-  const int64_t expected_destination =
-      (static_cast<int64_t>(plan_slot) * kKVHeads + head) *
-          kSelectedCapacity +
-      selected;
-  const bool hit_valid =
-      active_ordinal && kind == kHit && source_slot >= 0 &&
-      source_slot < temporal_chunks_per_component && miss_ordinal == -1;
-  const bool miss_valid =
-      active_ordinal && kind == kMiss && source_slot == -1 &&
-      miss_ordinal >= 0 && miss_ordinal < kSelectedCapacity &&
-      selected_chunk >= 0 &&
-      (static_cast<int64_t>(selected_chunk) + 1) * kChunkSize <= u_tokens &&
-      (static_cast<int64_t>(selected_chunk) + 1) * kChunkSize <= rope_rows;
-  const bool inactive_valid =
-      kind == kInactive && source_slot == -1 && destination_slot == -1 &&
-      miss_ordinal == -1;
-  const bool destination_valid = destination_slot == expected_destination;
-  const bool active =
-      row_valid && destination_valid && (hit_valid || miss_valid);
-  const int64_t destination_vector =
-      plan_offset * kVectorsPerChunk + vector_index;
+  __shared__ int8_t kinds[kChunksPerKeyBlock];
+  __shared__ int32_t temporal_sources[kChunksPerKeyBlock];
+  __shared__ int32_t chunks[kChunksPerKeyBlock];
+  __shared__ int has_miss;
+  __shared__ __align__(32) __nv_bfloat16
+      selected_u[kRowsPerKeyBlock][kRank];
 
-  if (!active) {
-    if (vector_index < kVectorsPerChunk) {
-      destination_key_values[destination_vector] = uint4{0, 0, 0, 0};
-    }
-    mark_invalid(
-        planner_error_codes,
-        head,
-        row_valid && !inactive_valid);
-    return;
+  if (threadIdx.x == 0) {
+    has_miss = 0;
   }
-  if (hit_valid) {
-    if (vector_index < kVectorsPerChunk) {
-      destination_key_values[destination_vector] =
-          temporal_key_values[
-              static_cast<int64_t>(source_slot) * kVectorsPerChunk +
-              vector_index];
+  if (threadIdx.x < kChunksPerKeyBlock) {
+    const int local_chunk = threadIdx.x;
+    const int selected = selected_base + local_chunk;
+    const int64_t plan_offset =
+        static_cast<int64_t>(head) * kSelectedCapacity + selected;
+    const int8_t kind = component_kinds[plan_offset];
+    const int source_slot = source_slots[plan_offset];
+    const int destination_slot = destination_slots[plan_offset];
+    const int miss_ordinal = miss_ordinals[plan_offset];
+    const int selected_chunk = selected_chunk_ids[plan_offset];
+    const bool active_ordinal = selected < selected_length;
+    const int64_t expected_destination =
+        (static_cast<int64_t>(plan_slot) * kKVHeads + head) *
+            kSelectedCapacity +
+        selected;
+    const bool hit_valid =
+        active_ordinal && kind == kHit && source_slot >= 0 &&
+        source_slot < temporal_chunks_per_component && miss_ordinal == -1;
+    const bool miss_valid =
+        active_ordinal && kind == kMiss && source_slot == -1 &&
+        miss_ordinal >= 0 && miss_ordinal < kSelectedCapacity &&
+        selected_chunk >= 0 &&
+        (static_cast<int64_t>(selected_chunk) + 1) * kChunkSize <=
+            u_tokens &&
+        (static_cast<int64_t>(selected_chunk) + 1) * kChunkSize <=
+            rope_rows;
+    const bool inactive_valid =
+        !active_ordinal && kind == kInactive && source_slot == -1 &&
+        destination_slot == -1 && miss_ordinal == -1;
+    const bool destination_valid =
+        active_ordinal && destination_slot == expected_destination;
+    const bool entry_valid =
+        plan_row_valid &&
+        (inactive_valid || (destination_valid && (hit_valid || miss_valid)));
+    kinds[local_chunk] = entry_valid ? kind : kInactive;
+    temporal_sources[local_chunk] = entry_valid ? source_slot : -1;
+    chunks[local_chunk] = entry_valid ? selected_chunk : -1;
+    if (entry_valid && miss_valid) {
+      atomicExch(&has_miss, 1);
     }
-    return;
-  }
-
-  __shared__ __align__(32) __nv_bfloat16 selected_u[kWmmaTile][kRank];
-  __shared__ __align__(32) float reconstructed[kWmmaTile][kHeadDimension];
-  const int64_t first_position =
-      static_cast<int64_t>(selected_chunk) * kChunkSize;
-  for (int index = vector_index; index < kWmmaTile * kRank; index += kThreads) {
-    const int token = index / kRank;
-    const int rank = index - token * kRank;
-    selected_u[token][rank] = token < kChunkSize
-        ? u[(first_position + token) * kRank + rank]
-        : __float2bfloat16_rn(0.0f);
+    if (plan_row_valid && !entry_valid) {
+      atomicCAS(
+          planner_error_codes + head,
+          0,
+          kInvalidPlacementDescriptor);
+    }
   }
   __syncthreads();
 
-  using namespace nvcuda;
-  const int output_tile = threadIdx.x / 32;
-  wmma::fragment<
-      wmma::matrix_a,
-      kWmmaTile,
-      kWmmaTile,
-      kWmmaTile,
-      __nv_bfloat16,
-      wmma::row_major>
-      a_fragment;
-  wmma::fragment<
-      wmma::matrix_b,
-      kWmmaTile,
-      kWmmaTile,
-      kWmmaTile,
-      __nv_bfloat16,
-      wmma::row_major>
-      b_fragment;
-  wmma::fragment<
-      wmma::accumulator,
-      kWmmaTile,
-      kWmmaTile,
-      kWmmaTile,
-      float>
-      accumulator;
-  wmma::fill_fragment(accumulator, 0.0f);
+  __nv_bfloat16* destination_elements =
+      reinterpret_cast<__nv_bfloat16*>(destination_key_values);
+  const int64_t destination_block_element =
+      (static_cast<int64_t>(head) * kSelectedCapacity + selected_base) *
+      kChunkElements;
+  if (has_miss) {
+    for (int index = threadIdx.x;
+         index < kRowsPerKeyBlock * kRank;
+         index += kThreads) {
+      const int row = index / kRank;
+      const int rank = index - row * kRank;
+      const int local_chunk = row / kChunkSize;
+      const int token = row - local_chunk * kChunkSize;
+      const int selected_chunk = chunks[local_chunk];
+      selected_u[row][rank] = kinds[local_chunk] == kMiss
+          ? u[(static_cast<int64_t>(selected_chunk) * kChunkSize + token) *
+                  kRank +
+              rank]
+          : __float2bfloat16_rn(0.0f);
+    }
+    __syncthreads();
+
+    using namespace nvcuda;
+    const int warp = threadIdx.x / 32;
+    const int warp_row = warp / kKeyBlockColumnTiles;
+    const int warp_column = warp - warp_row * kKeyBlockColumnTiles;
+    wmma::fragment<
+        wmma::matrix_a,
+        kWmmaTile,
+        kWmmaTile,
+        kWmmaTile,
+        __nv_bfloat16,
+        wmma::row_major>
+        a_fragments[kWarpRowTiles];
+    wmma::fragment<
+        wmma::matrix_b,
+        kWmmaTile,
+        kWmmaTile,
+        kWmmaTile,
+        __nv_bfloat16,
+        wmma::row_major>
+        b_fragments[kWarpColumnTiles];
+    wmma::fragment<
+        wmma::accumulator,
+        kWmmaTile,
+        kWmmaTile,
+        kWmmaTile,
+        float>
+        accumulators[kWarpRowTiles][kWarpColumnTiles];
 #pragma unroll
-  for (int rank = 0; rank < kRank; rank += kWmmaTile) {
-    wmma::load_matrix_sync(
-        a_fragment,
-        &selected_u[0][rank],
-        kRank);
-    wmma::load_matrix_sync(
-        b_fragment,
-        sv +
-            (static_cast<int64_t>(head) * kRank + rank) *
-                kHeadDimension +
-            output_tile * kWmmaTile,
-        kHeadDimension);
-    wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+    for (int row_tile = 0; row_tile < kWarpRowTiles; ++row_tile) {
+#pragma unroll
+      for (int column_tile = 0; column_tile < kWarpColumnTiles;
+           ++column_tile) {
+        wmma::fill_fragment(
+            accumulators[row_tile][column_tile],
+            0.0f);
+      }
+    }
+#pragma unroll
+    for (int rank = 0; rank < kRank; rank += kWmmaTile) {
+#pragma unroll
+      for (int row_tile = 0; row_tile < kWarpRowTiles; ++row_tile) {
+        wmma::load_matrix_sync(
+            a_fragments[row_tile],
+            &selected_u[warp_row * kWarpRows + row_tile * kWmmaTile][rank],
+            kRank);
+      }
+#pragma unroll
+      for (int column_tile = 0; column_tile < kWarpColumnTiles;
+           ++column_tile) {
+        wmma::load_matrix_sync(
+            b_fragments[column_tile],
+            sv +
+                (static_cast<int64_t>(head) * kRank + rank) *
+                    kHeadDimension +
+                warp_column * kWarpColumns + column_tile * kWmmaTile,
+            kHeadDimension);
+      }
+#pragma unroll
+      for (int row_tile = 0; row_tile < kWarpRowTiles; ++row_tile) {
+#pragma unroll
+        for (int column_tile = 0; column_tile < kWarpColumnTiles;
+             ++column_tile) {
+          wmma::mma_sync(
+              accumulators[row_tile][column_tile],
+              a_fragments[row_tile],
+              b_fragments[column_tile],
+              accumulators[row_tile][column_tile]);
+        }
+      }
+    }
+    __syncthreads();
+    float* warp_scratch =
+        reinterpret_cast<float*>(selected_u) + warp * kWmmaTile * kWmmaTile;
+    const int lane = threadIdx.x % 32;
+#pragma unroll
+    for (int row_tile = 0; row_tile < kWarpRowTiles; ++row_tile) {
+#pragma unroll
+      for (int column_tile = 0; column_tile < kWarpColumnTiles;
+           ++column_tile) {
+        wmma::store_matrix_sync(
+            warp_scratch,
+            accumulators[row_tile][column_tile],
+            kWmmaTile,
+            wmma::mem_row_major);
+        __syncwarp();
+        for (int tile_element = lane;
+             tile_element < kWmmaTile * kWmmaTile;
+             tile_element += 32) {
+          const int tile_row = tile_element / kWmmaTile;
+          const int tile_column = tile_element - tile_row * kWmmaTile;
+          const int output_row =
+              warp_row * kWarpRows + row_tile * kWmmaTile + tile_row;
+          const int output_column =
+              warp_column * kWarpColumns + column_tile * kWmmaTile +
+              tile_column;
+          destination_elements[
+              destination_block_element + output_row * kHeadDimension +
+              output_column] =
+                  __float2bfloat16_rn(warp_scratch[tile_element]);
+        }
+        __syncwarp();
+      }
+    }
+    __syncthreads();
   }
-  wmma::store_matrix_sync(
-      &reconstructed[0][output_tile * kWmmaTile],
-      accumulator,
-      kHeadDimension,
-      wmma::mem_row_major);
+
+  if (has_miss) {
+    for (int index = threadIdx.x;
+         index < kRowsPerKeyBlock * kHeadDimension;
+         index += kThreads) {
+      const int row = index / kHeadDimension;
+      const int dimension = index - row * kHeadDimension;
+      selected_u[row][dimension] =
+          destination_elements[destination_block_element + index];
+    }
+    __syncthreads();
+  }
+
+  for (int index = threadIdx.x;
+       index < kRowsPerKeyBlock * kHeadDimension;
+       index += kThreads) {
+    const int row = index / kHeadDimension;
+    const int dimension = index - row * kHeadDimension;
+    const int local_chunk = row / kChunkSize;
+    const int token = row - local_chunk * kChunkSize;
+    const int8_t kind = kinds[local_chunk];
+    const int64_t destination_element = destination_block_element + index;
+    if (kind == kMiss) {
+      const int paired_dimension =
+          dimension < kHalfHeadDimension
+          ? dimension + kHalfHeadDimension
+          : dimension - kHalfHeadDimension;
+      const int frequency = dimension % kHalfHeadDimension;
+      const int64_t position =
+          static_cast<int64_t>(chunks[local_chunk]) * kChunkSize + token;
+      const float value =
+          __bfloat162float(selected_u[row][dimension]);
+      const float paired = __bfloat162float(
+          selected_u[row][paired_dimension]);
+      const float rotated_half =
+          dimension < kHalfHeadDimension ? -paired : paired;
+      const int64_t frequency_offset =
+          position * kHalfHeadDimension + frequency;
+      const float direct_product =
+          __fmul_rn(value, cosine[frequency_offset]);
+      const float rotated_product =
+          __fmul_rn(rotated_half, sine[frequency_offset]);
+      destination_elements[destination_element] =
+          __float2bfloat16_rn(
+              __fadd_rn(direct_product, rotated_product));
+    } else if (kind == kInactive) {
+      destination_elements[destination_element] =
+          __float2bfloat16_rn(0.0f);
+    }
+  }
   __syncthreads();
 
-  if (vector_index >= kHeadDimension) {
-    return;
-  }
-  const int dimension = vector_index;
-
-  const int paired_dimension =
-      dimension < kHalfHeadDimension
-      ? dimension + kHalfHeadDimension
-      : dimension - kHalfHeadDimension;
-  const int frequency = dimension % kHalfHeadDimension;
-  const int64_t destination_element = plan_offset * kChunkElements;
-#pragma unroll
-  for (int token = 0; token < kChunkSize; ++token) {
-    const int64_t position = first_position + token;
-    const float value = __bfloat162float(
-        __float2bfloat16_rn(reconstructed[token][dimension]));
-    const float paired = __bfloat162float(
-        __float2bfloat16_rn(reconstructed[token][paired_dimension]));
-    const float rotated_half =
-        dimension < kHalfHeadDimension ? -paired : paired;
-    const int64_t frequency_offset =
-        position * kHalfHeadDimension + frequency;
-    const float direct_product =
-        __fmul_rn(value, cosine[frequency_offset]);
-    const float rotated_product =
-        __fmul_rn(rotated_half, sine[frequency_offset]);
-    reinterpret_cast<__nv_bfloat16*>(destination_key_values)
-        [destination_element + token * kHeadDimension + dimension] =
-            __float2bfloat16_rn(
-                __fadd_rn(direct_product, rotated_product));
+  for (int index = threadIdx.x;
+       index < kChunksPerKeyBlock * kVectorsPerChunk;
+       index += kThreads) {
+    const int local_chunk = index / kVectorsPerChunk;
+    const int vector = index - local_chunk * kVectorsPerChunk;
+    if (kinds[local_chunk] != kHit) {
+      continue;
+    }
+    const int64_t destination_vector =
+        (static_cast<int64_t>(head) * kSelectedCapacity + selected_base +
+         local_chunk) *
+            kVectorsPerChunk +
+        vector;
+    destination_key_values[destination_vector] =
+        temporal_key_values[
+            static_cast<int64_t>(temporal_sources[local_chunk]) *
+                kVectorsPerChunk +
+            vector];
   }
 }
 
@@ -550,7 +675,7 @@ void shadowkv_fused_key_a100(
   c10::cuda::CUDAGuard device_guard(device);
   check_sm80(u);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  shadowkv_fused_key_a100_kernel<<<kKVHeads * kSelectedCapacity, kThreads, 0, stream>>>(
+  shadowkv_fused_key_a100_kernel<<<kKVHeads * kKeyBlocksPerHead, kThreads, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(u.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(sv.data_ptr<at::BFloat16>()),
       cosine.data_ptr<float>(),
