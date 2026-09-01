@@ -78,6 +78,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "shadowkv_publish_value_descriptor(Tensor! descriptor_generation, Tensor! descriptor_validity, int generation) "
       "-> ()");
   m.impl("shadowkv_publish_value_descriptor", torch::kCUDA, &shadowkv_publish_value_descriptor);
+  m.def("shadowkv_resolve_mapped_host_pointer(Tensor host_values, int device_index) -> int");
+  m.impl("shadowkv_resolve_mapped_host_pointer", torch::kCPU, &shadowkv_resolve_mapped_host_pointer);
   m.def(
       "shadowkv_place_device(Tensor component_kinds, Tensor source_slots, Tensor destination_slots, Tensor "
       "plan_slots, Tensor! planner_error_codes, Tensor temporal_key_values, Tensor compatibility_key_values, int "
@@ -90,6 +92,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor descriptor_generation, Tensor descriptor_validity, int expected_generation, int plan_capacity, Tensor "
       "value_miss_key_values, Tensor! destination_key_values) -> ()");
   m.impl("shadowkv_place_device_miss_only", torch::kCUDA, &shadowkv_place_device_miss_only);
+  m.def(
+      "shadowkv_place_device_mapped_host(Tensor component_kinds, Tensor source_slots, Tensor destination_slots, "
+      "Tensor miss_ordinals, Tensor selected_chunk_ids, Tensor plan_slots, Tensor! planner_error_codes, Tensor "
+      "temporal_key_values, Tensor reconstructed_keys, Tensor value_miss_chunk_ids, Tensor value_miss_lengths, "
+      "Tensor descriptor_generation, Tensor descriptor_validity, int mapped_host_pointer, int mapped_host_bytes, "
+      "int prompt_chunk_capacity, int prompt_tokens, int expected_generation, int plan_capacity, Tensor! "
+      "destination_key_values) -> ()");
+  m.impl("shadowkv_place_device_mapped_host", torch::kCUDA, &shadowkv_place_device_mapped_host);
   m.def(
       "shadowkv_publish_device(Tensor selected_chunk_ids, Tensor selected_lengths, Tensor exact_chunk_ids, Tensor "
       "exact_lengths, Tensor row_indices, Tensor row_generations, Tensor planner_error_codes, Tensor "

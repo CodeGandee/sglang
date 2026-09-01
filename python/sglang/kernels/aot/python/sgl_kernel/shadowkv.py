@@ -97,6 +97,24 @@ class ShadowKVDevicePlanV2Outputs(ShadowKVDevicePlanOutputs):
     value_miss_lengths: torch.Tensor
 
 
+@dataclass(frozen=True)
+class ShadowKVMappedHostRegion:
+    """One mapped pinned host tensor whose lifetime protects its device pointer."""
+
+    values: torch.Tensor
+    device: torch.device
+    device_pointer: int
+    byte_length: int
+
+    @property
+    def kv_heads(self) -> int:
+        return self.values.shape[0]
+
+    @property
+    def prompt_chunk_capacity(self) -> int:
+        return self.values.shape[1]
+
+
 def shadowkv_kernels_available() -> bool:
     """Return whether this wheel contains the optional ShadowKV operators."""
 
@@ -105,6 +123,8 @@ def shadowkv_kernels_available() -> bool:
         and hasattr(torch.ops.sgl_kernel, "shadowkv_reconstruct_rope")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_place_device")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_place_device_miss_only")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_place_device_mapped_host")
+        and hasattr(torch.ops.sgl_kernel, "shadowkv_resolve_mapped_host_pointer")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_device")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_plan_device_v2")
         and hasattr(torch.ops.sgl_kernel, "shadowkv_publish_value_descriptor")
@@ -686,6 +706,49 @@ def shadowkv_publish_value_descriptor(
     )
 
 
+def shadowkv_resolve_mapped_host_region(
+    host_values: torch.Tensor,
+    *,
+    device: torch.device | str,
+) -> ShadowKVMappedHostRegion:
+    """Resolve one B200-accessible pinned host region and retain its owner."""
+
+    if host_values.dtype != torch.bfloat16:
+        raise ValueError("mapped host values must use torch.bfloat16")
+    if host_values.ndim != 4 or host_values.shape[-2:] != (8, 128):
+        raise ValueError("mapped host values must have shape [heads, chunks, 8, 128]")
+    if host_values.shape[0] < 1 or host_values.shape[1] < 1:
+        raise ValueError("mapped host values must contain heads and chunks")
+    if host_values.device.type != "cpu":
+        raise ValueError("mapped host values must reside on CPU")
+    if not host_values.is_contiguous():
+        raise ValueError("mapped host values must be contiguous")
+    if not host_values.is_pinned():
+        raise ValueError("mapped host values must use page-locked memory")
+    if host_values.data_ptr() % 16:
+        raise ValueError("mapped host values must be 16-byte aligned")
+    resolved_device = torch.device(device)
+    if resolved_device.type != "cuda":
+        raise ValueError("mapped host values require a CUDA destination device")
+    if resolved_device.index is None:
+        resolved_device = torch.device("cuda", torch.cuda.current_device())
+    _require_b200(resolved_device)
+    pointer = int(
+        torch.ops.sgl_kernel.shadowkv_resolve_mapped_host_pointer.default(
+            host_values,
+            resolved_device.index,
+        )
+    )
+    if pointer <= 0 or pointer % 16:
+        raise RuntimeError("mapped host resolver returned an invalid device pointer")
+    return ShadowKVMappedHostRegion(
+        values=host_values,
+        device=resolved_device,
+        device_pointer=pointer,
+        byte_length=host_values.numel() * host_values.element_size(),
+    )
+
+
 def shadowkv_place_device(
     component_kinds: torch.Tensor,
     source_slots: torch.Tensor,
@@ -880,6 +943,135 @@ def shadowkv_place_device_miss_only(
         expected_generation,
         plan_capacity,
         value_miss_key_values,
+        destination_key_values,
+    )
+    return destination_key_values
+
+
+def shadowkv_place_device_mapped_host(
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    reconstructed_keys: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    mapped_host_region: ShadowKVMappedHostRegion,
+    destination_key_values: torch.Tensor,
+    *,
+    prompt_tokens: int,
+    expected_generation: int,
+    plan_capacity: int,
+) -> torch.Tensor:
+    """Place hits and K misses while reading V misses from mapped pinned host rows."""
+
+    inputs = (
+        ("component_kinds", component_kinds, torch.int8, 3),
+        ("source_slots", source_slots, torch.int32, 3),
+        ("destination_slots", destination_slots, torch.int32, 3),
+        ("miss_ordinals", miss_ordinals, torch.int32, 3),
+        ("selected_chunk_ids", selected_chunk_ids, torch.int32, 2),
+        ("plan_slots", plan_slots, torch.int32, 1),
+        ("planner_error_codes", planner_error_codes, torch.int32, 1),
+        ("temporal_key_values", temporal_key_values, torch.bfloat16, 7),
+        ("reconstructed_keys", reconstructed_keys, torch.bfloat16, 4),
+        ("value_miss_chunk_ids", value_miss_chunk_ids, torch.int32, 2),
+        ("value_miss_lengths", value_miss_lengths, torch.int32, 1),
+        ("descriptor_generation", descriptor_generation, torch.int64, 1),
+        ("descriptor_validity", descriptor_validity, torch.uint8, 1),
+        ("destination_key_values", destination_key_values, torch.bfloat16, 5),
+    )
+    for name, tensor, dtype, dimensions in inputs:
+        _require_tensor(name, tensor, dtype=dtype, dimensions=dimensions)
+    if not isinstance(mapped_host_region, ShadowKVMappedHostRegion):
+        raise TypeError("mapped_host_region must be a resolved ShadowKV region")
+    if component_kinds.shape[0] != 2:
+        raise ValueError("component_kinds must have shape [2, heads, selected]")
+    heads, selected_capacity = component_kinds.shape[1:]
+    component_shape = (2, heads, selected_capacity)
+    compact_shape = (heads, selected_capacity)
+    if not 1 <= selected_capacity <= 256 or heads < 1:
+        raise ValueError("placement heads and selected capacity are outside bounds")
+    if any(
+        tensor.shape != component_shape
+        for tensor in (source_slots, destination_slots, miss_ordinals)
+    ):
+        raise ValueError("placement plan tensors must share shape [2, heads, selected]")
+    if (
+        selected_chunk_ids.shape != compact_shape
+        or value_miss_chunk_ids.shape != compact_shape
+    ):
+        raise ValueError(
+            "selected and value-miss ids must have shape [heads, selected]"
+        )
+    if (
+        plan_slots.shape != (heads,)
+        or planner_error_codes.shape != (heads,)
+        or value_miss_lengths.shape != (heads,)
+    ):
+        raise ValueError("placement row tensors must have shape [heads]")
+    if descriptor_generation.shape != (1,) or descriptor_validity.shape != (1,):
+        raise ValueError("descriptor generation and validity must have shape [1]")
+    if temporal_key_values.shape[0] != 2 or temporal_key_values.shape[3] != heads:
+        raise ValueError("temporal K/V component or head dimensions differ")
+    if temporal_key_values.shape[-2:] != (8, 128):
+        raise ValueError("temporal K/V must use chunk_size=8 and head_dim=128")
+    expected_compact_values = (heads, selected_capacity, 8, 128)
+    if reconstructed_keys.shape != expected_compact_values:
+        raise ValueError(
+            f"reconstructed_keys must have shape {expected_compact_values}"
+        )
+    expected_output = (2, heads, selected_capacity, 8, 128)
+    if destination_key_values.shape != expected_output:
+        raise ValueError(f"destination_key_values must have shape {expected_output}")
+    if mapped_host_region.kv_heads != heads:
+        raise ValueError("mapped host region has another KV-head count")
+    if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int):
+        raise TypeError("prompt_tokens must be an integer")
+    if not 1 <= prompt_tokens <= mapped_host_region.prompt_chunk_capacity * 8:
+        raise ValueError("prompt_tokens exceeds the mapped host region")
+    if isinstance(expected_generation, bool) or not isinstance(
+        expected_generation, int
+    ):
+        raise TypeError("expected_generation must be an integer")
+    if expected_generation < 0:
+        raise ValueError("expected_generation must be nonnegative")
+    if isinstance(plan_capacity, bool) or not isinstance(plan_capacity, int):
+        raise TypeError("plan_capacity must be an integer")
+    if plan_capacity < 1:
+        raise ValueError("plan_capacity must be positive")
+    device = component_kinds.device
+    if any(tensor.device != device for _, tensor, _, _ in inputs):
+        raise ValueError("all mapped-host placement tensors must share one CUDA device")
+    if mapped_host_region.device != device:
+        raise ValueError("mapped host region belongs to another CUDA device")
+    _require_b200(device)
+    torch.ops.sgl_kernel.shadowkv_place_device_mapped_host.default(
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        reconstructed_keys,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        mapped_host_region.device_pointer,
+        mapped_host_region.byte_length,
+        mapped_host_region.prompt_chunk_capacity,
+        prompt_tokens,
+        expected_generation,
+        plan_capacity,
         destination_key_values,
     )
     return destination_key_values

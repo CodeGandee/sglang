@@ -170,6 +170,7 @@ void shadowkv_publish_value_descriptor(
     at::Tensor& descriptor_generation,
     at::Tensor& descriptor_validity,
     int64_t generation);
+int64_t shadowkv_resolve_mapped_host_pointer(const at::Tensor& host_values, int64_t device_index);
 void shadowkv_place_device(
     const at::Tensor& component_kinds,
     const at::Tensor& source_slots,
@@ -197,6 +198,27 @@ void shadowkv_place_device_miss_only(
     int64_t expected_generation,
     int64_t plan_capacity,
     const at::Tensor& value_miss_key_values,
+    at::Tensor& destination_key_values);
+void shadowkv_place_device_mapped_host(
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& reconstructed_keys,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t mapped_host_bytes,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    int64_t plan_capacity,
     at::Tensor& destination_key_values);
 void shadowkv_publish_device(
     const at::Tensor& selected_chunk_ids,

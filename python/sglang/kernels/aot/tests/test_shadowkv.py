@@ -319,6 +319,25 @@ def _miss_only_placement_inputs(plan, compatibility):
     return reconstructed_keys, value_misses
 
 
+def _mapped_host_placement_inputs(plan, compatibility, prompt_chunk_capacity=128):
+    heads = plan.selected_chunk_ids.shape[0]
+    elements = heads * prompt_chunk_capacity * 8 * 128
+    host_values = (
+        torch.arange(elements, dtype=torch.int32)
+        .remainder_(8192)
+        .to(torch.bfloat16)
+        .view(heads, prompt_chunk_capacity, 8, 128)
+        .pin_memory()
+    )
+    matched_compatibility = compatibility.clone()
+    for head in range(heads):
+        for selected in range(plan.selected_chunk_ids.shape[1]):
+            chunk = plan.selected_chunk_ids[head, selected].item()
+            if chunk >= 0:
+                matched_compatibility[1, head, selected].copy_(host_values[head, chunk])
+    return host_values, matched_compatibility
+
+
 def _packed_gqa_reference(query, keys, values, lengths):
     outputs = []
     for row, length in enumerate(lengths.cpu().tolist()):
@@ -921,6 +940,153 @@ def test_shadowkv_place_device_miss_only_rejects_stale_descriptor():
 
     assert not torch.count_nonzero(output).item()
     assert plan.error_codes.cpu().tolist() == [8, 8]
+
+
+@pytest.mark.parametrize("mode", ["all-hit", "all-miss", "asymmetric"])
+def test_shadowkv_place_device_mapped_host_matches_full_selected_control(mode):
+    plan, temporal_values, compatibility, _, _ = _device_placement_arguments(
+        mode, parallel=True
+    )
+    host_values, compatibility = _mapped_host_placement_inputs(plan, compatibility)
+    mapped = sgl_kernel.shadowkv_resolve_mapped_host_region(
+        host_values,
+        device=torch.device("cuda"),
+    )
+    reconstructed_keys = compatibility[0].clone()
+    expected = _device_placement_reference(plan, temporal_values, compatibility)
+    guard_elements = 256
+    output_elements = compatibility.numel()
+    guarded = torch.full(
+        (output_elements + 2 * guard_elements,),
+        53,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = guarded.narrow(0, guard_elements, output_elements).view_as(compatibility)
+
+    actual = sgl_kernel.shadowkv_place_device_mapped_host(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        reconstructed_keys,
+        plan.value_miss_chunk_ids,
+        plan.value_miss_lengths,
+        torch.tensor([13], dtype=torch.int64, device="cuda"),
+        torch.ones((1,), dtype=torch.uint8, device="cuda"),
+        mapped,
+        output,
+        prompt_tokens=128 * 8,
+        expected_generation=13,
+        plan_capacity=2,
+    )
+    repeated = torch.empty_like(output)
+    sgl_kernel.shadowkv_place_device_mapped_host(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        reconstructed_keys,
+        plan.value_miss_chunk_ids,
+        plan.value_miss_lengths,
+        torch.tensor([13], dtype=torch.int64, device="cuda"),
+        torch.ones((1,), dtype=torch.uint8, device="cuda"),
+        mapped,
+        repeated,
+        prompt_tokens=128 * 8,
+        expected_generation=13,
+        plan_capacity=2,
+    )
+
+    assert mapped.values is host_values
+    assert mapped.device_pointer > 0
+    assert mapped.device_pointer % 16 == 0
+    assert actual.data_ptr() == output.data_ptr()
+    assert torch.equal(actual, expected)
+    assert torch.equal(repeated, expected)
+    assert torch.equal(actual[..., -1], expected[..., -1])
+    assert torch.equal(
+        guarded[:guard_elements], torch.full_like(guarded[:guard_elements], 53)
+    )
+    assert torch.equal(
+        guarded[-guard_elements:], torch.full_like(guarded[-guard_elements:], 53)
+    )
+
+
+def test_shadowkv_mapped_host_resolver_rejects_pageable_and_misaligned_storage():
+    pageable = torch.empty((2, 8, 8, 128), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="page-locked"):
+        sgl_kernel.shadowkv_resolve_mapped_host_region(pageable, device="cuda")
+    with pytest.raises(RuntimeError, match="page-locked"):
+        torch.ops.sgl_kernel.shadowkv_resolve_mapped_host_pointer.default(
+            pageable,
+            torch.cuda.current_device(),
+        )
+
+    elements = 2 * 8 * 8 * 128
+    allocation = torch.empty((elements + 1,), dtype=torch.bfloat16, pin_memory=True)
+    misaligned = allocation[1:].view(2, 8, 8, 128)
+    assert misaligned.is_contiguous() and misaligned.is_pinned()
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        sgl_kernel.shadowkv_resolve_mapped_host_region(misaligned, device="cuda")
+
+
+def test_shadowkv_mapped_host_bounds_failure_zeroes_complete_rows_and_guards():
+    plan, temporal_values, compatibility, _, _ = _device_placement_arguments(
+        "all-miss", parallel=True
+    )
+    host_values, compatibility = _mapped_host_placement_inputs(plan, compatibility)
+    mapped = sgl_kernel.shadowkv_resolve_mapped_host_region(
+        host_values,
+        device="cuda",
+    )
+    guard_elements = 256
+    output_elements = compatibility.numel()
+    guarded = torch.full(
+        (output_elements + 2 * guard_elements,),
+        59,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = guarded.narrow(0, guard_elements, output_elements).view_as(compatibility)
+
+    sgl_kernel.shadowkv_place_device_mapped_host(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        compatibility[0],
+        plan.value_miss_chunk_ids,
+        plan.value_miss_lengths,
+        torch.tensor([17], dtype=torch.int64, device="cuda"),
+        torch.ones((1,), dtype=torch.uint8, device="cuda"),
+        mapped,
+        output,
+        prompt_tokens=4 * 8,
+        expected_generation=17,
+        plan_capacity=2,
+    )
+
+    assert plan.error_codes.cpu().tolist() == [8, 8]
+    assert not torch.count_nonzero(output).item()
+    assert torch.equal(
+        guarded[:guard_elements], torch.full_like(guarded[:guard_elements], 59)
+    )
+    assert torch.equal(
+        guarded[-guard_elements:], torch.full_like(guarded[-guard_elements:], 59)
+    )
 
 
 def test_shadowkv_place_device_zeroes_invalid_rows_and_destinations():
