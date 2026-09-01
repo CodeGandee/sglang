@@ -1664,6 +1664,11 @@ class Scheduler(
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
+        release_provider_resources = getattr(
+            self.token_to_kv_pool, "release_host_resources", None
+        )
+        if callable(release_provider_resources):
+            release_provider_resources()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
