@@ -753,7 +753,7 @@ def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
         plan.selected_chunk_ids.to(torch.int64)[..., None] * 8
         + torch.arange(8, dtype=torch.int64, device="cuda")
     ).reshape(8, 2048)
-    pre_rope = torch.einsum("hnr,hrd->hnd", u[selected_positions], sv).float()
+    pre_rope = sgl_kernel.shadowkv_reconstruct(u, sv, selected_positions).float()
     selected_cosine = cosine[selected_positions]
     selected_sine = sine[selected_positions]
     expected_misses = (
@@ -813,7 +813,7 @@ def test_shadowkv_a100_fused_key_matches_plan_reference(mode):
     assert torch.count_nonzero(plan.error_codes).item() == 0
     assert torch.equal(output[1], torch.full_like(output[1], 23))
     assert torch.equal(repeated[0], output[0])
-    torch.testing.assert_close(output[0], expected, rtol=4e-2, atol=4e-2)
+    torch.testing.assert_close(output[0], expected, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize(
