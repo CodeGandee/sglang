@@ -146,11 +146,13 @@ def shadowkv_a100_fused_key_kernels_available() -> bool:
             "shadowkv_fused_key_sm80_a100_v2",
             "shadowkv_fused_key_sm80_a100_v3",
             "shadowkv_fused_key_sm80_a100_v4",
+            "shadowkv_fused_key_sm80_a100_v5",
             "shadowkv_fused_key_mapped_value_sm80_a100_v3",
             "shadowkv_fused_key_mapped_value_sm80_a100_v4",
             "shadowkv_fused_key_mapped_value_sm80_a100_v5",
             "shadowkv_fused_key_mapped_value_sm80_a100_v6",
             "shadowkv_fused_key_mapped_value_sm80_a100_v7",
+            "shadowkv_fused_key_mapped_value_sm80_a100_v8",
             "shadowkv_prepare_exact_miss_gemm_sm80_a100_v1",
             "shadowkv_resolve_miss_count_pointer_sm80_a100_v1",
             "shadowkv_place_value_sm80_a100_v1",
@@ -279,7 +281,7 @@ def _launch_shadowkv_fused_key_exact_a100(
     plan_capacity: int,
     destination_key_values: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v4.default(
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v5.default(
         u,
         sv,
         gathered_u,
@@ -499,7 +501,7 @@ def _launch_shadowkv_fused_key_mapped_value_exact_a100(
     reconstruction_stream: int,
     destination_key_values: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.shadowkv_fused_key_mapped_value_sm80_a100_v7.default(
+    torch.ops.sgl_kernel.shadowkv_fused_key_mapped_value_sm80_a100_v8.default(
         u,
         sv,
         gathered_u,

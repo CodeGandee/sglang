@@ -950,7 +950,7 @@ def test_shadowkv_a100_miss_only_boundaries_match_retained_full_bmm_control():
         1,
         miss_output,
     )
-    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v4.default(
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v5.default(
         u,
         sv,
         exact_gathered,
@@ -1041,7 +1041,7 @@ def test_shadowkv_a100_exact_all_hit_skips_compaction_and_gemm():
         1,
         full_output,
     )
-    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v4.default(
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v5.default(
         u,
         sv,
         exact_gathered,
@@ -1136,7 +1136,7 @@ def test_shadowkv_a100_miss_only_rejects_invalid_plan_before_write(mutation):
     with pytest.raises(
         RuntimeError, match="exact A100 miss count was not published safely"
     ):
-        torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v4.default(
+        torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v5.default(
             u,
             sv,
             exact_gathered,
@@ -1402,7 +1402,7 @@ def test_shadowkv_a100_combined_mapped_value_and_fused_key_matches_split(mode):
     exact_mapped_stream.wait_stream(caller_stream)
     exact_reconstruction_stream.wait_stream(caller_stream)
     with torch.cuda.stream(exact_mapped_stream):
-        torch.ops.sgl_kernel.shadowkv_fused_key_mapped_value_sm80_a100_v7.default(
+        torch.ops.sgl_kernel.shadowkv_fused_key_mapped_value_sm80_a100_v8.default(
             u,
             sv,
             exact_gathered,

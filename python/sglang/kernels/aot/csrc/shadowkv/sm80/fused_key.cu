@@ -819,8 +819,7 @@ __global__ void shadowkv_prepare_key_bmm_a100_kernel(
   }
 }
 
-__global__ void shadowkv_prepare_key_miss_only_a100_kernel(
-    const __nv_bfloat16* __restrict__ u,
+__global__ void shadowkv_validate_key_miss_plan_a100_kernel(
     const int8_t* __restrict__ component_kinds,
     const int32_t* __restrict__ source_slots,
     const int32_t* __restrict__ destination_slots,
@@ -829,13 +828,10 @@ __global__ void shadowkv_prepare_key_miss_only_a100_kernel(
     const int32_t* __restrict__ selected_lengths,
     const int32_t* __restrict__ plan_slots,
     int32_t* __restrict__ planner_error_codes,
-    const uint4* __restrict__ temporal_key_values,
     int u_tokens,
     int rope_rows,
     int64_t temporal_chunks_per_component,
     int plan_capacity,
-    __nv_bfloat16* __restrict__ gathered_u,
-    uint4* __restrict__ destination_key_values,
     int32_t* __restrict__ mapped_miss_counts) {
   const int head = blockIdx.x;
   const int selected = threadIdx.x;
@@ -931,42 +927,53 @@ __global__ void shadowkv_prepare_key_miss_only_a100_kernel(
     mapped_miss_counts[head] = miss_count;
     __threadfence_system();
   }
+}
 
-  for (int work = threadIdx.x;
-       work < kSelectedCapacity * kVectorsPerChunk;
-       work += blockDim.x) {
-    const int work_selected = work / kVectorsPerChunk;
-    const int vector = work - work_selected * kVectorsPerChunk;
-    const int64_t work_plan_offset =
-        static_cast<int64_t>(head) * kSelectedCapacity + work_selected;
-    const int8_t work_kind = component_kinds[work_plan_offset];
-    const int64_t destination_vector = work_plan_offset * kVectorsPerChunk + vector;
-    if (work_kind == kHit) {
+__global__ void shadowkv_materialize_key_misses_a100_kernel(
+    const __nv_bfloat16* __restrict__ u,
+    const int8_t* __restrict__ component_kinds,
+    const int32_t* __restrict__ source_slots,
+    const int32_t* __restrict__ miss_ordinals,
+    const int32_t* __restrict__ selected_chunk_ids,
+    const int32_t* __restrict__ planner_error_codes,
+    const uint4* __restrict__ temporal_key_values,
+    __nv_bfloat16* __restrict__ gathered_u,
+    uint4* __restrict__ destination_key_values) {
+  const int head = blockIdx.x / kSelectedCapacity;
+  const int selected = blockIdx.x - head * kSelectedCapacity;
+  if (planner_error_codes[head] != 0) {
+    return;
+  }
+  const int64_t plan_offset =
+      static_cast<int64_t>(head) * kSelectedCapacity + selected;
+  const int8_t kind = component_kinds[plan_offset];
+
+  for (int vector = threadIdx.x;
+       vector < kVectorsPerChunk;
+       vector += blockDim.x) {
+    const int64_t destination_vector = plan_offset * kVectorsPerChunk + vector;
+    if (kind == kHit) {
       destination_key_values[destination_vector] =
           temporal_key_values[
-              static_cast<int64_t>(source_slots[work_plan_offset]) *
+              static_cast<int64_t>(source_slots[plan_offset]) *
                   kVectorsPerChunk +
               vector];
-    } else if (work_kind == kInactive) {
+    } else if (kind == kInactive) {
       destination_key_values[destination_vector] = uint4{0, 0, 0, 0};
     }
   }
 
+  if (kind != kMiss) {
+    return;
+  }
   constexpr int kGatherElementsPerSelected = kChunkSize * kRank;
-  for (int work = threadIdx.x;
-       work < kSelectedCapacity * kGatherElementsPerSelected;
-       work += blockDim.x) {
-    const int work_selected = work / kGatherElementsPerSelected;
-    const int local = work - work_selected * kGatherElementsPerSelected;
-    const int64_t work_plan_offset =
-        static_cast<int64_t>(head) * kSelectedCapacity + work_selected;
-    if (component_kinds[work_plan_offset] != kMiss) {
-      continue;
-    }
+  for (int local = threadIdx.x;
+       local < kGatherElementsPerSelected;
+       local += blockDim.x) {
     const int token = local / kRank;
     const int rank = local - token * kRank;
-    const int ordinal = miss_ordinals[work_plan_offset];
-    const int chunk = selected_chunk_ids[work_plan_offset];
+    const int ordinal = miss_ordinals[plan_offset];
+    const int chunk = selected_chunk_ids[plan_offset];
     gathered_u[
         ((static_cast<int64_t>(head) * kSelectedCapacity + ordinal) *
              kChunkSize +
@@ -1584,6 +1591,69 @@ void launch_prepare_key_a100(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void launch_validate_key_miss_plan_a100(
+    const at::Tensor& u,
+    const at::Tensor& cosine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const PlanGeometry& geometry,
+    int64_t plan_capacity,
+    cudaStream_t stream,
+    int32_t* mapped_miss_counts = nullptr) {
+  TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
+  shadowkv_validate_key_miss_plan_a100_kernel
+      <<<kKVHeads, kThreads, 0, stream>>>(
+      component_kinds.data_ptr<int8_t>(),
+      source_slots.data_ptr<int32_t>(),
+      destination_slots.data_ptr<int32_t>(),
+      miss_ordinals.data_ptr<int32_t>(),
+      selected_chunk_ids.data_ptr<int32_t>(),
+      selected_lengths.data_ptr<int32_t>(),
+      plan_slots.data_ptr<int32_t>(),
+      planner_error_codes.data_ptr<int32_t>(),
+      static_cast<int>(u.size(0)),
+      static_cast<int>(cosine.size(0)),
+      geometry.temporal_chunks_per_component,
+      static_cast<int>(plan_capacity),
+      mapped_miss_counts);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_materialize_key_misses_a100(
+    const at::Tensor& u,
+    at::Tensor& gathered_u,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
+  shadowkv_materialize_key_misses_a100_kernel
+      <<<kKVHeads * kSelectedCapacity, kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(u.data_ptr<at::BFloat16>()),
+      component_kinds.data_ptr<int8_t>(),
+      source_slots.data_ptr<int32_t>(),
+      miss_ordinals.data_ptr<int32_t>(),
+      selected_chunk_ids.data_ptr<int32_t>(),
+      planner_error_codes.data_ptr<int32_t>(),
+      reinterpret_cast<const uint4*>(
+          temporal_key_values.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(
+          gathered_u.data_ptr<at::BFloat16>()),
+      reinterpret_cast<uint4*>(
+          destination_key_values.data_ptr<at::BFloat16>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void launch_prepare_key_miss_only_a100(
     const at::Tensor& u,
     at::Tensor& gathered_u,
@@ -1602,29 +1672,32 @@ void launch_prepare_key_miss_only_a100(
     at::Tensor& destination_key_values,
     cudaStream_t stream,
     int32_t* mapped_miss_counts = nullptr) {
-  TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
-  shadowkv_prepare_key_miss_only_a100_kernel<<<kKVHeads, kThreads, 0, stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(u.data_ptr<at::BFloat16>()),
-      component_kinds.data_ptr<int8_t>(),
-      source_slots.data_ptr<int32_t>(),
-      destination_slots.data_ptr<int32_t>(),
-      miss_ordinals.data_ptr<int32_t>(),
-      selected_chunk_ids.data_ptr<int32_t>(),
-      selected_lengths.data_ptr<int32_t>(),
-      plan_slots.data_ptr<int32_t>(),
-      planner_error_codes.data_ptr<int32_t>(),
-      reinterpret_cast<const uint4*>(
-          temporal_key_values.data_ptr<at::BFloat16>()),
-      static_cast<int>(u.size(0)),
-      static_cast<int>(cosine.size(0)),
-      geometry.temporal_chunks_per_component,
-      static_cast<int>(plan_capacity),
-      reinterpret_cast<__nv_bfloat16*>(
-          gathered_u.data_ptr<at::BFloat16>()),
-      reinterpret_cast<uint4*>(
-          destination_key_values.data_ptr<at::BFloat16>()),
+  launch_validate_key_miss_plan_a100(
+      u,
+      cosine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      geometry,
+      plan_capacity,
+      stream,
       mapped_miss_counts);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  launch_materialize_key_misses_a100(
+      u,
+      gathered_u,
+      component_kinds,
+      source_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      planner_error_codes,
+      temporal_key_values,
+      destination_key_values,
+      stream);
 }
 
 void launch_reconstruct_key_misses_a100(
@@ -1851,14 +1924,20 @@ void validate_exact_miss_resources(
       "exact A100 miss GEMM was not prepared for this CUDA device");
 }
 
-MissCounts await_exact_miss_counts(
-    at::Tensor& host_miss_counts,
+void record_exact_miss_counts_ready(
     int64_t miss_count_ready_event,
     cudaStream_t stream) {
-  auto* host_counts = host_miss_counts.data_ptr<int32_t>();
   cudaEvent_t ready_event =
       reinterpret_cast<cudaEvent_t>(miss_count_ready_event);
   C10_CUDA_CHECK(cudaEventRecord(ready_event, stream));
+}
+
+MissCounts await_exact_miss_counts(
+    at::Tensor& host_miss_counts,
+    int64_t miss_count_ready_event) {
+  auto* host_counts = host_miss_counts.data_ptr<int32_t>();
+  cudaEvent_t ready_event =
+      reinterpret_cast<cudaEvent_t>(miss_count_ready_event);
   C10_CUDA_CHECK(cudaEventSynchronize(ready_event));
   MissCounts counts{};
   for (int head = 0; head < kKVHeads; ++head) {
@@ -1968,7 +2047,7 @@ void finish_exact_fused_key_a100(
     at::Tensor& destination_key_values,
     cudaStream_t stream) {
   const MissCounts counts = await_exact_miss_counts(
-      host_miss_counts, miss_count_ready_event, stream);
+      host_miss_counts, miss_count_ready_event);
   launch_exact_miss_gemm(
       gathered_u,
       sv,
@@ -2334,9 +2413,8 @@ void shadowkv_fused_key_exact_a100(
   check_sm80(u);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   reset_exact_miss_counts(host_miss_counts);
-  launch_prepare_key_miss_only_a100(
+  launch_validate_key_miss_plan_a100(
       u,
-      gathered_u,
       cosine,
       component_kinds,
       source_slots,
@@ -2346,13 +2424,23 @@ void shadowkv_fused_key_exact_a100(
       selected_lengths,
       plan_slots,
       planner_error_codes,
-      temporal_key_values,
       geometry,
       plan_capacity,
-      destination_key_values,
       stream,
       reinterpret_cast<int32_t*>(
           static_cast<uintptr_t>(mapped_miss_counts)));
+  record_exact_miss_counts_ready(miss_count_ready_event, stream);
+  launch_materialize_key_misses_a100(
+      u,
+      gathered_u,
+      component_kinds,
+      source_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      planner_error_codes,
+      temporal_key_values,
+      destination_key_values,
+      stream);
   finish_exact_fused_key_a100(
       sv,
       gathered_u,
@@ -3175,9 +3263,8 @@ void shadowkv_fused_key_mapped_value_exact_a100(
   reset_exact_miss_counts(host_miss_counts);
   {
     c10::cuda::CUDAStreamGuard key_stream_guard(external_key_stream);
-    launch_prepare_key_miss_only_a100(
+    launch_validate_key_miss_plan_a100(
         u,
-        gathered_u,
         cosine,
         component_kinds,
         source_slots,
@@ -3187,13 +3274,23 @@ void shadowkv_fused_key_mapped_value_exact_a100(
         selected_lengths,
         plan_slots,
         planner_error_codes,
-        temporal_key_values,
         key_geometry,
         plan_capacity,
-        destination_key_values,
         key_stream,
         reinterpret_cast<int32_t*>(
             static_cast<uintptr_t>(mapped_miss_counts)));
+    record_exact_miss_counts_ready(miss_count_ready_event, key_stream);
+    launch_materialize_key_misses_a100(
+        u,
+        gathered_u,
+        component_kinds,
+        source_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        planner_error_codes,
+        temporal_key_values,
+        destination_key_values,
+        key_stream);
   }
   launch_mapped_value_a100(
       component_kinds,
