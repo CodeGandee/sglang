@@ -20,12 +20,15 @@ from sglang.srt.managers.scheduler import Scheduler
 
 def test_scheduler_releases_optional_cache_provider_resources() -> None:
     provider_release = Mock()
+    token_to_kv_pool = SimpleNamespace(
+        release_host_resources=provider_release,
+    )
     scheduler = SimpleNamespace(
         hisparse_coordinator=SimpleNamespace(destroy=Mock()),
         tree_cache=SimpleNamespace(release_host_resources=Mock()),
         decode_offload_manager=SimpleNamespace(release_host_resources=Mock()),
-        token_to_kv_pool=SimpleNamespace(
-            release_host_resources=provider_release,
+        token_to_kv_pool_allocator=SimpleNamespace(
+            get_kvcache=Mock(return_value=token_to_kv_pool),
         ),
     )
 
@@ -34,4 +37,5 @@ def test_scheduler_releases_optional_cache_provider_resources() -> None:
     scheduler.hisparse_coordinator.destroy.assert_called_once_with()
     scheduler.tree_cache.release_host_resources.assert_called_once_with()
     scheduler.decode_offload_manager.release_host_resources.assert_called_once_with()
+    scheduler.token_to_kv_pool_allocator.get_kvcache.assert_called_once_with()
     provider_release.assert_called_once_with()
