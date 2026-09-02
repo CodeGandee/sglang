@@ -145,10 +145,14 @@ def shadowkv_a100_fused_key_kernels_available() -> bool:
         for name in (
             "shadowkv_fused_key_sm80_a100_v2",
             "shadowkv_fused_key_sm80_a100_v3",
+            "shadowkv_fused_key_sm80_a100_v4",
             "shadowkv_fused_key_mapped_value_sm80_a100_v3",
             "shadowkv_fused_key_mapped_value_sm80_a100_v4",
             "shadowkv_fused_key_mapped_value_sm80_a100_v5",
             "shadowkv_fused_key_mapped_value_sm80_a100_v6",
+            "shadowkv_fused_key_mapped_value_sm80_a100_v7",
+            "shadowkv_prepare_exact_miss_gemm_sm80_a100_v1",
+            "shadowkv_resolve_miss_count_pointer_sm80_a100_v1",
             "shadowkv_place_value_sm80_a100_v1",
             "shadowkv_place_value_miss_only_sm80_a100_v1",
             "shadowkv_place_value_mapped_host_sm80_a100_v1",
@@ -230,6 +234,70 @@ def _launch_shadowkv_fused_key_a100(
         plan_slots,
         planner_error_codes,
         temporal_key_values,
+        plan_capacity,
+        destination_key_values,
+    )
+
+
+def _prepare_shadowkv_exact_miss_gemm_a100(device_anchor: torch.Tensor) -> None:
+    torch.ops.sgl_kernel.shadowkv_prepare_exact_miss_gemm_sm80_a100_v1.default(
+        device_anchor
+    )
+
+
+def _resolve_shadowkv_miss_count_pointer_a100(
+    host_miss_counts: torch.Tensor,
+    device_index: int,
+) -> int:
+    return int(
+        torch.ops.sgl_kernel.shadowkv_resolve_miss_count_pointer_sm80_a100_v1.default(
+            host_miss_counts,
+            device_index,
+        )
+    )
+
+
+def _launch_shadowkv_fused_key_exact_a100(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    gathered_u: torch.Tensor,
+    reconstructed_misses: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    host_miss_counts: torch.Tensor,
+    mapped_miss_counts: int,
+    miss_count_ready_event: int,
+    plan_capacity: int,
+    destination_key_values: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v4.default(
+        u,
+        sv,
+        gathered_u,
+        reconstructed_misses,
+        cosine,
+        sine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        host_miss_counts,
+        mapped_miss_counts,
+        miss_count_ready_event,
         plan_capacity,
         destination_key_values,
     )
@@ -395,6 +463,70 @@ def _launch_shadowkv_fused_key_mapped_value_a100(
         mapped_host_region.prompt_chunk_capacity,
         prompt_tokens,
         expected_generation,
+        plan_capacity,
+        reconstruction_stream,
+        destination_key_values,
+    )
+
+
+def _launch_shadowkv_fused_key_mapped_value_exact_a100(
+    u: torch.Tensor,
+    sv: torch.Tensor,
+    gathered_u: torch.Tensor,
+    reconstructed_misses: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    component_kinds: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_ordinals: torch.Tensor,
+    selected_chunk_ids: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    plan_slots: torch.Tensor,
+    planner_error_codes: torch.Tensor,
+    temporal_key_values: torch.Tensor,
+    value_miss_chunk_ids: torch.Tensor,
+    value_miss_lengths: torch.Tensor,
+    descriptor_generation: torch.Tensor,
+    descriptor_validity: torch.Tensor,
+    mapped_host_region: ShadowKVMappedHostRegion,
+    host_miss_counts: torch.Tensor,
+    mapped_miss_counts: int,
+    miss_count_ready_event: int,
+    prompt_tokens: int,
+    expected_generation: int,
+    plan_capacity: int,
+    reconstruction_stream: int,
+    destination_key_values: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.shadowkv_fused_key_mapped_value_sm80_a100_v7.default(
+        u,
+        sv,
+        gathered_u,
+        reconstructed_misses,
+        cosine,
+        sine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        value_miss_chunk_ids,
+        value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        mapped_host_region.device_pointer,
+        mapped_host_region.byte_length,
+        mapped_host_region.prompt_chunk_capacity,
+        prompt_tokens,
+        expected_generation,
+        host_miss_counts,
+        mapped_miss_counts,
+        miss_count_ready_event,
         plan_capacity,
         reconstruction_stream,
         destination_key_values,

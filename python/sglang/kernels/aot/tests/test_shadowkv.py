@@ -897,6 +897,22 @@ def test_shadowkv_a100_miss_only_boundaries_match_retained_full_bmm_control():
     )
     miss_workspace = torch.full_like(full_workspace, 43)
     miss_output = torch.full_like(full_output, 47)
+    exact_gathered = torch.full_like(full_workspace, 61)
+    exact_reconstructed = torch.full(
+        (8, 2048, 128), 67, dtype=torch.bfloat16, device="cuda"
+    )
+    exact_output = torch.full_like(full_output, 71)
+    host_miss_counts = torch.empty((8,), dtype=torch.int32, pin_memory=True)
+    exact_ready = torch.cuda.Event()
+    exact_ready.record()
+    exact_ready.synchronize()
+    torch.ops.sgl_kernel.shadowkv_prepare_exact_miss_gemm_sm80_a100_v1.default(u)
+    mapped_miss_counts = int(
+        torch.ops.sgl_kernel.shadowkv_resolve_miss_count_pointer_sm80_a100_v1.default(
+            host_miss_counts,
+            torch.cuda.current_device(),
+        )
+    )
 
     torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v2.default(
         u,
@@ -934,10 +950,35 @@ def test_shadowkv_a100_miss_only_boundaries_match_retained_full_bmm_control():
         1,
         miss_output,
     )
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v4.default(
+        u,
+        sv,
+        exact_gathered,
+        exact_reconstructed,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        host_miss_counts,
+        mapped_miss_counts,
+        exact_ready.cuda_event,
+        1,
+        exact_output,
+    )
 
     assert not plan.error_codes.any().item()
     torch.testing.assert_close(miss_output[0], full_output[0], rtol=2e-3, atol=2e-3)
+    assert torch.equal(exact_output[0], full_output[0])
     assert torch.equal(miss_output[1], torch.full_like(miss_output[1], 47))
+    assert torch.equal(exact_output[1], torch.full_like(exact_output[1], 71))
+    assert tuple(host_miss_counts.tolist()) == miss_counts
     assert torch.equal(miss_workspace[0], torch.full_like(miss_workspace[0], 43))
     for head, expected_misses in enumerate(miss_counts):
         assert (
@@ -946,6 +987,90 @@ def test_shadowkv_a100_miss_only_boundaries_match_retained_full_bmm_control():
         )
         hit_rows = plan.component_kinds[0, head] == 1
         assert torch.equal(miss_output[0, head, hit_rows], full_output[0, head, hit_rows])
+
+
+@pytest.mark.skipif(
+    not sgl_kernel.shadowkv_a100_fused_key_kernels_available(),
+    reason="the installed wheel has no SM80 fused-key child",
+)
+def test_shadowkv_a100_exact_all_hit_skips_compaction_and_gemm():
+    torch.manual_seed(20261007)
+    plan, temporal_values = _a100_fused_key_case("all-hit")
+    u = torch.zeros((2048, 160), dtype=torch.bfloat16, device="cuda")
+    sv = torch.zeros((8, 160, 128), dtype=torch.bfloat16, device="cuda")
+    cosine = torch.ones((2048, 64), dtype=torch.float32, device="cuda")
+    sine = torch.zeros_like(cosine)
+    full_gathered = torch.empty(
+        (8, 2048, 160), dtype=torch.bfloat16, device="cuda"
+    )
+    full_output = torch.full(
+        (2, 8, 256, 8, 128), 73, dtype=torch.bfloat16, device="cuda"
+    )
+    exact_gathered = torch.full_like(full_gathered, 79)
+    exact_reconstructed = torch.full(
+        (8, 2048, 128), 83, dtype=torch.bfloat16, device="cuda"
+    )
+    exact_output = torch.full_like(full_output, 89)
+    host_miss_counts = torch.empty((8,), dtype=torch.int32, pin_memory=True)
+    exact_ready = torch.cuda.Event()
+    exact_ready.record()
+    exact_ready.synchronize()
+    torch.ops.sgl_kernel.shadowkv_prepare_exact_miss_gemm_sm80_a100_v1.default(u)
+    mapped_miss_counts = int(
+        torch.ops.sgl_kernel.shadowkv_resolve_miss_count_pointer_sm80_a100_v1.default(
+            host_miss_counts,
+            torch.cuda.current_device(),
+        )
+    )
+
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v2.default(
+        u,
+        sv,
+        full_gathered,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        1,
+        full_output,
+    )
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v4.default(
+        u,
+        sv,
+        exact_gathered,
+        exact_reconstructed,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        host_miss_counts,
+        mapped_miss_counts,
+        exact_ready.cuda_event,
+        1,
+        exact_output,
+    )
+
+    assert not plan.error_codes.any().item()
+    assert torch.equal(exact_output[0], full_output[0])
+    assert tuple(host_miss_counts.tolist()) == (0,) * 8
+    assert torch.equal(exact_gathered, torch.full_like(exact_gathered, 79))
+    assert torch.equal(
+        exact_reconstructed, torch.full_like(exact_reconstructed, 83)
+    )
 
 
 @pytest.mark.skipif(
@@ -991,6 +1116,50 @@ def test_shadowkv_a100_miss_only_rejects_invalid_plan_before_write(mutation):
     output = torch.full(
         (2, 8, 256, 8, 128), 59, dtype=torch.bfloat16, device="cuda"
     )
+    exact_gathered = torch.full_like(gathered_u, 61)
+    exact_reconstructed = torch.full(
+        (8, 2048, 128), 67, dtype=torch.bfloat16, device="cuda"
+    )
+    exact_output = torch.full_like(output, 71)
+    host_miss_counts = torch.empty((8,), dtype=torch.int32, pin_memory=True)
+    exact_ready = torch.cuda.Event()
+    exact_ready.record()
+    exact_ready.synchronize()
+    torch.ops.sgl_kernel.shadowkv_prepare_exact_miss_gemm_sm80_a100_v1.default(u)
+    mapped_miss_counts = int(
+        torch.ops.sgl_kernel.shadowkv_resolve_miss_count_pointer_sm80_a100_v1.default(
+            host_miss_counts,
+            torch.cuda.current_device(),
+        )
+    )
+
+    with pytest.raises(
+        RuntimeError, match="exact A100 miss count was not published safely"
+    ):
+        torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v4.default(
+            u,
+            sv,
+            exact_gathered,
+            exact_reconstructed,
+            cosine,
+            sine,
+            plan.component_kinds,
+            plan.source_slots,
+            plan.destination_slots,
+            plan.miss_ordinals,
+            plan.selected_chunk_ids,
+            plan.selected_lengths,
+            plan.plan_slots,
+            plan.error_codes,
+            temporal_values,
+            host_miss_counts,
+            mapped_miss_counts,
+            exact_ready.cuda_event,
+            1,
+            exact_output,
+        )
+    assert torch.equal(exact_output[0, 0], torch.full_like(exact_output[0, 0], 71))
+    plan.error_codes.zero_()
 
     torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v3.default(
         u,
@@ -1172,6 +1341,106 @@ def test_shadowkv_a100_combined_mapped_value_and_fused_key_matches_split(mode):
     assert actual_keys.data_ptr() == actual[0].data_ptr()
     assert actual_values.data_ptr() == actual[1].data_ptr()
     assert torch.equal(actual, expected)
+
+    exact_expected = torch.full_like(expected, 37)
+    exact_actual = torch.full_like(expected, 41)
+    exact_gathered = torch.empty_like(gathered_u)
+    exact_reconstructed = torch.empty(
+        (8, 2048, 128), dtype=torch.bfloat16, device="cuda"
+    )
+    host_miss_counts = torch.empty((8,), dtype=torch.int32, pin_memory=True)
+    exact_ready = torch.cuda.Event()
+    exact_ready.record()
+    exact_ready.synchronize()
+    torch.ops.sgl_kernel.shadowkv_prepare_exact_miss_gemm_sm80_a100_v1.default(u)
+    mapped_miss_counts = int(
+        torch.ops.sgl_kernel.shadowkv_resolve_miss_count_pointer_sm80_a100_v1.default(
+            host_miss_counts,
+            torch.cuda.current_device(),
+        )
+    )
+    torch.ops.sgl_kernel.shadowkv_fused_key_sm80_a100_v2.default(
+        u,
+        sv,
+        exact_gathered,
+        cosine,
+        sine,
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        1,
+        exact_expected,
+    )
+    sgl_kernel.shadowkv_place_value_mapped_host_a100(
+        plan.component_kinds,
+        plan.source_slots,
+        plan.destination_slots,
+        plan.miss_ordinals,
+        plan.selected_chunk_ids,
+        plan.selected_lengths,
+        plan.plan_slots,
+        plan.error_codes,
+        temporal_values,
+        plan.value_miss_chunk_ids,
+        plan.value_miss_lengths,
+        descriptor_generation,
+        descriptor_validity,
+        mapped_region,
+        prompt_tokens=2048,
+        expected_generation=7,
+        plan_capacity=1,
+        out=exact_expected,
+    )
+    exact_mapped_stream = torch.cuda.Stream()
+    exact_reconstruction_stream = torch.cuda.Stream()
+    exact_mapped_stream.wait_stream(caller_stream)
+    exact_reconstruction_stream.wait_stream(caller_stream)
+    with torch.cuda.stream(exact_mapped_stream):
+        torch.ops.sgl_kernel.shadowkv_fused_key_mapped_value_sm80_a100_v7.default(
+            u,
+            sv,
+            exact_gathered,
+            exact_reconstructed,
+            cosine,
+            sine,
+            plan.component_kinds,
+            plan.source_slots,
+            plan.destination_slots,
+            plan.miss_ordinals,
+            plan.selected_chunk_ids,
+            plan.selected_lengths,
+            plan.plan_slots,
+            plan.error_codes,
+            temporal_values,
+            plan.value_miss_chunk_ids,
+            plan.value_miss_lengths,
+            descriptor_generation,
+            descriptor_validity,
+            mapped_region.device_pointer,
+            mapped_region.byte_length,
+            mapped_region.prompt_chunk_capacity,
+            2048,
+            7,
+            host_miss_counts,
+            mapped_miss_counts,
+            exact_ready.cuda_event,
+            1,
+            exact_reconstruction_stream.cuda_stream,
+            exact_actual,
+        )
+    caller_stream.wait_stream(exact_mapped_stream)
+    caller_stream.wait_stream(exact_reconstruction_stream)
+    assert torch.equal(exact_actual, exact_expected)
+    assert tuple(host_miss_counts.tolist()) == tuple(
+        int(torch.count_nonzero(plan.component_kinds[0, head] == 2).item())
+        for head in range(8)
+    )
 
 
 @pytest.mark.skipif(

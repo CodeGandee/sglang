@@ -17,6 +17,7 @@ limitations under the License.
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cublasLt.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -29,8 +30,10 @@ limitations under the License.
 #include "cutlass/layout/matrix.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 
 #include "utils.h"
 
@@ -65,6 +68,9 @@ constexpr int kChunkBytes = kChunkElements * sizeof(at::BFloat16);
 constexpr int kVectorsPerChunk = kChunkBytes / kVectorBytes;
 constexpr int kValueEntries = kKVHeads * kSelectedCapacity;
 constexpr int kThrottledMappedValueBlocks = 512;
+constexpr int kExactGemmAlgorithm = 6;
+constexpr uint32_t kExactGemmTile = CUBLASLT_MATMUL_TILE_128x64;
+constexpr uint32_t kExactGemmStages = CUBLASLT_MATMUL_STAGES_64x3;
 
 // This fixed SM80 shape is part of the Llama 3.1 8B specialization contract.
 // It uses the CUTLASS headers already fetched by the AOT build and does not
@@ -116,6 +122,197 @@ static_assert(kRowsPerKeyBlock == 128 && kThreads == 256);
 static_assert(kValueEntries % kThrottledMappedValueBlocks == 0);
 static_assert(kMissGemmThreads == 128);
 
+struct MissCounts {
+  int32_t values[kKVHeads];
+};
+
+struct ExactMissGemmRuntime {
+  std::mutex mutex;
+  cublasLtHandle_t handle = nullptr;
+  cublasLtMatmulDescOpaque_t operation{};
+  cublasLtMatmulAlgo_t algorithm{};
+  int device_index = -1;
+  bool prepared = false;
+};
+
+ExactMissGemmRuntime& exact_miss_gemm_runtime() {
+  static ExactMissGemmRuntime runtime;
+  return runtime;
+}
+
+void check_cublas(cublasStatus_t status, const char* operation) {
+  TORCH_CHECK(
+      status == CUBLAS_STATUS_SUCCESS,
+      operation,
+      " failed with cuBLAS status ",
+      static_cast<int>(status));
+}
+
+void configure_exact_matrix_layout(
+    cublasLtMatrixLayout_t layout,
+    int32_t batch_count,
+    int64_t batch_stride) {
+  const cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+  check_cublas(
+      cublasLtMatrixLayoutSetAttribute(
+          layout,
+          CUBLASLT_MATRIX_LAYOUT_ORDER,
+          &order,
+          sizeof(order)),
+      "set exact GEMM row-major layout");
+  check_cublas(
+      cublasLtMatrixLayoutSetAttribute(
+          layout,
+          CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+          &batch_count,
+          sizeof(batch_count)),
+      "set exact GEMM batch count");
+  check_cublas(
+      cublasLtMatrixLayoutSetAttribute(
+          layout,
+          CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+          &batch_stride,
+          sizeof(batch_stride)),
+      "set exact GEMM batch stride");
+}
+
+struct ExactMatrixLayouts {
+  cublasLtMatrixLayoutOpaque_t a{};
+  cublasLtMatrixLayoutOpaque_t b{};
+  cublasLtMatrixLayoutOpaque_t c{};
+  cublasLtMatrixLayoutOpaque_t d{};
+
+  explicit ExactMatrixLayouts(int rows) {
+    check_cublas(
+        cublasLtMatrixLayoutInit(&a, CUDA_R_16BF, rows, kRank, kRank),
+        "initialize exact GEMM A layout");
+    check_cublas(
+        cublasLtMatrixLayoutInit(
+            &b, CUDA_R_16BF, kRank, kHeadDimension, kHeadDimension),
+        "initialize exact GEMM B layout");
+    check_cublas(
+        cublasLtMatrixLayoutInit(
+            &c, CUDA_R_16BF, rows, kHeadDimension, kHeadDimension),
+        "initialize exact GEMM C layout");
+    check_cublas(
+        cublasLtMatrixLayoutInit(
+            &d, CUDA_R_16BF, rows, kHeadDimension, kHeadDimension),
+        "initialize exact GEMM D layout");
+    configure_exact_matrix_layout(
+        &a,
+        kKVHeads,
+        static_cast<int64_t>(kSelectedCapacity) * kChunkSize * kRank);
+    configure_exact_matrix_layout(
+        &b,
+        kKVHeads,
+        static_cast<int64_t>(kRank) * kHeadDimension);
+    configure_exact_matrix_layout(
+        &c,
+        kKVHeads,
+        static_cast<int64_t>(kSelectedCapacity) * kChunkSize *
+            kHeadDimension);
+    configure_exact_matrix_layout(
+        &d,
+        kKVHeads,
+        static_cast<int64_t>(kSelectedCapacity) * kChunkSize *
+            kHeadDimension);
+  }
+};
+
+void prepare_exact_miss_gemm(int device_index) {
+  ExactMissGemmRuntime& runtime = exact_miss_gemm_runtime();
+  std::lock_guard<std::mutex> guard(runtime.mutex);
+  if (runtime.prepared) {
+    TORCH_CHECK(
+        runtime.device_index == device_index,
+        "exact A100 miss GEMM was prepared on a different CUDA device");
+    return;
+  }
+  check_cublas(cublasLtCreate(&runtime.handle), "create exact GEMM handle");
+  runtime.device_index = device_index;
+  check_cublas(
+      cublasLtMatmulDescInit(
+          &runtime.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+      "initialize exact GEMM operation");
+  check_cublas(
+      cublasLtMatmulAlgoInit(
+          runtime.handle,
+          CUBLAS_COMPUTE_32F,
+          CUDA_R_32F,
+          CUDA_R_16BF,
+          CUDA_R_16BF,
+          CUDA_R_16BF,
+          CUDA_R_16BF,
+          kExactGemmAlgorithm,
+          &runtime.algorithm),
+      "initialize exact GEMM algorithm");
+  const int32_t split_k = 1;
+  const uint32_t reduction_scheme = CUBLASLT_REDUCTION_SCHEME_NONE;
+  const uint32_t swizzle = 0;
+  const uint32_t custom_option = 0;
+  check_cublas(
+      cublasLtMatmulAlgoConfigSetAttribute(
+          &runtime.algorithm,
+          CUBLASLT_ALGO_CONFIG_TILE_ID,
+          &kExactGemmTile,
+          sizeof(kExactGemmTile)),
+      "set exact GEMM tile");
+  check_cublas(
+      cublasLtMatmulAlgoConfigSetAttribute(
+          &runtime.algorithm,
+          CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+          &split_k,
+          sizeof(split_k)),
+      "set exact GEMM split-K");
+  check_cublas(
+      cublasLtMatmulAlgoConfigSetAttribute(
+          &runtime.algorithm,
+          CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+          &reduction_scheme,
+          sizeof(reduction_scheme)),
+      "set exact GEMM reduction");
+  check_cublas(
+      cublasLtMatmulAlgoConfigSetAttribute(
+          &runtime.algorithm,
+          CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
+          &swizzle,
+          sizeof(swizzle)),
+      "set exact GEMM swizzle");
+  check_cublas(
+      cublasLtMatmulAlgoConfigSetAttribute(
+          &runtime.algorithm,
+          CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
+          &custom_option,
+          sizeof(custom_option)),
+      "set exact GEMM custom option");
+  check_cublas(
+      cublasLtMatmulAlgoConfigSetAttribute(
+          &runtime.algorithm,
+          CUBLASLT_ALGO_CONFIG_STAGES_ID,
+          &kExactGemmStages,
+          sizeof(kExactGemmStages)),
+      "set exact GEMM stages");
+  for (int miss_chunks = 1; miss_chunks <= kSelectedCapacity; ++miss_chunks) {
+    ExactMatrixLayouts layouts(miss_chunks * kChunkSize);
+    cublasLtMatmulHeuristicResult_t checked{};
+    check_cublas(
+        cublasLtMatmulAlgoCheck(
+            runtime.handle,
+            &runtime.operation,
+            &layouts.a,
+            &layouts.b,
+            &layouts.c,
+            &layouts.d,
+            &runtime.algorithm,
+            &checked),
+        "validate exact GEMM miss bucket");
+    TORCH_CHECK(
+        checked.workspaceSize == 0,
+        "exact A100 miss GEMM unexpectedly requires workspace");
+  }
+  runtime.prepared = true;
+}
+
 void check_tensor(
     const at::Tensor& tensor,
     const char* name,
@@ -143,15 +340,19 @@ void check_alignment(
       "-byte aligned");
 }
 
-void check_sm80(const at::Tensor& tensor) {
+void check_sm80_device(int device_index) {
   cudaDeviceProp properties{};
-  C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, tensor.get_device()));
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, device_index));
   TORCH_CHECK(
       properties.major == 8 && properties.minor == 0,
       "A100 fused ShadowKV kernels require compute capability 8.0; found ",
       properties.major,
       ".",
       properties.minor);
+}
+
+void check_sm80(const at::Tensor& tensor) {
+  check_sm80_device(tensor.get_device());
 }
 
 struct PlanGeometry {
@@ -634,7 +835,8 @@ __global__ void shadowkv_prepare_key_miss_only_a100_kernel(
     int64_t temporal_chunks_per_component,
     int plan_capacity,
     __nv_bfloat16* __restrict__ gathered_u,
-    uint4* __restrict__ destination_key_values) {
+    uint4* __restrict__ destination_key_values,
+    int32_t* __restrict__ mapped_miss_counts) {
   const int head = blockIdx.x;
   const int selected = threadIdx.x;
   __shared__ int32_t seen_ordinals[kSelectedCapacity];
@@ -724,6 +926,10 @@ __global__ void shadowkv_prepare_key_miss_only_a100_kernel(
   __syncthreads();
   if (planner_error_codes[head] != 0) {
     return;
+  }
+  if (selected == 0 && mapped_miss_counts != nullptr) {
+    mapped_miss_counts[head] = miss_count;
+    __threadfence_system();
   }
 
   for (int work = threadIdx.x;
@@ -950,6 +1156,80 @@ __global__ void shadowkv_reconstruct_key_misses_a100_kernel(
             __fmul_rn(first, cosine_value),
             __fmul_rn(-second, sine_value)));
     destination[destination_base + kHalfHeadDimension + frequency] =
+        __float2bfloat16_rn(
+            __fadd_rn(
+                __fmul_rn(second, cosine_value),
+                __fmul_rn(first, sine_value)));
+  }
+}
+
+__global__ void shadowkv_zero_compact_key_padding_a100_kernel(
+    __nv_bfloat16* __restrict__ gathered_u,
+    MissCounts miss_counts,
+    int maximum_miss_chunks) {
+  const int head = blockIdx.x;
+  const int first_element = miss_counts.values[head] * kChunkSize * kRank;
+  const int end_element = maximum_miss_chunks * kChunkSize * kRank;
+  for (int element = first_element + blockIdx.y * blockDim.x + threadIdx.x;
+       element < end_element;
+       element += gridDim.y * blockDim.x) {
+    gathered_u[
+        static_cast<int64_t>(head) * kSelectedCapacity * kChunkSize * kRank +
+        element] = __float2bfloat16_rn(0.0f);
+  }
+}
+
+__global__ void shadowkv_finalize_compact_key_misses_a100_kernel(
+    const __nv_bfloat16* __restrict__ reconstructed_misses,
+    const float* __restrict__ cosine,
+    const float* __restrict__ sine,
+    const int8_t* __restrict__ component_kinds,
+    const int32_t* __restrict__ miss_ordinals,
+    const int32_t* __restrict__ selected_chunk_ids,
+    __nv_bfloat16* __restrict__ destination_key_values) {
+  constexpr int kPairsPerSelected = kChunkSize * kHalfHeadDimension;
+  constexpr int kPairsPerBlock = kChunksPerKeyBlock * kPairsPerSelected;
+  const int head = blockIdx.x;
+  const int selected_base = blockIdx.y * kChunksPerKeyBlock;
+  for (int pair = threadIdx.x; pair < kPairsPerBlock; pair += blockDim.x) {
+    const int local_selected = pair / kPairsPerSelected;
+    const int local_pair = pair - local_selected * kPairsPerSelected;
+    const int token = local_pair / kHalfHeadDimension;
+    const int frequency = local_pair - token * kHalfHeadDimension;
+    const int selected = selected_base + local_selected;
+    const int64_t plan_offset =
+        static_cast<int64_t>(head) * kSelectedCapacity + selected;
+    if (component_kinds[plan_offset] != kMiss) {
+      continue;
+    }
+    const int ordinal = miss_ordinals[plan_offset];
+    const int64_t source_base =
+        (static_cast<int64_t>(head) * kSelectedCapacity * kChunkSize +
+         ordinal * kChunkSize + token) *
+        kHeadDimension;
+    const float first =
+        __bfloat162float(reconstructed_misses[source_base + frequency]);
+    const float second = __bfloat162float(
+        reconstructed_misses[
+            source_base + kHalfHeadDimension + frequency]);
+    const int selected_chunk = selected_chunk_ids[plan_offset];
+    const int64_t position =
+        static_cast<int64_t>(selected_chunk) * kChunkSize + token;
+    const int64_t frequency_offset =
+        position * kHalfHeadDimension + frequency;
+    const float cosine_value = cosine[frequency_offset];
+    const float sine_value = sine[frequency_offset];
+    const int64_t destination_base =
+        (static_cast<int64_t>(head) * kSelectedCapacity * kChunkSize +
+         selected * kChunkSize + token) *
+        kHeadDimension;
+    destination_key_values[destination_base + frequency] =
+        __float2bfloat16_rn(
+            __fadd_rn(
+                __fmul_rn(first, cosine_value),
+                __fmul_rn(-second, sine_value)));
+    destination_key_values[
+        destination_base + kHalfHeadDimension + frequency] =
         __float2bfloat16_rn(
             __fadd_rn(
                 __fmul_rn(second, cosine_value),
@@ -1320,7 +1600,8 @@ void launch_prepare_key_miss_only_a100(
     const PlanGeometry& geometry,
     int64_t plan_capacity,
     at::Tensor& destination_key_values,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int32_t* mapped_miss_counts = nullptr) {
   TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
   shadowkv_prepare_key_miss_only_a100_kernel<<<kKVHeads, kThreads, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(u.data_ptr<at::BFloat16>()),
@@ -1341,7 +1622,8 @@ void launch_prepare_key_miss_only_a100(
       reinterpret_cast<__nv_bfloat16*>(
           gathered_u.data_ptr<at::BFloat16>()),
       reinterpret_cast<uint4*>(
-          destination_key_values.data_ptr<at::BFloat16>()));
+          destination_key_values.data_ptr<at::BFloat16>()),
+      mapped_miss_counts);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1529,6 +1811,182 @@ void launch_fused_key_miss_only_a100(
       stream);
 }
 
+void validate_exact_miss_resources(
+    const at::Tensor& reconstructed_misses,
+    const at::Tensor& host_miss_counts,
+    int64_t mapped_miss_counts,
+    int64_t miss_count_ready_event,
+    const at::Device& device) {
+  check_tensor(
+      reconstructed_misses,
+      "reconstructed_misses",
+      at::ScalarType::BFloat16,
+      3);
+  TORCH_CHECK(
+      reconstructed_misses.sizes() ==
+          at::IntArrayRef(
+              {kKVHeads, kSelectedCapacity * kChunkSize, kHeadDimension}),
+      "reconstructed_misses must have shape [8, 2048, 128]");
+  TORCH_CHECK(
+      reconstructed_misses.device() == device,
+      "exact miss workspace must share the fused-key CUDA device");
+  check_alignment(reconstructed_misses, "reconstructed_misses", kVectorBytes);
+  TORCH_CHECK(
+      host_miss_counts.device().is_cpu() &&
+          host_miss_counts.is_contiguous() &&
+          host_miss_counts.scalar_type() == at::ScalarType::Int &&
+          host_miss_counts.sizes() == at::IntArrayRef({kKVHeads}) &&
+          host_miss_counts.is_pinned(),
+      "host_miss_counts must be pinned contiguous int32 [8]");
+  TORCH_CHECK(
+      mapped_miss_counts > 0 && mapped_miss_counts % alignof(int32_t) == 0,
+      "mapped miss-count pointer is invalid");
+  TORCH_CHECK(
+      miss_count_ready_event > 0,
+      "miss-count readiness event is invalid");
+  ExactMissGemmRuntime& runtime = exact_miss_gemm_runtime();
+  TORCH_CHECK(
+      runtime.prepared && runtime.handle != nullptr &&
+          runtime.device_index == device.index(),
+      "exact A100 miss GEMM was not prepared for this CUDA device");
+}
+
+MissCounts await_exact_miss_counts(
+    at::Tensor& host_miss_counts,
+    int64_t miss_count_ready_event,
+    cudaStream_t stream) {
+  auto* host_counts = host_miss_counts.data_ptr<int32_t>();
+  cudaEvent_t ready_event =
+      reinterpret_cast<cudaEvent_t>(miss_count_ready_event);
+  C10_CUDA_CHECK(cudaEventRecord(ready_event, stream));
+  C10_CUDA_CHECK(cudaEventSynchronize(ready_event));
+  MissCounts counts{};
+  for (int head = 0; head < kKVHeads; ++head) {
+    TORCH_CHECK(
+        host_counts[head] >= 0 && host_counts[head] <= kSelectedCapacity,
+        "exact A100 miss count was not published safely");
+    counts.values[head] = host_counts[head];
+  }
+  return counts;
+}
+
+void reset_exact_miss_counts(at::Tensor& host_miss_counts) {
+  auto* host_counts = host_miss_counts.data_ptr<int32_t>();
+  std::fill(host_counts, host_counts + kKVHeads, -1);
+}
+
+void launch_exact_miss_gemm(
+    const at::Tensor& gathered_u,
+    const at::Tensor& sv,
+    at::Tensor& reconstructed_misses,
+    MissCounts miss_counts,
+    cudaStream_t stream) {
+  int maximum_miss_chunks = 0;
+  for (int head = 0; head < kKVHeads; ++head) {
+    maximum_miss_chunks =
+        std::max(maximum_miss_chunks, miss_counts.values[head]);
+  }
+  if (maximum_miss_chunks == 0) {
+    return;
+  }
+  const int rows = maximum_miss_chunks * kChunkSize;
+  shadowkv_zero_compact_key_padding_a100_kernel
+      <<<dim3(kKVHeads, 8), kThreads, 0, stream>>>(
+          reinterpret_cast<__nv_bfloat16*>(
+              gathered_u.data_ptr<at::BFloat16>()),
+          miss_counts,
+          maximum_miss_chunks);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  ExactMissGemmRuntime& runtime = exact_miss_gemm_runtime();
+  ExactMatrixLayouts layouts(rows);
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  check_cublas(
+      cublasLtMatmul(
+          runtime.handle,
+          &runtime.operation,
+          &alpha,
+          gathered_u.data_ptr(),
+          &layouts.a,
+          sv.data_ptr(),
+          &layouts.b,
+          &beta,
+          reconstructed_misses.data_ptr(),
+          &layouts.c,
+          reconstructed_misses.data_ptr(),
+          &layouts.d,
+          &runtime.algorithm,
+          nullptr,
+          0,
+          stream),
+      "launch exact compact A100 miss GEMM");
+}
+
+void launch_finalize_exact_misses(
+    const at::Tensor& reconstructed_misses,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    at::Tensor& destination_key_values,
+    MissCounts miss_counts,
+    cudaStream_t stream) {
+  const bool has_misses = std::any_of(
+      std::begin(miss_counts.values),
+      std::end(miss_counts.values),
+      [](int32_t count) { return count > 0; });
+  if (!has_misses) {
+    return;
+  }
+  shadowkv_finalize_compact_key_misses_a100_kernel
+      <<<dim3(kKVHeads, kKeyBlocksPerHead), kThreads, 0, stream>>>(
+          reinterpret_cast<const __nv_bfloat16*>(
+              reconstructed_misses.data_ptr<at::BFloat16>()),
+          cosine.data_ptr<float>(),
+          sine.data_ptr<float>(),
+          component_kinds.data_ptr<int8_t>(),
+          miss_ordinals.data_ptr<int32_t>(),
+          selected_chunk_ids.data_ptr<int32_t>(),
+          reinterpret_cast<__nv_bfloat16*>(
+              destination_key_values.data_ptr<at::BFloat16>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void finish_exact_fused_key_a100(
+    const at::Tensor& sv,
+    const at::Tensor& gathered_u,
+    at::Tensor& reconstructed_misses,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    at::Tensor& host_miss_counts,
+    int64_t miss_count_ready_event,
+    at::Tensor& destination_key_values,
+    cudaStream_t stream) {
+  const MissCounts counts = await_exact_miss_counts(
+      host_miss_counts, miss_count_ready_event, stream);
+  launch_exact_miss_gemm(
+      gathered_u,
+      sv,
+      reconstructed_misses,
+      counts,
+      stream);
+  launch_finalize_exact_misses(
+      reconstructed_misses,
+      cosine,
+      sine,
+      component_kinds,
+      miss_ordinals,
+      selected_chunk_ids,
+      destination_key_values,
+      counts,
+      stream);
+}
+
 PlanGeometry validate_mapped_value_a100(
     const at::Tensor& component_kinds,
     const at::Tensor& source_slots,
@@ -1665,6 +2123,50 @@ void launch_mapped_value_a100(
 
 }  // namespace
 
+void shadowkv_prepare_exact_miss_gemm_a100(const at::Tensor& device_anchor) {
+  TORCH_CHECK(device_anchor.is_cuda(), "exact miss GEMM anchor must use CUDA");
+  c10::cuda::CUDAGuard device_guard(device_anchor.device());
+  check_sm80(device_anchor);
+  prepare_exact_miss_gemm(device_anchor.get_device());
+}
+
+int64_t shadowkv_resolve_miss_count_pointer_a100(
+    const at::Tensor& host_miss_counts,
+    int64_t device_index) {
+  TORCH_CHECK(
+      host_miss_counts.device().is_cpu() &&
+          host_miss_counts.is_contiguous() &&
+          host_miss_counts.scalar_type() == at::ScalarType::Int &&
+          host_miss_counts.sizes() == at::IntArrayRef({kKVHeads}) &&
+          host_miss_counts.is_pinned(),
+      "host miss counts must be pinned contiguous int32 [8]");
+  TORCH_CHECK(
+      device_index >= 0 && device_index <= std::numeric_limits<int>::max(),
+      "mapped miss-count CUDA device is invalid");
+  int device_count = 0;
+  C10_CUDA_CHECK(cudaGetDeviceCount(&device_count));
+  TORCH_CHECK(
+      device_index < device_count,
+      "mapped miss-count CUDA device is not visible");
+  c10::cuda::CUDAGuard device_guard(
+      c10::Device(c10::DeviceType::CUDA, device_index));
+  check_sm80_device(static_cast<int>(device_index));
+  void* device_pointer = nullptr;
+  C10_CUDA_CHECK(cudaHostGetDevicePointer(
+      &device_pointer,
+      host_miss_counts.data_ptr<int32_t>(),
+      0));
+  TORCH_CHECK(
+      device_pointer != nullptr,
+      "pinned host miss counts have no mapped CUDA pointer");
+  const uintptr_t pointer = reinterpret_cast<uintptr_t>(device_pointer);
+  TORCH_CHECK(
+      pointer % alignof(int32_t) == 0 &&
+          pointer <= static_cast<uintptr_t>(std::numeric_limits<int64_t>::max()),
+      "mapped miss-count pointer exceeds the operator contract");
+  return static_cast<int64_t>(pointer);
+}
+
 void shadowkv_fused_key_a100(
     const at::Tensor& u,
     const at::Tensor& sv,
@@ -1779,6 +2281,89 @@ void shadowkv_fused_key_miss_only_a100(
       temporal_key_values,
       geometry,
       plan_capacity,
+      destination_key_values,
+      stream);
+}
+
+void shadowkv_fused_key_exact_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    at::Tensor& reconstructed_misses,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    at::Tensor& host_miss_counts,
+    int64_t mapped_miss_counts,
+    int64_t miss_count_ready_event,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values) {
+  const PlanGeometry geometry = validate_fused_key_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      plan_capacity,
+      destination_key_values);
+  const auto device = u.device();
+  validate_exact_miss_resources(
+      reconstructed_misses,
+      host_miss_counts,
+      mapped_miss_counts,
+      miss_count_ready_event,
+      device);
+  c10::cuda::CUDAGuard device_guard(device);
+  check_sm80(u);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  reset_exact_miss_counts(host_miss_counts);
+  launch_prepare_key_miss_only_a100(
+      u,
+      gathered_u,
+      cosine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      geometry,
+      plan_capacity,
+      destination_key_values,
+      stream,
+      reinterpret_cast<int32_t*>(
+          static_cast<uintptr_t>(mapped_miss_counts)));
+  finish_exact_fused_key_a100(
+      sv,
+      gathered_u,
+      reconstructed_misses,
+      cosine,
+      sine,
+      component_kinds,
+      miss_ordinals,
+      selected_chunk_ids,
+      host_miss_counts,
+      miss_count_ready_event,
       destination_key_values,
       stream);
 }
@@ -2494,4 +3079,159 @@ void shadowkv_fused_key_mapped_value_miss_only_a100(
       destination_key_values,
       kThrottledMappedValueBlocks,
       true);
+}
+
+void shadowkv_fused_key_mapped_value_exact_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    at::Tensor& reconstructed_misses,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t mapped_host_bytes,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    at::Tensor& host_miss_counts,
+    int64_t mapped_miss_counts,
+    int64_t miss_count_ready_event,
+    int64_t plan_capacity,
+    int64_t reconstruction_stream,
+    at::Tensor& destination_key_values) {
+  const PlanGeometry key_geometry = validate_fused_key_a100(
+      u,
+      sv,
+      gathered_u,
+      cosine,
+      sine,
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      plan_capacity,
+      destination_key_values);
+  const PlanGeometry value_geometry = validate_mapped_value_a100(
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      mapped_host_bytes,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      plan_capacity,
+      destination_key_values);
+  const auto device = component_kinds.device();
+  validate_exact_miss_resources(
+      reconstructed_misses,
+      host_miss_counts,
+      mapped_miss_counts,
+      miss_count_ready_event,
+      device);
+  c10::cuda::CUDAGuard device_guard(device);
+  check_sm80(component_kinds);
+  cudaStream_t value_stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t key_stream =
+      reinterpret_cast<cudaStream_t>(reconstruction_stream);
+  int key_stream_device = -1;
+  C10_CUDA_CHECK(cudaStreamGetDevice(key_stream, &key_stream_device));
+  TORCH_CHECK(
+      key_stream_device == device.index(),
+      "A100 fused reconstruction stream must target the plan CUDA device");
+  TORCH_CHECK(
+      key_stream != value_stream,
+      "A100 fused reconstruction and mapped-value streams must be distinct");
+  const c10::cuda::CUDAStream external_key_stream =
+      c10::cuda::getStreamFromExternal(key_stream, device.index());
+  reset_exact_miss_counts(host_miss_counts);
+  {
+    c10::cuda::CUDAStreamGuard key_stream_guard(external_key_stream);
+    launch_prepare_key_miss_only_a100(
+        u,
+        gathered_u,
+        cosine,
+        component_kinds,
+        source_slots,
+        destination_slots,
+        miss_ordinals,
+        selected_chunk_ids,
+        selected_lengths,
+        plan_slots,
+        planner_error_codes,
+        temporal_key_values,
+        key_geometry,
+        plan_capacity,
+        destination_key_values,
+        key_stream,
+        reinterpret_cast<int32_t*>(
+            static_cast<uintptr_t>(mapped_miss_counts)));
+  }
+  launch_mapped_value_a100(
+      component_kinds,
+      source_slots,
+      destination_slots,
+      miss_ordinals,
+      selected_chunk_ids,
+      selected_lengths,
+      plan_slots,
+      planner_error_codes,
+      temporal_key_values,
+      value_miss_chunk_ids,
+      value_miss_lengths,
+      descriptor_generation,
+      descriptor_validity,
+      mapped_host_pointer,
+      prompt_chunk_capacity,
+      prompt_tokens,
+      expected_generation,
+      value_geometry,
+      plan_capacity,
+      destination_key_values,
+      value_stream,
+      kThrottledMappedValueBlocks);
+  {
+    c10::cuda::CUDAStreamGuard key_stream_guard(external_key_stream);
+    finish_exact_fused_key_a100(
+        sv,
+        gathered_u,
+        reconstructed_misses,
+        cosine,
+        sine,
+        component_kinds,
+        miss_ordinals,
+        selected_chunk_ids,
+        host_miss_counts,
+        miss_count_ready_event,
+        destination_key_values,
+        key_stream);
+  }
 }

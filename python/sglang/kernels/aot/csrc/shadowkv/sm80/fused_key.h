@@ -6,6 +6,13 @@
 
 #include <cstdint>
 
+void shadowkv_prepare_exact_miss_gemm_a100(
+    const at::Tensor& device_anchor);
+
+int64_t shadowkv_resolve_miss_count_pointer_a100(
+    const at::Tensor& host_miss_counts,
+    int64_t device_index);
+
 void shadowkv_fused_key_a100(
     const at::Tensor& u,
     const at::Tensor& sv,
@@ -39,6 +46,28 @@ void shadowkv_fused_key_miss_only_a100(
     const at::Tensor& plan_slots,
     at::Tensor& planner_error_codes,
     const at::Tensor& temporal_key_values,
+    int64_t plan_capacity,
+    at::Tensor& destination_key_values);
+
+void shadowkv_fused_key_exact_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    at::Tensor& reconstructed_misses,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    at::Tensor& host_miss_counts,
+    int64_t mapped_miss_counts,
+    int64_t miss_count_ready_event,
     int64_t plan_capacity,
     at::Tensor& destination_key_values);
 
@@ -203,6 +232,38 @@ void shadowkv_fused_key_mapped_value_miss_only_a100(
     int64_t prompt_chunk_capacity,
     int64_t prompt_tokens,
     int64_t expected_generation,
+    int64_t plan_capacity,
+    int64_t reconstruction_stream,
+    at::Tensor& destination_key_values);
+
+void shadowkv_fused_key_mapped_value_exact_a100(
+    const at::Tensor& u,
+    const at::Tensor& sv,
+    at::Tensor& gathered_u,
+    at::Tensor& reconstructed_misses,
+    const at::Tensor& cosine,
+    const at::Tensor& sine,
+    const at::Tensor& component_kinds,
+    const at::Tensor& source_slots,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_ordinals,
+    const at::Tensor& selected_chunk_ids,
+    const at::Tensor& selected_lengths,
+    const at::Tensor& plan_slots,
+    at::Tensor& planner_error_codes,
+    const at::Tensor& temporal_key_values,
+    const at::Tensor& value_miss_chunk_ids,
+    const at::Tensor& value_miss_lengths,
+    const at::Tensor& descriptor_generation,
+    const at::Tensor& descriptor_validity,
+    int64_t mapped_host_pointer,
+    int64_t mapped_host_bytes,
+    int64_t prompt_chunk_capacity,
+    int64_t prompt_tokens,
+    int64_t expected_generation,
+    at::Tensor& host_miss_counts,
+    int64_t mapped_miss_counts,
+    int64_t miss_count_ready_event,
     int64_t plan_capacity,
     int64_t reconstruction_stream,
     at::Tensor& destination_key_values);
