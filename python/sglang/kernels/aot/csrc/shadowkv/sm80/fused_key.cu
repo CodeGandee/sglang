@@ -938,7 +938,8 @@ __global__ void shadowkv_materialize_key_misses_a100_kernel(
     const int32_t* __restrict__ planner_error_codes,
     const uint4* __restrict__ temporal_key_values,
     __nv_bfloat16* __restrict__ gathered_u,
-    uint4* __restrict__ destination_key_values) {
+    uint4* __restrict__ destination_key_values,
+    const int32_t* __restrict__ mapped_miss_counts) {
   const int head = blockIdx.x / kSelectedCapacity;
   const int selected = blockIdx.x - head * kSelectedCapacity;
   if (planner_error_codes[head] != 0) {
@@ -947,6 +948,20 @@ __global__ void shadowkv_materialize_key_misses_a100_kernel(
   const int64_t plan_offset =
       static_cast<int64_t>(head) * kSelectedCapacity + selected;
   const int8_t kind = component_kinds[plan_offset];
+  __shared__ int32_t head_miss_count;
+  __shared__ int32_t maximum_miss_count;
+  if (threadIdx.x == 0) {
+    head_miss_count = 0;
+    maximum_miss_count = 0;
+    if (mapped_miss_counts != nullptr) {
+      head_miss_count = mapped_miss_counts[head];
+      for (int other_head = 0; other_head < kKVHeads; ++other_head) {
+        maximum_miss_count =
+            max(maximum_miss_count, mapped_miss_counts[other_head]);
+      }
+    }
+  }
+  __syncthreads();
 
   for (int vector = threadIdx.x;
        vector < kVectorsPerChunk;
@@ -963,10 +978,21 @@ __global__ void shadowkv_materialize_key_misses_a100_kernel(
     }
   }
 
+  constexpr int kGatherElementsPerSelected = kChunkSize * kRank;
+  if (maximum_miss_count > 0 && selected >= head_miss_count &&
+      selected < maximum_miss_count) {
+    for (int local = threadIdx.x;
+         local < kGatherElementsPerSelected;
+         local += blockDim.x) {
+      gathered_u[
+          (static_cast<int64_t>(head) * kSelectedCapacity + selected) *
+              kGatherElementsPerSelected +
+          local] = __float2bfloat16_rn(0.0f);
+    }
+  }
   if (kind != kMiss) {
     return;
   }
-  constexpr int kGatherElementsPerSelected = kChunkSize * kRank;
   for (int local = threadIdx.x;
        local < kGatherElementsPerSelected;
        local += blockDim.x) {
@@ -1167,22 +1193,6 @@ __global__ void shadowkv_reconstruct_key_misses_a100_kernel(
             __fadd_rn(
                 __fmul_rn(second, cosine_value),
                 __fmul_rn(first, sine_value)));
-  }
-}
-
-__global__ void shadowkv_zero_compact_key_padding_a100_kernel(
-    __nv_bfloat16* __restrict__ gathered_u,
-    MissCounts miss_counts,
-    int maximum_miss_chunks) {
-  const int head = blockIdx.x;
-  const int first_element = miss_counts.values[head] * kChunkSize * kRank;
-  const int end_element = maximum_miss_chunks * kChunkSize * kRank;
-  for (int element = first_element + blockIdx.y * blockDim.x + threadIdx.x;
-       element < end_element;
-       element += gridDim.y * blockDim.x) {
-    gathered_u[
-        static_cast<int64_t>(head) * kSelectedCapacity * kChunkSize * kRank +
-        element] = __float2bfloat16_rn(0.0f);
   }
 }
 
@@ -1635,7 +1645,8 @@ void launch_materialize_key_misses_a100(
     const at::Tensor& planner_error_codes,
     const at::Tensor& temporal_key_values,
     at::Tensor& destination_key_values,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int32_t* mapped_miss_counts = nullptr) {
   TORCH_INTERNAL_ASSERT(stream == at::cuda::getCurrentCUDAStream());
   shadowkv_materialize_key_misses_a100_kernel
       <<<kKVHeads * kSelectedCapacity, kThreads, 0, stream>>>(
@@ -1650,7 +1661,8 @@ void launch_materialize_key_misses_a100(
       reinterpret_cast<__nv_bfloat16*>(
           gathered_u.data_ptr<at::BFloat16>()),
       reinterpret_cast<uint4*>(
-          destination_key_values.data_ptr<at::BFloat16>()));
+          destination_key_values.data_ptr<at::BFloat16>()),
+      mapped_miss_counts);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1697,7 +1709,8 @@ void launch_prepare_key_miss_only_a100(
       planner_error_codes,
       temporal_key_values,
       destination_key_values,
-      stream);
+      stream,
+      mapped_miss_counts);
 }
 
 void launch_reconstruct_key_misses_a100(
@@ -1969,14 +1982,6 @@ void launch_exact_miss_gemm(
     return;
   }
   const int rows = maximum_miss_chunks * kChunkSize;
-  shadowkv_zero_compact_key_padding_a100_kernel
-      <<<dim3(kKVHeads, 8), kThreads, 0, stream>>>(
-          reinterpret_cast<__nv_bfloat16*>(
-              gathered_u.data_ptr<at::BFloat16>()),
-          miss_counts,
-          maximum_miss_chunks);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-
   ExactMissGemmRuntime& runtime = exact_miss_gemm_runtime();
   ExactMatrixLayouts layouts(rows);
   const float alpha = 1.0f;
@@ -2440,7 +2445,9 @@ void shadowkv_fused_key_exact_a100(
       planner_error_codes,
       temporal_key_values,
       destination_key_values,
-      stream);
+      stream,
+      reinterpret_cast<int32_t*>(
+          static_cast<uintptr_t>(mapped_miss_counts)));
   finish_exact_fused_key_a100(
       sv,
       gathered_u,
@@ -3290,7 +3297,9 @@ void shadowkv_fused_key_mapped_value_exact_a100(
         planner_error_codes,
         temporal_key_values,
         destination_key_values,
-        key_stream);
+        key_stream,
+        reinterpret_cast<int32_t*>(
+            static_cast<uintptr_t>(mapped_miss_counts)));
   }
   launch_mapped_value_a100(
       component_kinds,
