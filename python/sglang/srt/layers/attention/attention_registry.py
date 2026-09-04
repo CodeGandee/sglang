@@ -46,6 +46,26 @@ def register_attention_backend(name):
     return decorator
 
 
+def registered_attention_backend_names() -> tuple[str, ...]:
+    """Return backend identities without constructing or importing a provider."""
+
+    return tuple(sorted(ATTENTION_BACKENDS))
+
+
+def resolve_attention_backend_factory(name):
+    """Resolve one registered constructor through the supported registry API."""
+
+    normalized = name.strip()
+    factory = ATTENTION_BACKENDS.get(normalized)
+    if factory is None:
+        available = ", ".join(registered_attention_backend_names())
+        raise ValueError(
+            f"Invalid attention backend: {normalized!r}; registered backends: "
+            f"{available}"
+        )
+    return factory
+
+
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
     import torch

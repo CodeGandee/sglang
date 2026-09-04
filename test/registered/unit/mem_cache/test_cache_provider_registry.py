@@ -28,6 +28,8 @@ class _ConfiguratorFixture:
         self.spec_algorithm = _SpecAlgorithm()
         self.is_draft_worker = False
         self.memory_pool_config = None
+        self._native_memory_pool_config_preview = None
+        self._native_memory_pool_config_preview_input = None
         self.req_to_token_pool = None
         self.token_to_kv_pool_allocator = None
         self.device = "cuda"
@@ -54,6 +56,11 @@ class _ConfiguratorFixture:
     def _configure_attention_backend_cache_provider(self, **kwargs):
         return KVCacheConfigurator._configure_attention_backend_cache_provider(
             self, **kwargs
+        )
+
+    def preview_native_memory_pool_config(self, pre_model_load_memory):
+        return KVCacheConfigurator.preview_native_memory_pool_config(
+            self, pre_model_load_memory
         )
 
     def _derive_pool_sizes(self, *, config):
@@ -186,6 +193,40 @@ class TestCacheProviderRegistry(CustomTestCase):
             result.token_to_kv_pool,
             fixture.builtin_pools.token_to_kv_pool,
         )
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.get_available_gpu_memory",
+        return_value=100.0,
+    )
+    def test_provider_preview_is_reused_by_builtin_allocation(self, _):
+        previews = []
+
+        @register_attention_backend_cache_provider("fixture")
+        def provider(configurator, *, pre_model_load_memory):
+            previews.append(
+                configurator.preview_native_memory_pool_config(
+                    pre_model_load_memory
+                )
+            )
+            return None
+
+        fixture = _ConfiguratorFixture(("fixture",))
+        result = KVCacheConfigurator.configure(fixture, pre_model_load_memory=10)
+
+        self.assertEqual(
+            [name for name, _ in fixture.builtin_calls],
+            ["resolve", "derive", "init"],
+        )
+        self.assertIs(previews[0], fixture.builtin_config)
+        self.assertIs(result.memory_pool_config, previews[0])
+
+    def test_native_pool_preview_rejects_changed_memory_input(self):
+        fixture = _ConfiguratorFixture(("triton",))
+        first = fixture.preview_native_memory_pool_config(10)
+
+        self.assertIs(first, fixture.preview_native_memory_pool_config(10))
+        with self.assertRaisesRegex(RuntimeError, "preview input changed"):
+            fixture.preview_native_memory_pool_config(11)
 
     def test_conflicting_split_backend_providers_are_rejected(self):
         register_attention_backend_cache_provider("prefill")(

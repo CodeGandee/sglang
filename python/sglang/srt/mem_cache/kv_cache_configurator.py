@@ -237,6 +237,12 @@ class KVCacheConfigurator:
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
+    _native_memory_pool_config_preview: Optional[MemoryPoolConfig] = field(
+        init=False, default=None, repr=False
+    )
+    _native_memory_pool_config_preview_input: Optional[int] = field(
+        init=False, default=None, repr=False
+    )
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     mambaish_config: Optional[Any] = field(init=False)
@@ -309,7 +315,7 @@ class KVCacheConfigurator:
             ), "Draft worker requires memory_pool_config"
             config = self.memory_pool_config
         else:
-            config = self._resolve_memory_pool_config(pre_model_load_memory)
+            config = self.preview_native_memory_pool_config(pre_model_load_memory)
 
         sizes = self._derive_pool_sizes(config=config)
 
@@ -1993,6 +1999,30 @@ class KVCacheConfigurator:
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
         return config
+
+    def preview_native_memory_pool_config(
+        self, pre_model_load_memory: int
+    ) -> MemoryPoolConfig:
+        """Resolve the native pool plan once so a lazy provider can inspect it.
+
+        A cache provider may need the exact native token capacity while deciding
+        whether to decline back to SGLang's built-in pool path. Reusing this
+        object prevents a second memory probe from changing the plan between
+        provider qualification and allocation.
+        """
+
+        prior_input = self._native_memory_pool_config_preview_input
+        if prior_input is not None and prior_input != pre_model_load_memory:
+            raise RuntimeError(
+                "native memory-pool preview input changed before allocation: "
+                f"previewed={prior_input}, requested={pre_model_load_memory}"
+            )
+        if self._native_memory_pool_config_preview is None:
+            self._native_memory_pool_config_preview = self._resolve_memory_pool_config(
+                pre_model_load_memory
+            )
+            self._native_memory_pool_config_preview_input = pre_model_load_memory
+        return self._native_memory_pool_config_preview
 
     def config_from_budget(
         self, budget_bytes: int, *, cap_tokens: Optional[int] = None

@@ -4,7 +4,7 @@ import json
 
 import msgspec
 import pytest
-import sglang.kernels.selector as selector
+from sglang.kernels import selector
 from sglang.kernels.registry import KernelRegistry
 from sglang.kernels.selector import (
     KernelSelectionError,
@@ -46,6 +46,14 @@ _SM90A = PlatformInfo(
     cuda_arch_minor=0,
     device_index=2,
     architecture_name="sm90a",
+)
+_EXACT_ARCHITECTURE_FIXTURES = (
+    ("ampere", "sm80", 8, 0),
+    ("hopper", "sm90a", 9, 0),
+    ("blackwell-datacenter", "sm100a", 10, 0),
+    ("blackwell-successor", "sm103a", 10, 3),
+    ("blackwell-client", "sm120a", 12, 0),
+    ("future", "sm130a", 13, 0),
 )
 _ENVELOPE = KernelInputEnvelope(
     dtypes=frozenset({"bfloat16"}),
@@ -420,6 +428,43 @@ def test_simulated_multi_device_resolution_uses_each_operation_device(monkeypatc
         7,
         "sm100a-specialized",
     )
+
+
+def test_exact_architecture_fixtures_never_cross_dispatch_device_code(monkeypatch):
+    candidates = tuple(
+        _candidate(
+            f"{architecture}-specialized",
+            specialization=KernelSpecialization.ARCHITECTURE,
+            architectures=frozenset({architecture}),
+        )
+        for _, architecture, _, _ in _EXACT_ARCHITECTURE_FIXTURES
+    )
+    _registry(monkeypatch, *reversed(candidates))
+    identities = frozenset(candidate.identity for candidate in candidates)
+
+    for device_index, (family, architecture, major, minor) in enumerate(
+        _EXACT_ARCHITECTURE_FIXTURES
+    ):
+        platform = PlatformInfo(
+            device_type="cuda",
+            cuda_arch_major=major,
+            cuda_arch_minor=minor,
+            device_index=device_index,
+            architecture_name=architecture,
+        )
+        result = select_kernel_candidate(
+            candidates[0].op,
+            platform=platform,
+            envelope=_ENVELOPE,
+            packaged_implementation_ids=identities,
+            qualified_implementation_ids=identities,
+        )
+        assert result.selected.identity == f"{architecture}-specialized", family
+        rejected = {item.implementation_id: item.reasons for item in result.rejections}
+        for candidate in candidates:
+            if candidate.identity == result.selected.identity:
+                continue
+            assert rejected[candidate.identity] == (f"architecture:{architecture}",)
 
 
 def test_unsupported_architecture_and_envelope_report_rejections(monkeypatch):
