@@ -3646,6 +3646,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         if self.model_path.lower() in ["none", "dummy"]:
+            self._validate_attention_backend_config_ownership()
             return
 
         self._handle_model_source_paths()
@@ -3812,6 +3813,19 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+        self._validate_attention_backend_config_ownership()
+
+    def _validate_attention_backend_config_ownership(self):
+        """Validate opaque config after the attention route becomes immutable."""
+
+        from sglang.srt.arg_groups.attention_backend_config import (
+            validate_attention_backend_config,
+        )
+
+        validate_attention_backend_config(
+            self.attention_backend_config,
+            self.get_attention_backends(),
+        )
 
     def _handle_moe_runner_backend_alias(self):
         if self.moe_runner_backend != "megamoe":
