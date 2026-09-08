@@ -78,7 +78,6 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-from sglang.srt.mem_cache.cache_lifecycle import CacheTerminalReason
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -483,16 +482,6 @@ class TreeCacheNamespace(SimpleNamespace):
     def evict(self, params: EvictParams):
         pass
 
-    def available_and_evictable_str(self) -> str:
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        return (
-            f"Available tokens: {available_size} "
-            f"(available_size={available_size} + evictable_size=0)\n"
-        )
-
-    def pretty_print(self) -> str:
-        return ""
-
 
 @torch.no_grad
 def extend(reqs, model_runner):
@@ -582,13 +571,7 @@ class _TorchBenchRunner:
         return decode(next_token_ids, batch, self.torch_runner)
 
     def cleanup(self, batch):
-        for req in batch.reqs:
-            if req.req_pool_idx is not None:
-                self.torch_runner.req_to_token_pool.free(
-                    req,
-                    terminal_reason=CacheTerminalReason.COMPLETION,
-                    terminal_detail="one-batch benchmark cleanup",
-                )
+        pass
 
     def synchronize(self):
         synchronize(self.torch_runner.device)

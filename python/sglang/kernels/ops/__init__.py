@@ -32,7 +32,6 @@ _GROUPS = (
     "moe",
     "quantization",
     "sampling",
-    "shadowkv",
     "speculative",
     "lplb",
     "kv_canary",

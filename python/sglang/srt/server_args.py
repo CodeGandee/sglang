@@ -40,9 +40,6 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.arg_groups.attention_backend_config import (
-    parse_attention_backend_config,
-)
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     mamba_extra_buffer_lazy_of,
@@ -396,9 +393,7 @@ def add_quantization_method_choices(choices):
 
 
 def add_attention_backend_choices(choices):
-    for choice in choices:
-        if choice not in ATTENTION_BACKEND_CHOICES:
-            ATTENTION_BACKEND_CHOICES.append(choice)
+    ATTENTION_BACKEND_CHOICES.extend(choices)
 
 
 def add_chunked_prefix_cache_attention_backend(backend_name):
@@ -1706,18 +1701,6 @@ class ServerArgs:
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
             resolvable=True,
-        ),
-        NS("exec.kernel"),
-    ] = None
-    attention_backend_config: A[
-        Optional[Dict[str, Any]],
-        Arg(
-            help=(
-                "Opaque attention-backend configuration as an inline JSON object "
-                "or @path to a JSON file. SGLang validates JSON structure; the "
-                "selected backend validates its own keys."
-            ),
-            type_parser=parse_attention_backend_config,
         ),
         NS("exec.kernel"),
     ] = None
@@ -3646,7 +3629,6 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         if self.model_path.lower() in ["none", "dummy"]:
-            self._validate_attention_backend_config_ownership()
             return
 
         self._handle_model_source_paths()
@@ -3813,19 +3795,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
-        self._validate_attention_backend_config_ownership()
-
-    def _validate_attention_backend_config_ownership(self):
-        """Validate opaque config after the attention route becomes immutable."""
-
-        from sglang.srt.arg_groups.attention_backend_config import (
-            validate_attention_backend_config,
-        )
-
-        validate_attention_backend_config(
-            self.attention_backend_config,
-            self.get_attention_backends(),
-        )
 
     def _handle_moe_runner_backend_alias(self):
         if self.moe_runner_backend != "megamoe":

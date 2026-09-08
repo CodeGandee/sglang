@@ -219,9 +219,8 @@ class LlamaAttention(nn.Module):
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        pre_rope_key = self.attn.capture_pre_rope_key(k)
         q, k = self.rotary_emb(positions, q, k)
-        return q, k, v, pre_rope_key
+        return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -236,7 +235,7 @@ class LlamaAttention(nn.Module):
             self.head_dim,
             is_neox_style=self.rotary_emb.is_neox_style,
         )
-        return q, k, v, None
+        return q, k, v
 
     def forward(
         self,
@@ -249,27 +248,18 @@ class LlamaAttention(nn.Module):
             or not hasattr(self.rotary_emb, "get_cos_sin_with_position")
             or forward_batch.forward_mode.is_extend()
         ):
-            q, k, v, pre_rope_key = self.forward_prepare_native(
+            q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
             )
         else:
-            q, k, v, pre_rope_key = self.forward_prepare_npu(
+            q, k, v = self.forward_prepare_npu(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
 
-        if pre_rope_key is None:
-            attn_output = self.attn(q, k, v, forward_batch)
-        else:
-            attn_output = self.attn(
-                q,
-                k,
-                v,
-                forward_batch,
-                pre_rope_key=pre_rope_key,
-            )
+        attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 

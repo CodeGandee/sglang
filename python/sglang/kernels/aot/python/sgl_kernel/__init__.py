@@ -12,13 +12,11 @@ else:
     from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
     from sgl_kernel.load_utils import (
         _load_architecture_specific_ops,
-        _load_optional_shadowkv_ops,
         _preload_cuda_library,
     )
 
     # Initialize the ops library based on current GPU
     common_ops = _load_architecture_specific_ops()
-    shadowkv_ops = _load_optional_shadowkv_ops()
 
     # Preload the CUDA library to avoid the issue of libcudart.so.12 not found
     if torch.version.cuda is not None:
@@ -110,31 +108,6 @@ else:
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
-
-    def shadowkv_kernels_available():
-        """Return whether all optional ShadowKV native operators are loaded."""
-
-        return shadowkv_ops is not None and all(
-            hasattr(torch.ops.sgl_kernel, name)
-            for name in (
-                "shadowkv_reconstruct_generic_aot_v1",
-                "shadowkv_reconstruct_rope_generic_aot_v1",
-                "shadowkv_plan_reuse_generic_aot_v1",
-                "shadowkv_packed_gqa_generic_aot_v1",
-            )
-        )
-
-    # A disabled wheel retains the availability probe for callers that inspect
-    # optional features. It must not import the provider wrapper or publish
-    # callable ShadowKV operations when the containing extension is absent.
-    if shadowkv_ops is not None:
-        from sgl_kernel.shadowkv import (
-            ShadowKVReusePlan,
-            shadowkv_packed_gqa,
-            shadowkv_plan_reuse,
-            shadowkv_reconstruct,
-            shadowkv_reconstruct_rope,
-        )
     from sgl_kernel.speculative import (
         assign_draft_cache_locs_contiguous_cpu,
         assign_extend_cache_locs_cpu,
@@ -216,10 +189,6 @@ else:
         "rmsnorm",
         "rotary_embedding",
         "segment_packbits",
-        "shadowkv_plan_reuse",
-        "shadowkv_packed_gqa",
-        "shadowkv_reconstruct",
-        "shadowkv_reconstruct_rope",
         "sgl_per_token_group_quant_8bit",
         "sgl_per_token_group_quant_fp8",
         "sgl_per_token_group_quant_int8",

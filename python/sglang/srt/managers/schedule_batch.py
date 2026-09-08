@@ -97,10 +97,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
-from sglang.srt.mem_cache.cache_lifecycle import (
-    CacheBatchMutationKind,
-    CacheTerminalReason,
-)
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     evict_from_tree_cache,
@@ -1918,7 +1914,6 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-    terminal_reason: CacheTerminalReason = CacheTerminalReason.RETRACTION,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
@@ -1936,12 +1931,7 @@ def release_req(
             get_disagg().disaggregation_decode_retraction_backup,
         )
     # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(
-        req,
-        tree_cache,
-        is_insert=False,
-        terminal_reason=terminal_reason,
-    )
+    release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -2640,7 +2630,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
-        self.req_to_token_pool.publish_cache_allocations(self.reqs)
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
@@ -2860,13 +2849,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(
-                last_idx,
-                0,
-                server_args,
-                offload_kv=False,
-                terminal_reason=CacheTerminalReason.ABORT,
-            )
+            self.release_req(last_idx, 0, server_args, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2927,7 +2910,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         remaing_req_count: int,
         server_args: ServerArgs,
         offload_kv: bool = True,
-        terminal_reason: CacheTerminalReason = CacheTerminalReason.RETRACTION,
     ):
         release_req(
             req=self.reqs[idx],
@@ -2938,7 +2920,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
-            terminal_reason=terminal_reason,
         )
 
     def prepare_encoder_info_decode(self):
@@ -3164,10 +3145,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.reqs = []
             self.return_hidden_states = False
             self.return_hidden_states_mode = CaptureHiddenMode.NULL
-            if self.req_to_token_pool is not None:
-                self.req_to_token_pool.notify_cache_batch_mutation(
-                    CacheBatchMutationKind.FILTER, self.reqs
-                )
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -3229,10 +3206,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 new_indices_cpu=keep_indices,
-            )
-        if self.req_to_token_pool is not None:
-            self.req_to_token_pool.notify_cache_batch_mutation(
-                CacheBatchMutationKind.FILTER, self.reqs
             )
 
     def merge_batch(self, other: ScheduleBatch):
@@ -3300,10 +3273,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
-        if self.req_to_token_pool is not None:
-            self.req_to_token_pool.notify_cache_batch_mutation(
-                CacheBatchMutationKind.MERGE, self.reqs
-            )
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.

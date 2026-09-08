@@ -9,7 +9,7 @@ never imports ``torch`` or a kernel backend.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
 
 from sglang.kernels.spec import KernelBackend, KernelSpec
 
@@ -25,18 +25,16 @@ class KernelRegistry:
 
         Re-registering an identical spec is idempotent so that module reloads
         during tests remain safe. A different spec for the same ``(op,
-        implementation_id)`` pair is rejected because silently replacing it
-        makes selection depend on import order. Legacy specs derive their
-        implementation identity from the backend, which preserves the former
-        one-implementation-per-backend behavior.
+        backend)`` pair is rejected because silently replacing it makes the
+        selected implementation depend on import order.
         """
         existing = self._by_op[spec.op]
         for other in existing:
-            if other.identity == spec.identity:
+            if other.backend == spec.backend:
                 if other != spec:
                     raise ValueError(
                         f"Conflicting kernel registration for op {spec.op!r}, "
-                        f"implementation {spec.identity!r}: "
+                        f"backend {spec.backend.value!r}: "
                         f"{other.target!r} != {spec.target!r}"
                     )
                 return spec
@@ -50,29 +48,12 @@ class KernelRegistry:
     def get_backend(self, op: str, backend: KernelBackend) -> KernelSpec:
         """The spec for ``op`` provided by ``backend``.
 
-        Raises ``KeyError`` if no such implementation is registered and
-        ``ValueError`` when several implementation identities share the
-        provider. Call :meth:`get_implementation` in the ambiguous case.
+        Raises ``KeyError`` if no such implementation is registered.
         """
-        matches = [spec for spec in self._by_op.get(op, ()) if spec.backend == backend]
-        if not matches:
-            raise KeyError(f"No '{backend.value}' backend registered for op {op!r}")
-        if len(matches) != 1:
-            identities = sorted(spec.identity for spec in matches)
-            raise ValueError(
-                f"Backend {backend.value!r} is ambiguous for op {op!r}: "
-                f"implementations {identities}; select an implementation_id"
-            )
-        return matches[0]
-
-    def get_implementation(self, op: str, implementation_id: str) -> KernelSpec:
-        """Return the uniquely identified implementation for ``op``."""
         for spec in self._by_op.get(op, ()):
-            if spec.identity == implementation_id:
+            if spec.backend == backend:
                 return spec
-        raise KeyError(
-            f"No implementation {implementation_id!r} registered for op {op!r}"
-        )
+        raise KeyError(f"No '{backend.value}' backend registered for op {op!r}")
 
     def has(self, op: str) -> bool:
         return bool(self._by_op.get(op))
@@ -86,14 +67,6 @@ class KernelRegistry:
         for op in self.ops():
             specs.extend(self._by_op[op])
         return specs
-
-    def inventory(self, op: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Return deterministic metadata records without loading providers."""
-        specs = self.get(op) if op is not None else self.all_specs()
-        return [
-            spec.inventory_record()
-            for spec in sorted(specs, key=lambda item: (item.op, item.identity))
-        ]
 
 
 # Process-wide registry. Group packages register into this instance on import.

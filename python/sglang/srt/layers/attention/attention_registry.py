@@ -32,38 +32,11 @@ ATTENTION_BACKENDS = {}
 
 
 def register_attention_backend(name):
-    normalized = name.strip()
-    if not normalized:
-        raise ValueError("attention backend name must not be empty")
-
     def decorator(fn):
-        existing = ATTENTION_BACKENDS.get(normalized)
-        if existing is not None and existing is not fn:
-            raise ValueError(f"attention backend {normalized!r} is already registered")
-        ATTENTION_BACKENDS[normalized] = fn
+        ATTENTION_BACKENDS[name] = fn
         return fn
 
     return decorator
-
-
-def registered_attention_backend_names() -> tuple[str, ...]:
-    """Return backend identities without constructing or importing a provider."""
-
-    return tuple(sorted(ATTENTION_BACKENDS))
-
-
-def resolve_attention_backend_factory(name):
-    """Resolve one registered constructor through the supported registry API."""
-
-    normalized = name.strip()
-    factory = ATTENTION_BACKENDS.get(normalized)
-    if factory is None:
-        available = ", ".join(registered_attention_backend_names())
-        raise ValueError(
-            f"Invalid attention backend: {normalized!r}; registered backends: "
-            f"{available}"
-        )
-    return factory
 
 
 @register_attention_backend("flashinfer")

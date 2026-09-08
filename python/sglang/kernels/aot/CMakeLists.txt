@@ -3,7 +3,6 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 
 # utils
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/shadowkv.cmake)
 include(FetchContent)
 
 # CMake
@@ -186,7 +185,6 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SG
 option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
-option(SGL_KERNEL_ENABLE_SHADOWKV         "Build optional SM80 or SM100a ShadowKV kernels" OFF)
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -339,12 +337,6 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
-sgl_configure_shadowkv_sources(
-    SHADOWKV_GENERIC_SOURCES
-    SHADOWKV_BINDING_SOURCES
-    SHADOWKV_SPECIALIZED_SOURCES
-)
-
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
@@ -404,28 +396,6 @@ if(SGL_KERNEL_BUILD_SM90_VARIANT)
 endif()
 if(SGL_KERNEL_BUILD_SM100_VARIANT)
     target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
-endif()
-
-# ======================= Optional ShadowKV Build =========================== #
-# Keep implementation-specific schemas and target-scoped CUDA sources outside
-# common_ops so adding one specialization does not alter unrelated operators.
-if(SGL_KERNEL_ENABLE_SHADOWKV)
-    Python_add_library(
-        shadowkv_ops
-        MODULE
-        USE_SABI ${SKBUILD_SABI_VERSION}
-        WITH_SOABI
-        ${SHADOWKV_BINDING_SOURCES}
-        ${SHADOWKV_GENERIC_SOURCES}
-        ${SHADOWKV_SPECIALIZED_SOURCES}
-    )
-    target_compile_options(shadowkv_ops PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
-    )
-    target_compile_definitions(shadowkv_ops PRIVATE SGL_KERNEL_ENABLE_SHADOWKV=1)
-    target_include_directories(shadowkv_ops PRIVATE ${INCLUDES})
-    target_link_libraries(shadowkv_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
-    install(TARGETS shadowkv_ops LIBRARY DESTINATION sgl_kernel)
 endif()
 
 # sparse flash attention
