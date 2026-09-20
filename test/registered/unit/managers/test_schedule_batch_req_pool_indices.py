@@ -16,12 +16,23 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # no
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _make_req(req_pool_idx, origin_input_ids, output_ids):
+def _make_req(
+    req_pool_idx,
+    origin_input_ids,
+    output_ids,
+    *,
+    return_logprob=False,
+    token_ids_logprob=None,
+):
     return types.SimpleNamespace(
         req_pool_idx=req_pool_idx,
         origin_input_ids=origin_input_ids,
         output_ids=output_ids,
-        return_logprob=False,
+        return_logprob=return_logprob,
+        logprob=types.SimpleNamespace(
+            top_logprobs_num=0,
+            token_ids_logprob=token_ids_logprob,
+        ),
         grammar=None,
         return_hidden_states=False,
         return_hidden_states_mode=CaptureHiddenMode.NULL,
@@ -65,6 +76,51 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         self.assertTrue(
             torch.equal(batch.req_pool_indices_cpu, batch.req_pool_indices.cpu())
         )
+
+    def test_build_hisparse_decode_batch_preserves_requested_token_logprob_ids(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.device = "cpu"
+        scheduler.req_to_token_pool = types.SimpleNamespace(device="cpu")
+        scheduler.token_to_kv_pool_allocator = None
+        scheduler.tree_cache = None
+        scheduler.model_config = types.SimpleNamespace(
+            is_encoder_decoder=False, vocab_size=32
+        )
+        scheduler.enable_overlap = False
+        scheduler.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)
+        scheduler.future_map = MagicMock()
+
+        requests = (
+            _make_req(
+                req_pool_idx=4,
+                origin_input_ids=[1, 2, 3],
+                output_ids=[7],
+                return_logprob=True,
+                token_ids_logprob=None,
+            ),
+            _make_req(
+                req_pool_idx=9,
+                origin_input_ids=[1, 2],
+                output_ids=[8],
+                return_logprob=True,
+                token_ids_logprob=[3, 5],
+            ),
+            _make_req(
+                req_pool_idx=12,
+                origin_input_ids=[6],
+                output_ids=[9],
+                return_logprob=True,
+                token_ids_logprob=[],
+            ),
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
+            return_value=MagicMock(),
+        ):
+            batch = scheduler._build_hisparse_decode_batch(list(requests))
+
+        self.assertEqual(batch.token_ids_logprobs, [None, [3, 5], []])
 
 
 class TestHisparseCoordinatorReqPoolCpu(unittest.TestCase):
