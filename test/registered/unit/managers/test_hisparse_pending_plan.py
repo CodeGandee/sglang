@@ -121,6 +121,229 @@ def _coordinator() -> HiSparseCoordinator:
 
 class TestHiSparsePendingPlan(unittest.TestCase):
     @staticmethod
+    def _predictive_device_coordinator() -> SimpleNamespace:
+        device = torch.device("cuda")
+        capacity = 2
+        row_width = 576
+        layer_count = 10
+        host_rows = 8
+        physical_rows = 16
+        physical_locs = [9, 7, 3, 5, 11]
+        initial_tokens = [0, 1, 2, 3]
+        coordinator = _coordinator()
+        host_layers: list[torch.Tensor] = []
+        device_layers: list[torch.Tensor] = []
+        for layer_id in range(layer_count):
+            host = torch.empty(
+                (host_rows, 1, row_width),
+                dtype=torch.bfloat16,
+                device="cpu",
+                pin_memory=True,
+            )
+            for row in range(host_rows):
+                host[row].fill_(layer_id * 16 + row)
+            resident = torch.full(
+                (physical_rows, 1, row_width),
+                -900 - layer_id,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            host_layers.append(host)
+            device_layers.append(resident)
+
+        coordinator.device = str(device)
+        coordinator.top_k = capacity
+        coordinator.device_buffer_size = 4
+        coordinator.swap_in_block_size = 960
+        coordinator.item_size_bytes = row_width * torch.bfloat16.itemsize
+        coordinator.num_real_reqs = torch.tensor([1], dtype=torch.int32, device=device)
+        coordinator.top_k_device_locs_buffer = torch.full(
+            (1, capacity), -1, dtype=torch.int32, device=device
+        )
+        token_template = torch.tensor(
+            [[initial_tokens + [-1]]] * layer_count,
+            dtype=torch.int32,
+            device=device,
+        )
+        location_template = torch.tensor(
+            [[physical_locs]] * layer_count,
+            dtype=torch.int32,
+            device=device,
+        )
+        lru_template = (
+            torch.arange(4, dtype=torch.int16, device=device)
+            .view(1, 1, -1)
+            .repeat(layer_count, 1, 1)
+            .contiguous()
+        )
+        coordinator.req_device_buffer_tokens = token_template.clone()
+        coordinator.req_device_buffer_token_locs = location_template.clone()
+        coordinator.lru_slots = lru_template.clone()
+        coordinator.req_to_host_pool = torch.arange(
+            host_rows, dtype=torch.int64, device=device
+        ).view(1, -1)
+        coordinator._miss_src = torch.zeros(
+            (1, capacity), dtype=torch.int64, device=device
+        )
+        coordinator._miss_dst = torch.zeros(
+            (1, capacity), dtype=torch.int32, device=device
+        )
+        coordinator._miss_count = torch.zeros(1, dtype=torch.int32, device=device)
+        coordinator._prefetch_events = [torch.cuda.Event() for _ in range(3)]
+        coordinator.prefetch_stream = torch.cuda.Stream()
+        coordinator.write_staging_stream = torch.cuda.Stream()
+        coordinator.decode_backup_stream = torch.cuda.Stream()
+        coordinator._backup_done_event = torch.cuda.Event()
+        coordinator._has_pending_backup = False
+        coordinator._prefetch_copy_blocks = 4
+        coordinator.mem_pool_host = SimpleNamespace(kv_buffer=host_layers)
+        coordinator.mem_pool_device = SimpleNamespace(
+            kv_buffer=device_layers,
+            get_kv_size_bytes=lambda: sum(tensor.nbytes for tensor in device_layers),
+        )
+        coordinator.is_dsv4_hisparse = False
+        coordinator.skip_io = False
+        coordinator.enable_prefetch = True
+        coordinator._overlap_enabled = False
+        coordinator._enable_prediction_staging(0, predictive_overlap=True)
+
+        request = SimpleNamespace(req_pool_idx=0, rid="predictive-device")
+        native_identity = _HiSparseRequestIdentity(0, 7, id(request))
+        project_identity = SimpleNamespace(
+            request_id=request.rid,
+            request_pool_index=0,
+            generation=19,
+        )
+        coordinator._split_generation = native_identity.generation
+        coordinator._split_requests = {0: native_identity}
+        coordinator._split_step_request = native_identity
+        coordinator._split_next_request = None
+        coordinator._split_aborted_generation = None
+        coordinator._split_step = 4
+        coordinator._split_anchor_index = 2
+        coordinator._split_pending = None
+        coordinator._split_followers_seen = 0
+        coordinator._staging_slot_next = 0
+        coordinator._staging_slot_epochs = [0, 0]
+        coordinator._staging_tag_sequence = 0
+        coordinator._staging_slots_busy = [False, False]
+        coordinator._staging_active = {}
+        coordinator._staging_admitted_counts = {}
+        coordinator._staging_admission_attempted = set()
+        coordinator._staging_admission_events = []
+        coordinator._staging_device_records = {}
+        coordinator._staging_slot_stats = [
+            {
+                "slot": slot,
+                "admissions": 0,
+                "reuses": 0,
+                "retirements": 0,
+                "busy": False,
+            }
+            for slot in range(2)
+        ]
+        coordinator._staging_skipped_admissions = 0
+        coordinator._staging_generated_publications = 0
+        coordinator._staging_last_generated_positions = ()
+        coordinator._staging_pending_generated_positions = ()
+        coordinator._staging_identity = project_identity
+        coordinator._staging_target_step = 4
+        coordinator._staging_history_limit = host_rows - 1
+        coordinator._staging_request_slot = 0
+        coordinator._staging_observation_anchor_ids = (0, 1, 2, 6)
+        coordinator._staging_views = {
+            2: SimpleNamespace(
+                logical_ids=torch.tensor([6, -1], dtype=torch.int32, device=device),
+                valid_count=torch.tensor(1, dtype=torch.int32, device=device),
+            )
+        }
+        request_indices = torch.tensor([0], dtype=torch.int64, device=device)
+        coordinator._split_step_request_ptr = request_indices.data_ptr()
+        fixture = SimpleNamespace(
+            coordinator=coordinator,
+            request=request,
+            native_identity=native_identity,
+            project_identity=project_identity,
+            host_layers=host_layers,
+            device_layers=device_layers,
+            request_indices=request_indices,
+            seq_lens=torch.tensor([host_rows], dtype=torch.int32, device=device),
+            selected_tokens=torch.tensor([[6, 7]], dtype=torch.int32, device=device),
+            token_template=token_template,
+            location_template=location_template,
+            lru_template=lru_template,
+            physical_locs=physical_locs,
+            initial_tokens=initial_tokens,
+        )
+        TestHiSparsePendingPlan._reset_predictive_device_coordinator(fixture)
+        return fixture
+
+    @staticmethod
+    def _reset_predictive_device_coordinator(fixture: SimpleNamespace) -> None:
+        coordinator = fixture.coordinator
+        coordinator.req_device_buffer_tokens.copy_(fixture.token_template)
+        coordinator.req_device_buffer_token_locs.copy_(fixture.location_template)
+        coordinator.lru_slots.copy_(fixture.lru_template)
+        for layer_id, resident in enumerate(fixture.device_layers):
+            resident.fill_(-900 - layer_id)
+            for slot, token_id in enumerate(fixture.initial_tokens):
+                resident[fixture.physical_locs[slot]].copy_(
+                    fixture.host_layers[layer_id][token_id], non_blocking=True
+                )
+            resident[fixture.physical_locs[4]].copy_(
+                fixture.host_layers[layer_id][7], non_blocking=True
+            )
+        coordinator._split_anchor_index = 2
+        coordinator._split_pending = None
+        coordinator._split_followers_seen = 0
+        coordinator._split_step_request_ptr = fixture.request_indices.data_ptr()
+        coordinator._staging_slot_next = 0
+        coordinator._staging_slots_busy[:] = [False, False]
+        coordinator._staging_active.clear()
+        coordinator._staging_admitted_counts.clear()
+        coordinator._staging_admission_attempted.clear()
+        coordinator._staging_device_records.clear()
+        coordinator._staging_observation_counts.zero_()
+        coordinator._staging_identity = fixture.project_identity
+        coordinator._staging_target_step = 4
+        coordinator._staging_request_slot = 0
+        coordinator._staging_views = {
+            2: SimpleNamespace(
+                logical_ids=torch.tensor([6, -1], dtype=torch.int32, device="cuda"),
+                valid_count=torch.tensor(1, dtype=torch.int32, device="cuda"),
+            )
+        }
+        torch.cuda.current_stream().synchronize()
+
+    @staticmethod
+    def _warm_predictive_device_coordinator(fixture: SimpleNamespace) -> None:
+        coordinator = fixture.coordinator
+        prediction_ready = torch.cuda.Event()
+        prediction_ready.record(torch.cuda.current_stream())
+        coordinator._prediction_ready_event = prediction_ready
+        plan, _, _ = coordinator._stage_prediction_rows(2)
+        if plan is None:
+            raise AssertionError("predictive warm-up did not acquire a stage lease")
+        coordinator.swap_in_selected_pages(
+            fixture.request_indices,
+            fixture.seq_lens,
+            fixture.selected_tokens,
+            2,
+        )
+        for layer_id in (3, 4, 5):
+            coordinator.swap_in_selected_pages(
+                fixture.request_indices,
+                fixture.seq_lens,
+                fixture.selected_tokens,
+                layer_id,
+            )
+        coordinator.retire_prediction_step(fixture.project_identity, 4)
+        coordinator._speculative_stream.synchronize()
+        coordinator.prefetch_stream.synchronize()
+        torch.cuda.current_stream().synchronize()
+        TestHiSparsePendingPlan._reset_predictive_device_coordinator(fixture)
+
+    @staticmethod
     def _bindable_staging_coordinator() -> tuple[
         HiSparseCoordinator, SimpleNamespace, SimpleNamespace
     ]:
@@ -1048,6 +1271,159 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         self.assertGreaterEqual(sum(row["reuses"] for row in runtime["slot_stats"]), 1)
         self.assertGreaterEqual(
             sum(row["retirements"] for row in runtime["slot_stats"]), 1
+        )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None,
+        "CUDA is required for predictive urgent-independence coverage",
+    )
+    def test_predictive_urgent_repair_and_native_followers_progress_while_stage_is_delayed(
+        self,
+    ) -> None:
+        fixture = self._predictive_device_coordinator()
+        self._warm_predictive_device_coordinator(fixture)
+        coordinator = fixture.coordinator
+
+        delayed = torch.cuda.Stream()
+        gate = torch.cuda.Event()
+        with torch.cuda.stream(delayed):
+            torch.cuda._sleep(100_000_000)
+            gate.record(delayed)
+        delayed_tail = torch.cuda.Event()
+        delayed_tail.record(delayed)
+
+        coordinator._prediction_ready_event = gate
+        staged, _, _ = coordinator._stage_prediction_rows(2)
+        self.assertIsNotNone(staged)
+
+        real_table = coordinator.swap_in_selected_pages(
+            fixture.request_indices,
+            fixture.seq_lens,
+            fixture.selected_tokens,
+            2,
+        )
+        tables = {2: real_table.clone()}
+        observed = {
+            2: fixture.device_layers[2][real_table[0].long()].clone(),
+        }
+        for layer_id in (3, 4, 5):
+            table = coordinator.swap_in_selected_pages(
+                fixture.request_indices,
+                fixture.seq_lens,
+                fixture.selected_tokens,
+                layer_id,
+            )
+            tables[layer_id] = table.clone()
+            observed[layer_id] = fixture.device_layers[layer_id][
+                table[0].long()
+            ].clone()
+        urgent_done = coordinator._urgent_done_event
+        if urgent_done is None:
+            raise AssertionError("predictive coordinator did not create U event")
+        urgent_done.synchronize()
+        for layer_id in (3, 4, 5):
+            coordinator._prefetch_events[
+                coordinator._prefetch_slot[layer_id]
+            ].synchronize()
+        self.assertTrue(urgent_done.query())
+        self.assertFalse(delayed_tail.query())
+
+        expected_table = torch.tensor([9, 11], dtype=torch.int32, device="cuda")
+        for layer_id in (2, 3, 4, 5):
+            self.assertTrue(torch.equal(tables[layer_id][0], expected_table))
+            expected = torch.stack(
+                [fixture.host_layers[layer_id][6], fixture.host_layers[layer_id][7]]
+            )
+            self.assertTrue(
+                torch.equal(observed[layer_id].cpu(), expected),
+                f"layer {layer_id} consumed another layer's or poisoned bytes",
+            )
+
+        coordinator.retire_prediction_step(fixture.project_identity, 4)
+        torch.cuda.current_stream().synchronize()
+        delayed_tail.synchronize()
+        self.assertEqual(coordinator._staging_slots_busy, [False, False])
+        self.assertGreaterEqual(
+            sum(stats["retirements"] for stats in coordinator._staging_slot_stats),
+            1,
+        )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None,
+        "CUDA is required for predictive cancellation coverage",
+    )
+    def test_predictive_cancellation_drains_owned_streams_before_slot_reuse(
+        self,
+    ) -> None:
+        fixture = self._predictive_device_coordinator()
+        self._warm_predictive_device_coordinator(fixture)
+        coordinator = fixture.coordinator
+        sentinel_targets = {
+            name: torch.full((256,), -1, dtype=torch.int32, device="cuda")
+            for name in ("C", "U", "N", "P", "backup", "write_staging")
+        }
+        stream_by_name = {
+            "C": torch.cuda.current_stream(),
+            "U": coordinator._urgent_stream,
+            "N": coordinator.prefetch_stream,
+            "P": coordinator._speculative_stream,
+            "backup": coordinator.decode_backup_stream,
+            "write_staging": coordinator.write_staging_stream,
+        }
+        completion_events: dict[str, torch.cuda.Event] = {}
+        for name, stream in stream_by_name.items():
+            event = (
+                coordinator._backup_done_event
+                if name == "backup"
+                else torch.cuda.Event(enable_timing=False)
+            )
+            with torch.cuda.stream(stream):
+                sentinel_targets[name].fill_(0)
+                event.record(stream)
+            completion_events[name] = event
+        for stream in stream_by_name.values():
+            stream.synchronize()
+
+        prediction_ready = torch.cuda.Event()
+        prediction_ready.record(torch.cuda.current_stream())
+        coordinator._prediction_ready_event = prediction_ready
+        staged, _, _ = coordinator._stage_prediction_rows(2)
+        self.assertIsNotNone(staged)
+
+        for name, stream in stream_by_name.items():
+            event = completion_events[name]
+            with torch.cuda.stream(stream):
+                torch.cuda._sleep(100_000_000)
+                sentinel_targets[name].fill_(17)
+                event.record(stream)
+        coordinator._has_pending_backup = True
+
+        for name, event in completion_events.items():
+            self.assertFalse(event.query(), f"{name} stream completed before abort")
+        coordinator.abort_split_materialization(safe_to_reuse=True)
+        for event in completion_events.values():
+            self.assertTrue(event.query())
+        self.assertEqual(coordinator._staging_slots_busy, [False, False])
+        self.assertEqual(coordinator._staging_active, {})
+        self.assertTrue(coordinator.split_worker_reusable)
+
+        for target in sentinel_targets.values():
+            target.fill_(29)
+        torch.cuda.current_stream().synchronize()
+        for name, target in sentinel_targets.items():
+            self.assertTrue(
+                torch.equal(target, torch.full_like(target, 29)),
+                f"{name} stream wrote after cancellation reuse",
+            )
+
+        replacement = SimpleNamespace(req_pool_idx=0)
+        coordinator._split_generation = fixture.native_identity.generation
+        coordinator._split_requests = {}
+        coordinator._assert_can_activate_split_request(replacement)
+        coordinator._activate_split_request(replacement)
+        self.assertEqual(
+            coordinator._split_requests[0].generation,
+            fixture.native_identity.generation + 1,
         )
 
 
