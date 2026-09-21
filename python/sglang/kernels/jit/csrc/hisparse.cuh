@@ -8,6 +8,10 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#ifndef USE_ROCM
+#include <cuda/atomic>
+#endif
+
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
@@ -1057,18 +1061,17 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_prediction_staging_kern
   }
 }
 
+#ifndef USE_ROCM
 /** Publish a lease-specific ready tag after the speculative payload writes. */
 template <int BLOCK_SIZE>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void publish_prediction_staging_ready_kernel(
     int64_t* __restrict__ ready_tag,
     int64_t expected_tag) {
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  // The copy and metadata kernels are submitted before this kernel on the
-  // same stream.  The device fence makes those writes visible before the
-  // acquire snapshot used by the urgent resolver.
-  __threadfence();
-  atomicExch(reinterpret_cast<unsigned long long*>(ready_tag),
-             static_cast<unsigned long long>(expected_tag));
+  // Earlier kernels on this stream finish payload and metadata writes before
+  // this release. The resolver's device-scope acquire publishes both together.
+  cuda::atomic_ref<int64_t, cuda::thread_scope_device> tag(*ready_tag);
+  tag.store(expected_tag, cuda::memory_order_release);
 }
 
 /** Tagged resolver variant used by the asynchronous predictive path. */
@@ -1088,19 +1091,20 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_prediction_staging_read
     int64_t* __restrict__ repair_src,
     int32_t* __restrict__ repair_dst,
     int32_t* __restrict__ repair_count) {
-  // An atomic compare/exchange with an identical zero value gives one device
-  // snapshot without a plain load racing the producer's atomic publication.
-  // A stale or unpublished tag intentionally resolves as host repair.
-  const auto observed = atomicCAS(
-      reinterpret_cast<unsigned long long*>(const_cast<int64_t*>(ready_tag)),
-      0ull, 0ull);
-  const bool stage_ready = observed == static_cast<unsigned long long>(expected_tag);
+  // One CTA takes exactly one readiness snapshot for the whole real miss plan.
+  // A stale/unpublished tag never permits even a metadata read from the lease.
+  __shared__ int32_t staged_rows;
+  if (threadIdx.x == 0) {
+    cuda::atomic_ref<int64_t, cuda::thread_scope_device> tag(
+        *const_cast<int64_t*>(ready_tag));
+    const bool stage_ready = tag.load(cuda::memory_order_acquire) == expected_tag;
+    staged_rows = stage_ready
+        ? max(0, min(staged_count[0], static_cast<int32_t>(capacity)))
+        : 0;
+  }
+  __syncthreads();
   const int32_t real_misses = max(0, min(miss_count[0], static_cast<int32_t>(capacity)));
-  const int32_t staged_rows = stage_ready
-      ? max(0, min(staged_count[0], static_cast<int32_t>(capacity)))
-      : 0;
-  for (int32_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < real_misses;
-       i += gridDim.x * BLOCK_SIZE) {
+  for (int32_t i = threadIdx.x; i < real_misses; i += BLOCK_SIZE) {
     int32_t stage_position = -1;
     for (int32_t staged = 0; staged < staged_rows; ++staged) {
       if (staged_host_locs[staged] == miss_src[i]) {
@@ -1119,6 +1123,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_prediction_staging_read
     }
   }
 }
+#endif  // !USE_ROCM
 
 /** Launch fixed-capacity staged-promotion versus host-repair resolution. */
 template <int BLOCK_SIZE>
@@ -1170,11 +1175,13 @@ void resolve_prediction_staging_ready(
     tvm::ffi::TensorView repair_src,
     tvm::ffi::TensorView repair_dst,
     tvm::ffi::TensorView repair_count) {
+#ifdef USE_ROCM
+  throw std::runtime_error("Predictive ready-tag resolution requires CUDA.");
+#else
   using namespace host;
   const int64_t capacity = miss_src.shape()[1];
-  const int64_t num_blocks = (capacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
   const auto device = LaunchKernel::resolve_device(miss_src.device());
-  LaunchKernel(num_blocks, BLOCK_SIZE, device)(
+  LaunchKernel(1, BLOCK_SIZE, device)(
       resolve_prediction_staging_ready_kernel<BLOCK_SIZE>,
       static_cast<const int64_t*>(miss_src.data_ptr()),
       static_cast<const int32_t*>(miss_dst.data_ptr()),
@@ -1190,6 +1197,7 @@ void resolve_prediction_staging_ready(
       static_cast<int64_t*>(repair_src.data_ptr()),
       static_cast<int32_t*>(repair_dst.data_ptr()),
       static_cast<int32_t*>(repair_count.data_ptr()));
+#endif
 }
 
 /** Launch the device-scope ready-tag publication kernel. */
@@ -1197,12 +1205,16 @@ template <int BLOCK_SIZE>
 void publish_prediction_staging_ready(
     tvm::ffi::TensorView ready_tag,
     int64_t expected_tag) {
+#ifdef USE_ROCM
+  throw std::runtime_error("Predictive ready-tag publication requires CUDA.");
+#else
   using namespace host;
   const auto device = LaunchKernel::resolve_device(ready_tag.device());
   LaunchKernel(1, BLOCK_SIZE, device)(
       publish_prediction_staging_ready_kernel<BLOCK_SIZE>,
       static_cast<int64_t*>(ready_tag.data_ptr()),
       expected_tag);
+#endif
 }
 
 }  // namespace sglang

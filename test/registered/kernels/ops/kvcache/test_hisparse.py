@@ -1228,133 +1228,206 @@ def test_prediction_source_resolver_fails_closed_until_matching_ready_tag() -> N
 
 
 @pytest.mark.skipif(is_hip(), reason="M4.4 urgent-independence gate is CUDA-qualified.")
-def test_delayed_stage_leases_do_not_block_urgent_repair() -> None:
-    """Urgent repair completes while both predictive producers are gated.
-
-    The first real miss overlaps a row that a delayed lease will eventually
-    stage; the second miss is absent from both leases.  Neither producer may
-    write the authoritative destination, and the urgent result must match the
-    host reference before the producer gate is released.
-    """
-
-    host_cache = _host_cache()
-    item_size_bytes = ITEM_SIZE_BYTES
-    real_buffer = torch.full(
-        (8, 1, KV_DIM), -777, dtype=DTYPE, device=DEVICE
+@pytest.mark.parametrize("delay_point", ["payload", "publication"])
+def test_delayed_stage_leases_do_not_block_urgent_repair(delay_point: str) -> None:
+    """Repair both leases at native geometry without waiting for publication."""
+    capacity, kv_dim = 2048, 576
+    item_size_bytes = kv_dim * 2
+    host_cache = torch.empty(
+        (capacity * 3, 1, kv_dim), dtype=torch.bfloat16, pin_memory=True
     )
+    host_cache.copy_(
+        torch.arange(host_cache.numel(), dtype=torch.float32)
+        .remainder_(509)
+        .view_as(host_cache)
+    )
+    real_buffer = torch.full(
+        (capacity * 2 + 8, 1, kv_dim), -777, dtype=torch.bfloat16, device=DEVICE
+    )
+    reference = torch.full_like(real_buffer, -777)
+    real_at_urgent_completion = torch.empty_like(real_buffer)
     num_real_reqs = torch.tensor([1], dtype=torch.int32, device=DEVICE)
-    gate = torch.cuda.Event()
-    producer_streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    initialized, gate, urgent_done = (torch.cuda.Event() for _ in range(3))
+    producer = torch.cuda.Stream()
+    urgent = torch.cuda.Stream(priority=-1)
+    hold = torch.cuda.Stream()
     producer_done = [torch.cuda.Event(), torch.cuda.Event()]
     stage_buffers = [
-        torch.full((4, 1, KV_DIM), -999, dtype=DTYPE, device=DEVICE),
-        torch.full((4, 1, KV_DIM), -999, dtype=DTYPE, device=DEVICE),
+        torch.full((capacity, 1, kv_dim), -999, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(2)
     ]
     stage_sources = [
-        torch.tensor([[1, -1, -1, -1]], dtype=torch.int64, device=DEVICE),
-        torch.tensor([[2, -1, -1, -1]], dtype=torch.int64, device=DEVICE),
+        torch.arange(
+            i * capacity, (i + 1) * capacity, dtype=torch.int64, device=DEVICE
+        ).view(1, -1)
+        for i in range(2)
     ]
-    stage_destinations = [
-        torch.tensor([[0, -1, -1, -1]], dtype=torch.int32, device=DEVICE),
-        torch.tensor([[0, -1, -1, -1]], dtype=torch.int32, device=DEVICE),
+    stage_destinations = torch.arange(capacity, dtype=torch.int32, device=DEVICE).view(
+        1, -1
+    )
+    staged_host_locs = [source.view(-1) for source in stage_sources]
+    stage_counts = [
+        torch.tensor([capacity], dtype=torch.int32, device=DEVICE) for _ in range(2)
     ]
-    stage_counts = [torch.tensor([1], dtype=torch.int32, device=DEVICE) for _ in range(2)]
     ready_tags = [torch.zeros(1, dtype=torch.int64, device=DEVICE) for _ in range(2)]
+    ready_at_urgent_completion = [torch.empty_like(tag) for tag in ready_tags]
     expected_tags = (101, 102)
-    hold = torch.cuda.Stream()
-    with torch.cuda.stream(hold):
-        torch.cuda._sleep(10_000_000_000)
-        gate.record(hold)
+    real_sources = [
+        torch.cat(
+            (
+                source[0, : capacity // 2],
+                torch.arange(
+                    capacity * 2 + i * capacity // 2,
+                    capacity * 2 + (i + 1) * capacity // 2,
+                    dtype=torch.int64,
+                    device=DEVICE,
+                ),
+            )
+        ).view(1, -1)
+        for i, source in enumerate(stage_sources)
+    ]
+    real_destinations = [
+        torch.arange(
+            i * capacity, (i + 1) * capacity, dtype=torch.int32, device=DEVICE
+        ).view(1, -1)
+        for i in range(2)
+    ]
+    promotions = [_make_plan(1, capacity) for _ in range(2)]
+    repairs = [_make_plan(1, capacity) for _ in range(2)]
 
-    for stream, done, stage, source, destination, count, ready_tag, expected in zip(
-        producer_streams,
-        producer_done,
-        stage_buffers,
-        stage_sources,
-        stage_destinations,
-        stage_counts,
-        ready_tags,
-        expected_tags,
-    ):
-        stream.wait_event(gate)
-        with torch.cuda.stream(stream):
+    def fill_stage(slot: int) -> None:
+        copy_cache_planned_mla(
+            miss_src=stage_sources[slot],
+            miss_dst=stage_destinations,
+            miss_count=stage_counts[slot],
+            num_real_reqs=num_real_reqs,
+            host_cache=host_cache,
+            device_buffer=stage_buffers[slot],
+            item_size_bytes=item_size_bytes,
+        )
+
+    def resolve_and_copy(slot: int, epoch: int) -> None:
+        promotion_src, promotion_dst, promotion_count = promotions[slot]
+        repair_src, repair_dst, repair_count = repairs[slot]
+        resolve_prediction_staging_mla(
+            miss_src=real_sources[slot],
+            miss_dst=real_destinations[slot],
+            miss_count=stage_counts[slot],
+            staged_host_locs=staged_host_locs[slot],
+            staged_count=stage_counts[slot],
+            ready_tag=ready_tags[slot],
+            expected_tag=epoch,
+            promotion_src=promotion_src,
+            promotion_dst=promotion_dst,
+            promotion_count=promotion_count,
+            repair_src=repair_src,
+            repair_dst=repair_dst,
+            repair_count=repair_count,
+        )
+        for source, destination, count, source_buffer in (
+            (*promotions[slot], stage_buffers[slot]),
+            (*repairs[slot], host_cache),
+        ):
             copy_cache_planned_mla(
                 miss_src=source,
                 miss_dst=destination,
                 miss_count=count,
                 num_real_reqs=num_real_reqs,
-                host_cache=host_cache,
-                device_buffer=stage,
-                item_size_bytes=item_size_bytes,
-            )
-            publish_prediction_staging_ready_mla(
-                ready_tag=ready_tag,
-                expected_tag=expected,
-            )
-            done.record(stream)
-
-    urgent = torch.cuda.Stream(priority=-1)
-    urgent_done = torch.cuda.Event()
-    real_misses = (
-        torch.tensor([[1, 3, -1, -1]], dtype=torch.int64, device=DEVICE),
-        torch.tensor([[2, 3, -1, -1]], dtype=torch.int64, device=DEVICE),
-    )
-    for miss_src, ready_tag, expected_tag, destination in zip(
-        real_misses,
-        ready_tags,
-        expected_tags,
-        (0, 1),
-    ):
-        miss_dst = torch.tensor(
-            [[destination, destination + 2, -1, -1]],
-            dtype=torch.int32,
-            device=DEVICE,
-        )
-        miss_count = torch.tensor([2], dtype=torch.int32, device=DEVICE)
-        promotion_src, promotion_dst, promotion_count = _make_plan(1, 4)
-        repair_src, repair_dst, repair_count = _make_plan(1, 4)
-        with torch.cuda.stream(urgent):
-            resolve_prediction_staging_mla(
-                miss_src=miss_src,
-                miss_dst=miss_dst,
-                miss_count=miss_count,
-                staged_host_locs=stage_sources[0 if expected_tag == 101 else 1][0],
-                staged_count=stage_counts[0 if expected_tag == 101 else 1],
-                ready_tag=ready_tag,
-                expected_tag=expected_tag,
-                promotion_src=promotion_src,
-                promotion_dst=promotion_dst,
-                promotion_count=promotion_count,
-                repair_src=repair_src,
-                repair_dst=repair_dst,
-                repair_count=repair_count,
-            )
-            copy_cache_planned_mla(
-                miss_src=repair_src,
-                miss_dst=repair_dst,
-                miss_count=repair_count,
-                num_real_reqs=num_real_reqs,
-                host_cache=host_cache,
+                host_cache=source_buffer,
                 device_buffer=real_buffer,
                 item_size_bytes=item_size_bytes,
             )
-    urgent_done.record(urgent)
-    urgent_done.synchronize()
 
-    # The gated payload and tags are the observable proof that neither
-    # producer has run yet.
-    assert all(int(tag.item()) == 0 for tag in ready_tags)
-    assert all(torch.all(stage == -999) for stage in stage_buffers)
-    assert torch.equal(real_buffer[0].cpu(), host_cache[1])
-    assert torch.equal(real_buffer[2].cpu(), host_cache[3])
-    assert torch.equal(real_buffer[1].cpu(), host_cache[2])
-    assert torch.equal(real_buffer[3].cpu(), host_cache[3])
+    # Initialize and warm every kernel, copy kind and event before introducing
+    # the delay. Lazy loading or device allocation after the delay can hide a
+    # dependency error by allowing the producer to finish before urgent work.
+    for slot in range(2):
+        fill_stage(slot)
+        publish_prediction_staging_ready_mla(
+            ready_tag=ready_tags[slot], expected_tag=expected_tags[slot]
+        )
+        resolve_and_copy(slot, expected_tags[slot])
+        copy_cache_planned_mla(
+            miss_src=real_sources[slot],
+            miss_dst=real_destinations[slot],
+            miss_count=stage_counts[slot],
+            num_real_reqs=num_real_reqs,
+            host_cache=host_cache,
+            device_buffer=reference,
+            item_size_bytes=item_size_bytes,
+        )
+        ready_at_urgent_completion[slot].copy_(ready_tags[slot])
+    real_at_urgent_completion.copy_(real_buffer)
+    torch.cuda._sleep(1)
+    for event in (initialized, gate, urgent_done, *producer_done):
+        event.record()
+    torch.cuda.synchronize()
+    assert torch.equal(real_buffer, reference)
+    for slot in range(2):
+        stage_buffers[slot].fill_(-999)
+        ready_tags[slot].zero_()
+    real_buffer.fill_(-777)
+    initialized.record()
+    for stream in (producer, urgent, hold):
+        stream.wait_event(initialized)
 
-    hold.synchronize()
-    for stream in producer_streams:
-        stream.synchronize()
-    assert all(done.query() for done in producer_done)
-    assert all(int(tag.item()) == expected for tag, expected in zip(ready_tags, expected_tags))
+    try:
+        with torch.cuda.stream(hold):
+            torch.cuda._sleep(1_000_000_000)
+            gate.record(hold)
+        with torch.cuda.stream(producer):
+            if delay_point == "payload":
+                producer.wait_event(gate)
+            for slot in range(2):
+                fill_stage(slot)
+            if delay_point == "publication":
+                producer.wait_event(gate)
+            for slot in range(2):
+                publish_prediction_staging_ready_mla(
+                    ready_tag=ready_tags[slot], expected_tag=expected_tags[slot]
+                )
+                producer_done[slot].record(producer)
+        with torch.cuda.stream(urgent):
+            for slot in range(2):
+                resolve_and_copy(slot, expected_tags[slot])
+                ready_at_urgent_completion[slot].copy_(ready_tags[slot])
+            real_at_urgent_completion.copy_(real_buffer)
+            urgent_done.record(urgent)
+        urgent_done.synchronize()
+        assert all(not done.query() for done in producer_done)
+    finally:
+        hold.synchronize()
+        producer.synchronize()
+        urgent.synchronize()
+
+    # Downloads happen only after the ordering assertion and scoped drains.
+    # Both delayed producers use separate destinations; their late writes must
+    # leave the complete authoritative buffer, including its guard rows, exact.
+    assert all(int(tag.item()) == 0 for tag in ready_at_urgent_completion)
+    assert torch.equal(real_at_urgent_completion, reference)
+    assert torch.equal(real_buffer, reference)
+    assert all(int(plan[2].item()) == 0 for plan in promotions)
+    assert all(int(plan[2].item()) == capacity for plan in repairs)
+
+    # The same full-capacity buffers exercise useful promotion once published,
+    # followed by immediate epoch reuse while an old ready tag remains visible.
+    for epoch_offset in (0, 100):
+        real_buffer.fill_(-777)
+        for slot in range(2):
+            resolve_and_copy(slot, expected_tags[slot] + epoch_offset)
+        torch.cuda.synchronize()
+        assert torch.equal(real_buffer, reference)
+        expected_promotions = capacity // 2 if epoch_offset == 0 else 0
+        for promotion, repair in zip(promotions, repairs):
+            promoted_count = int(promotion[2].item())
+            repaired_count = int(repair[2].item())
+            assert promoted_count == expected_promotions
+            assert repaired_count == capacity - expected_promotions
+            promoted_destinations = set(promotion[1][0, :promoted_count].cpu().tolist())
+            repaired_destinations = set(repair[1][0, :repaired_count].cpu().tolist())
+            assert len(promoted_destinations) == promoted_count
+            assert len(repaired_destinations) == repaired_count
+            assert promoted_destinations.isdisjoint(repaired_destinations)
 
 
 if __name__ == "__main__":

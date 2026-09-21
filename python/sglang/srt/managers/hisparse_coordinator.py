@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
@@ -34,6 +35,13 @@ device_module = get_device_module()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _nvtx_range(name: str, *, enabled: bool) -> AbstractContextManager[None]:
+    """Return a CUDA timeline range without affecting CPU-only execution."""
+    if enabled and hasattr(torch.cuda, "nvtx"):
+        return torch.cuda.nvtx.range(name)
+    return nullcontext()
 
 
 class HiSparseAct(NamedTuple):
@@ -70,6 +78,7 @@ class _HiSparsePendingPlan:
     miss_dst: torch.Tensor
     miss_count: torch.Tensor
     staging: "_HiSparseStagePlan | None" = None
+    plan_ready: device_module.Event | None = None
 
 
 @dataclass(frozen=True)
@@ -446,8 +455,7 @@ class HiSparseCoordinator:
             "generated_publications": self._staging_generated_publications,
             "last_generated_positions": list(self._staging_last_generated_positions),
             "admission_events": [
-                dict(event)
-                for event in getattr(self, "_staging_admission_events", [])
+                dict(event) for event in getattr(self, "_staging_admission_events", [])
             ],
         }
 
@@ -575,10 +583,10 @@ class HiSparseCoordinator:
         self._staging_request_slot = -1
         self._staging_slot_next = 0
         self._staging_slot_epochs = [0, 0]
+        self._staging_tag_sequence = 0
         self._staging_active: dict[int, _HiSparseStagePlan] = {}
-        self._staging_admitted_counts: dict[
-            int, tuple[torch.Tensor, torch.Tensor]
-        ] = {}
+        self._staging_admitted_counts: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._staging_admission_attempted: set[int] = set()
         self._staging_admission_events: list[dict[str, int | str]] = []
         self._staging_device_records: dict[int, dict[str, object]] = {}
         self._staging_slots_busy = [False, False]
@@ -607,11 +615,14 @@ class HiSparseCoordinator:
         self._speculative_stream = None
         self._urgent_stream = None
         self._overlap_compute_stream = None
+        self._overlap_nvtx_enabled = False
         self._staging_ready_tags: tuple[torch.Tensor, ...] = ()
         self._staging_producer_events: tuple[object, ...] = ()
         self._staging_reader_events: tuple[object, ...] = ()
         self._urgent_done_event = None
         self._prediction_ready_event = None
+        self._staging_step_end_event = None
+        self._overlap_timing_events: dict[str, object] = {}
         self._overlap_stream_priorities: dict[str, int] = {}
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
@@ -625,6 +636,9 @@ class HiSparseCoordinator:
             "follower_bytes": 0,
             "unused_stage_bytes": 0,
             "skipped_stage_rows": 0,
+            "urgent_execution_us": 0.0,
+            "urgent_wait_us": 0.0,
+            "retirement_tail_us": 0.0,
         }
         if staging:
             self._enable_prediction_staging(
@@ -868,6 +882,32 @@ class HiSparseCoordinator:
         self._staging_slot_events = self._staging_reader_events
         self._urgent_done_event = device_module.Event(enable_timing=False)
         self._prediction_ready_event = device_module.Event(enable_timing=False)
+        self._staging_step_end_event = device_module.Event(enable_timing=False)
+        self._overlap_nvtx_enabled = torch.device(self.device).type == "cuda"
+        if self._overlap_nvtx_enabled:
+            anchor_count = len(self._split_anchor_layers)
+            self._overlap_timing_events = {
+                "urgent": tuple(
+                    (
+                        device_module.Event(enable_timing=True),
+                        device_module.Event(enable_timing=True),
+                    )
+                    for _ in range(anchor_count)
+                ),
+                "attention_wait": tuple(
+                    (
+                        device_module.Event(enable_timing=True),
+                        device_module.Event(enable_timing=True),
+                    )
+                    for _ in range(anchor_count)
+                ),
+                "retirement": (
+                    device_module.Event(enable_timing=True),
+                    device_module.Event(enable_timing=True),
+                ),
+            }
+        else:
+            self._overlap_timing_events = {}
         self._overlap_enabled = True
 
     @property
@@ -901,7 +941,9 @@ class HiSparseCoordinator:
         matches the already-installed bundle.
         """
         if stage_slot_count != 2 or rows_per_lease != self.top_k:
-            raise RuntimeError("predictive overlap lease bounds differ from native staging")
+            raise RuntimeError(
+                "predictive overlap lease bounds differ from native staging"
+            )
         if urgent_priority != -1 or speculative_priority != 0:
             raise RuntimeError("predictive overlap stream priorities are unsupported")
         if native_exact_role != "prefetch_stream":
@@ -1011,7 +1053,9 @@ class HiSparseCoordinator:
         self._staging_views = dict(eligible_views)
         self._staging_observation_anchor_ids = self._split_anchor_layers
         self._staging_device_records = {}
+        self._staging_observation_counts.zero_()
         self._staging_admitted_counts = {}
+        self._staging_admission_attempted = set()
         self._staging_admission_events = []
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
@@ -1033,16 +1077,22 @@ class HiSparseCoordinator:
             "follower_bytes": 0,
             "unused_stage_bytes": 0,
             "skipped_stage_rows": 0,
+            "urgent_execution_us": 0.0,
+            "urgent_wait_us": 0.0,
+            "retirement_tail_us": 0.0,
         }
         # Prediction tensors are produced before the carrier traversal.  A
         # stream event captures that dependency once; ordinary decode never
         # queries a scalar readiness value on the host.
         prediction_ready_event = getattr(self, "_prediction_ready_event", None)
         if prediction_ready_event is not None:
+            self.wait_for_pending_backup()
             prediction_ready_event.record(device_module.current_stream())
+            self._stage_prediction_rows(0)
+            self._stage_prediction_rows(1)
 
     def clear_prediction_staging(self, identity: object, target_step: int) -> None:
-        """Clear the project consumer binding after the pair forward."""
+        """Join one prediction step before releasing its bank binding."""
         if not self.prediction_staging_enabled:
             return
         if (
@@ -1057,12 +1107,7 @@ class HiSparseCoordinator:
             self._staging_request_slot = -1
 
     def retire_prediction_step(self, identity: object, target_step: int) -> bool:
-        """Attempt scoped retirement after one real step has committed.
-
-        The method only queries lease-owned events and never synchronizes the
-        device.  A ``False`` result leaves the two fixed slots busy until a
-        later admission observes their producer and reader completion.
-        """
+        """Enqueue a request-scoped producer/reader join without host polling."""
         if not self.prediction_staging_enabled:
             return True
         if self._staging_identity is not None and (
@@ -1070,6 +1115,39 @@ class HiSparseCoordinator:
             or self._staging_target_step != target_step
         ):
             raise RuntimeError("predictive staging retirement identity is stale")
+        if getattr(self, "_overlap_enabled", False):
+            current = device_module.current_stream()
+            timing = self._overlap_timing_events.get("retirement")
+            with _nvtx_range(
+                "dualdecoder.retire",
+                enabled=bool(getattr(self, "_overlap_nvtx_enabled", False)),
+            ):
+                if timing is not None:
+                    timing[0].record(current)
+                # An admitted but unused plan has no stage reader. Record the
+                # absence of a future reader on C, then join both lease owners.
+                for plan in tuple(self._staging_active.values()):
+                    if plan.reader_done is not None:
+                        plan.reader_done.record(current)
+                for slot, busy in enumerate(self._staging_slots_busy):
+                    if not busy:
+                        continue
+                    producer = self._staging_producer_events[slot]
+                    reader = self._staging_reader_events[slot]
+                    current.wait_event(producer)
+                    current.wait_event(reader)
+                if timing is not None:
+                    timing[1].record(current)
+                if self._staging_step_end_event is not None:
+                    self._staging_step_end_event.record(current)
+            self._staging_active.clear()
+            self._staging_admitted_counts.clear()
+            for slot, busy in enumerate(self._staging_slots_busy):
+                if busy:
+                    self._staging_slot_stats[slot]["retirements"] += 1
+                self._staging_slot_stats[slot]["busy"] = False
+            self._staging_slots_busy[:] = [False, False]
+            return True
         self._retire_completed_staging_slots()
         return not any(self._staging_slots_busy)
 
@@ -1078,6 +1156,9 @@ class HiSparseCoordinator:
         device_module.current_stream().synchronize()
         if self.enable_prefetch:
             self.prefetch_stream.synchronize()
+        if getattr(self, "_overlap_enabled", False):
+            self._urgent_stream.synchronize()
+            self._speculative_stream.synchronize()
         self._retire_completed_staging_slots()
         anchors: dict[str, dict[str, object]] = {}
         totals = {
@@ -1087,6 +1168,9 @@ class HiSparseCoordinator:
             "follower_bytes": 0,
             "unused_stage_bytes": 0,
             "skipped_stage_rows": 0,
+            "urgent_execution_us": 0.0,
+            "urgent_wait_us": 0.0,
+            "retirement_tail_us": 0.0,
         }
         records = self._staging_device_records
         anchor_ids = self._staging_observation_anchor_ids or tuple(records)
@@ -1111,6 +1195,8 @@ class HiSparseCoordinator:
                     "follower_destination_rows": [],
                     "follower_bytes": 0,
                     "unused_stage_bytes": 0,
+                    "urgent_execution_us": 0.0,
+                    "urgent_wait_us": 0.0,
                 }
                 continue
             row = int(record["observation_row"])
@@ -1185,6 +1271,36 @@ class HiSparseCoordinator:
             receipt["stage_h2d_bytes"] = staged_count * self.item_size_bytes
             receipt["promotion_d2d_bytes"] = promoted_count * self.item_size_bytes
             receipt["repair_h2d_bytes"] = repaired_count * self.item_size_bytes
+            timing_row = self._staging_observation_rows[layer_id]
+            timing_events = getattr(self, "_overlap_timing_events", {})
+            urgent_timings = timing_events.get("urgent")
+            wait_timings = timing_events.get("attention_wait")
+            receipt["urgent_execution_us"] = (
+                max(
+                    0.0,
+                    float(
+                        urgent_timings[timing_row][0].elapsed_time(
+                            urgent_timings[timing_row][1]
+                        )
+                    )
+                    * 1000.0,
+                )
+                if urgent_timings is not None
+                else 0.0
+            )
+            receipt["urgent_wait_us"] = (
+                max(
+                    0.0,
+                    float(
+                        wait_timings[timing_row][0].elapsed_time(
+                            wait_timings[timing_row][1]
+                        )
+                    )
+                    * 1000.0,
+                )
+                if wait_timings is not None
+                else 0.0
+            )
             anchors[str(layer_id)] = receipt
             for field in totals:
                 if field == "skipped_stage_rows":
@@ -1193,16 +1309,39 @@ class HiSparseCoordinator:
                     totals[field] += int(receipt["unused_stage_bytes"])
                 elif field == "follower_bytes":
                     totals[field] += int(receipt["follower_bytes"])
+                elif field in ("urgent_execution_us", "urgent_wait_us"):
+                    totals[field] += float(receipt[field])
+                elif field == "retirement_tail_us":
+                    continue
                 else:
                     totals[field] += int(receipt.get(field, 0))
+        retirement = getattr(self, "_overlap_timing_events", {}).get("retirement")
+        if retirement is not None:
+            totals["retirement_tail_us"] = max(
+                0.0,
+                float(retirement[0].elapsed_time(retirement[1])) * 1000.0,
+            )
         self._staging_observation.update({"anchors": anchors, **totals})
 
     def _stage_prediction_rows(
         self, layer_id: int
     ) -> tuple[_HiSparseStagePlan | None, torch.Tensor, torch.Tensor]:
         """Filter one anchor and stage rows on the independent P stream."""
+        overlap = bool(getattr(self, "_overlap_enabled", False))
+        if overlap and layer_id in self._staging_admission_attempted:
+            counts = self._staging_admitted_counts.get(
+                layer_id, (self._staging_zero_count, self._staging_zero_count)
+            )
+            return self._staging_active.get(layer_id), counts[0], counts[1]
+        if overlap:
+            self._staging_admission_attempted.add(layer_id)
         view = self._staging_views.get(layer_id)
         if view is None:
+            if overlap:
+                self._staging_admitted_counts[layer_id] = (
+                    self._staging_zero_count,
+                    self._staging_zero_count,
+                )
             return None, self._staging_zero_count, self._staging_zero_count
         if not hasattr(self, "_staging_admitted_counts"):
             self._staging_admitted_counts = {}
@@ -1214,14 +1353,26 @@ class HiSparseCoordinator:
             if counts is None:
                 raise RuntimeError("staged prediction lease lost admission metadata")
             return existing, counts[0], counts[1]
-        self._retire_completed_staging_slots()
+        if not overlap:
+            self._retire_completed_staging_slots()
         slot = None
+        reclaiming = False
         for offset in range(len(self._staging_slots_busy)):
             index = (self._staging_slot_next + offset) % len(self._staging_slots_busy)
             busy = self._staging_slots_busy[index]
             if not busy:
                 slot = index
                 break
+        if slot is None and overlap:
+            active_slots = {plan.slot for plan in self._staging_active.values()}
+            for offset in range(len(self._staging_slots_busy)):
+                index = (self._staging_slot_next + offset) % len(
+                    self._staging_slots_busy
+                )
+                if index not in active_slots:
+                    slot = index
+                    reclaiming = True
+                    break
         valid_count = view.valid_count
         if slot is None:
             self._staging_skipped_admissions += 1
@@ -1233,11 +1384,20 @@ class HiSparseCoordinator:
                     "phase": self._staging_admission_phase(layer_id),
                 }
             )
+            self._staging_admitted_counts[layer_id] = (valid_count, valid_count)
+            if overlap:
+                counts = self._staging_observation_counts[
+                    self._staging_observation_rows[layer_id]
+                ]
+                counts[0].copy_(valid_count.reshape(()))
+                counts[4].copy_(valid_count.reshape(()))
             return None, valid_count, valid_count
         self._staging_slot_next = (slot + 1) % len(self._staging_slots_busy)
         self._staging_slots_busy[slot] = True
         self._staging_slot_epochs[slot] += 1
         slot_stats = self._staging_slot_stats[slot]
+        if reclaiming:
+            slot_stats["retirements"] += 1
         if slot_stats["admissions"]:
             slot_stats["reuses"] += 1
         slot_stats["admissions"] += 1
@@ -1251,7 +1411,7 @@ class HiSparseCoordinator:
             }
         )
         stage = self._staging_buffers[slot]
-        if not getattr(self, "_overlap_enabled", False):
+        if not overlap:
             plan_prediction_staging_mla(
                 logical_ids=view.logical_ids,
                 valid_count=valid_count,
@@ -1301,7 +1461,7 @@ class HiSparseCoordinator:
             )
         epoch = self._staging_slot_epochs[slot]
         request = self._split_requests[self._staging_request_slot]
-        expected_tag = self._encode_stage_tag(
+        expected_tag = self._next_stage_tag(
             request,
             target_step=self._staging_target_step,
             anchor_layer=layer_id,
@@ -1312,13 +1472,18 @@ class HiSparseCoordinator:
         speculative = self._speculative_stream
         if speculative is None:
             raise RuntimeError("predictive staging has no speculative stream")
-        with device_module.stream(speculative):
+        with (
+            device_module.stream(speculative),
+            _nvtx_range(
+                "dualdecoder.P.stage",
+                enabled=bool(getattr(self, "_overlap_nvtx_enabled", False)),
+            ),
+        ):
             prediction_ready_event = getattr(self, "_prediction_ready_event", None)
             if prediction_ready_event is not None:
                 speculative.wait_event(prediction_ready_event)
-            # Invalidate the previous tag on the producer stream before any
-            # new metadata is visible to an urgent resolver.
-            ready_tag.zero_()
+            if reclaiming:
+                speculative.wait_event(self._staging_reader_events[slot])
             plan_prediction_staging_mla(
                 logical_ids=view.logical_ids,
                 valid_count=valid_count,
@@ -1344,7 +1509,22 @@ class HiSparseCoordinator:
                 ready_tag=ready_tag,
                 expected_tag=expected_tag,
             )
+            row = self._staging_observation_rows[layer_id]
+            counts = self._staging_observation_counts[row]
+            counts[0].copy_(self._staging_eligible_counts[slot])
+            counts[1].copy_(self._staging_valid_counts[slot])
+            counts[4].copy_(self._staging_skipped_counts[slot])
+            self._staging_observation_plans["stage_logical"][row].copy_(
+                self._staging_logical_ids[slot]
+            )
+            self._staging_observation_plans["stage_source"][row].copy_(
+                self._staging_host_locs[slot]
+            )
             producer_done.record(speculative)
+            if view.logical_ids.is_cuda:
+                view.logical_ids.record_stream(speculative)
+            if valid_count.is_cuda:
+                valid_count.record_stream(speculative)
         plan = _HiSparseStagePlan(
             slot=slot,
             anchor_layer=layer_id,
@@ -1373,6 +1553,30 @@ class HiSparseCoordinator:
             self._staging_skipped_counts[slot],
         )
 
+    def admit_prediction_after_layer(self, layer_id: int) -> None:
+        """Admit one future anchor after the layer's final attention reader."""
+        if not getattr(self, "_overlap_enabled", False):
+            return
+        anchor = {0: 2, 4: 6}.get(layer_id)
+        if anchor is not None:
+            self._stage_prediction_rows(anchor)
+
+    def _prediction_stage_for_anchor(
+        self, layer_id: int
+    ) -> tuple[_HiSparseStagePlan | None, torch.Tensor, torch.Tensor]:
+        """Return only the stage result captured at the anchor's admission window."""
+        if not getattr(self, "_overlap_enabled", False):
+            self.wait_for_pending_backup()
+            return self._stage_prediction_rows(layer_id)
+        if layer_id not in self._staging_admission_attempted:
+            raise RuntimeError(
+                f"predictive anchor {layer_id} reached consumption before admission"
+            )
+        counts = self._staging_admitted_counts.get(
+            layer_id, (self._staging_zero_count, self._staging_zero_count)
+        )
+        return self._staging_active.get(layer_id), counts[0], counts[1]
+
     @staticmethod
     def _staging_admission_phase(layer_id: int) -> str:
         """Return the fixed M4.4 layer-timed admission phase for one anchor."""
@@ -1384,47 +1588,43 @@ class HiSparseCoordinator:
             return "after-layer-4-reader"
         return "unsupported"
 
-    @staticmethod
-    def _encode_stage_tag(
+    def _next_stage_tag(
+        self,
         request: _HiSparseRequestIdentity,
         *,
         target_step: int,
         anchor_layer: int,
         lease_epoch: int,
     ) -> int:
-        """Pack the qualified request/step/anchor/epoch identity into int64."""
-        values = (request.slot, request.generation, target_step, anchor_layer, lease_epoch)
+        """Issue a collision-free capability for one immutable stage identity."""
+        values = (
+            request.slot,
+            request.generation,
+            target_step,
+            anchor_layer,
+            lease_epoch,
+        )
         if any(value < 0 for value in values):
             raise RuntimeError("negative predictive stage identity")
-        # The qualified profile has a 4096-slot request pool, 16-bit step and
-        # generation counters, ten managed layers, and a bounded two-lease
-        # epoch.  Keeping the top bit clear lets the tag live in torch.int64.
-        slot, generation, step, anchor, epoch = values
-        if slot >= (1 << 12) or generation >= (1 << 16) or step >= (1 << 16):
-            raise RuntimeError("predictive stage identity exceeds tag capacity")
-        if anchor >= (1 << 8) or epoch >= (1 << 8):
-            raise RuntimeError("predictive stage anchor/epoch exceeds tag capacity")
-        return (
-            (slot << 51)
-            | (generation << 35)
-            | (step << 19)
-            | (anchor << 11)
-            | (epoch << 3)
-            | 0x5
-        )
+        if anchor_layer not in self._split_anchor_layers:
+            raise RuntimeError("predictive stage anchor is not managed")
+        self._staging_tag_sequence += 1
+        if self._staging_tag_sequence >= (1 << 60):
+            raise RuntimeError("predictive stage publication sequence exhausted")
+        # The immutable StagePlan carries the full key. The device tag is its
+        # non-repeating capability, leaving enough range for long-lived workers.
+        return (self._staging_tag_sequence << 3) | 0x5
 
     def _retire_completed_staging_slots(self) -> None:
-        """Reclaim leases whose final-reader events have completed."""
+        """Reclaim synchronous staging leases after their final readers."""
+        if getattr(self, "_overlap_enabled", False):
+            return
         active_slots = {plan.slot for plan in self._staging_active.values()}
         for slot, busy in enumerate(self._staging_slots_busy):
             if not busy or slot in active_slots:
                 continue
-            if getattr(self, "_overlap_enabled", False):
-                producer = self._staging_producer_events[slot]
-                reader = self._staging_reader_events[slot]
-            else:
-                producer = reader = self._staging_slot_events[slot]
-            if producer is not None and reader is not None and producer.query() and reader.query():
+            reader = self._staging_slot_events[slot]
+            if reader is not None and reader.query():
                 self._staging_slots_busy[slot] = False
                 self._staging_slot_stats[slot]["busy"] = False
                 self._staging_slot_stats[slot]["retirements"] += 1
@@ -1463,9 +1663,20 @@ class HiSparseCoordinator:
         )
         if urgent is None:
             raise RuntimeError("predictive staging has no urgent stream")
-        with device_module.stream(urgent):
+        row = self._staging_observation_rows[layer_id]
+        timing_events = getattr(self, "_overlap_timing_events", {}).get("urgent")
+        timing = timing_events[row] if timing_events is not None else None
+        with (
+            device_module.stream(urgent),
+            _nvtx_range(
+                "dualdecoder.U.repair",
+                enabled=bool(getattr(self, "_overlap_nvtx_enabled", False)),
+            ),
+        ):
             if plan_ready_event is not None:
                 urgent.wait_event(plan_ready_event)
+            if timing is not None:
+                timing[0].record(urgent)
             resolve_prediction_staging_mla(
                 miss_src=miss_src,
                 miss_dst=miss_dst,
@@ -1508,35 +1719,38 @@ class HiSparseCoordinator:
                 device_buffer=self.mem_pool_device.kv_buffer[layer_id],
                 item_size_bytes=self.item_size_bytes,
             )
+            counts = self._staging_observation_counts[row]
+            if not getattr(self, "_overlap_enabled", False):
+                counts[0].copy_(eligible_count.reshape(()))
+                counts[1].copy_(staged_count)
+                counts[4].copy_(skipped_count.reshape(()))
+            counts[2].copy_(self._staging_promotion_count[0])
+            counts[3].copy_(self._staging_repair_count[0])
+            counts[5].copy_(miss_count[0])
+            plans = self._staging_observation_plans
+            if plan is not None and not getattr(self, "_overlap_enabled", False):
+                plans["stage_logical"][row].copy_(plan.logical_ids)
+                plans["stage_source"][row].copy_(plan.host_locs)
+            plans["promotion_source"][row].copy_(self._staging_promotion_src[0])
+            plans["promotion_destination"][row].copy_(self._staging_promotion_dst[0])
+            plans["repair_source"][row].copy_(self._staging_repair_src[0])
+            plans["repair_destination"][row].copy_(self._staging_repair_dst[0])
+            plans["follower_source"][row].copy_(miss_src[0])
+            plans["follower_destination"][row].copy_(miss_dst[0])
+            if plan is not None:
+                event = plan.reader_done
+                if event is not None:
+                    event.record(urgent)
+                else:
+                    self._staging_slots_busy[plan.slot] = False
+                    self._staging_slot_stats[plan.slot]["busy"] = False
+                    self._staging_slot_stats[plan.slot]["retirements"] += 1
+            if timing is not None:
+                timing[1].record(urgent)
             urgent_done_event = getattr(self, "_urgent_done_event", None)
             if urgent_done_event is not None:
                 urgent_done_event.record(urgent)
-        row = self._staging_observation_rows[layer_id]
-        counts = self._staging_observation_counts[row]
-        counts[0].copy_(eligible_count.reshape(()))
-        counts[1].copy_(staged_count)
-        counts[2].copy_(self._staging_promotion_count[0])
-        counts[3].copy_(self._staging_repair_count[0])
-        counts[4].copy_(skipped_count.reshape(()))
-        counts[5].copy_(miss_count[0])
-        plans = self._staging_observation_plans
         if plan is not None:
-            plans["stage_logical"][row].copy_(plan.logical_ids)
-            plans["stage_source"][row].copy_(plan.host_locs)
-        plans["promotion_source"][row].copy_(self._staging_promotion_src[0])
-        plans["promotion_destination"][row].copy_(self._staging_promotion_dst[0])
-        plans["repair_source"][row].copy_(self._staging_repair_src[0])
-        plans["repair_destination"][row].copy_(self._staging_repair_dst[0])
-        plans["follower_source"][row].copy_(miss_src[0])
-        plans["follower_destination"][row].copy_(miss_dst[0])
-        if plan is not None:
-            event = plan.reader_done
-            if event is not None:
-                event.record(urgent)
-            else:
-                self._staging_slots_busy[plan.slot] = False
-                self._staging_slot_stats[plan.slot]["busy"] = False
-                self._staging_slot_stats[plan.slot]["retirements"] += 1
             self._staging_active.pop(layer_id, None)
             self._staging_admitted_counts.pop(layer_id, None)
         self._staging_device_records[layer_id] = {
@@ -1574,6 +1788,9 @@ class HiSparseCoordinator:
             if self.decode_producer_stream is not None:
                 current_stream.wait_stream(self.decode_producer_stream)
             self.wait_for_pending_backup()
+            write_staging_stream = getattr(self, "write_staging_stream", None)
+            if write_staging_stream is not None:
+                write_staging_stream.synchronize()
             self.prefetch_stream.synchronize()
             if getattr(self, "_overlap_enabled", False):
                 if self._speculative_stream is not None:
@@ -1588,6 +1805,7 @@ class HiSparseCoordinator:
                     self._staging_slot_stats[slot]["busy"] = False
                 self._staging_active.clear()
                 getattr(self, "_staging_admitted_counts", {}).clear()
+                getattr(self, "_staging_admission_attempted", set()).clear()
                 getattr(self, "_staging_admission_events", []).clear()
                 self._staging_device_records.clear()
                 self._staging_slots_busy[:] = [False, False]
@@ -2540,17 +2758,9 @@ class HiSparseCoordinator:
             eligible_count = None
             skipped_count = None
             if self.prediction_staging_enabled:
-                # Optional staging reads only published host history and completes
-                # into isolated storage before authoritative placement can change.
-                self.wait_for_pending_backup()
-                stage_plan, eligible_count, skipped_count = self._stage_prediction_rows(
-                    layer_id
+                stage_plan, eligible_count, skipped_count = (
+                    self._prediction_stage_for_anchor(layer_id)
                 )
-                if getattr(self, "_overlap_enabled", False) and layer_id == 0:
-                    # Fresh anchors 0 and 1 are admitted at step entry. Anchor 1
-                    # is retained in its own lease until layer 1 consumes it;
-                    # no compute stream wait is added for its producer.
-                    self._stage_prediction_rows(1)
             plan_cache_to_device_buffer_mla(
                 top_k_tokens=top_k_result,
                 device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -2585,6 +2795,7 @@ class HiSparseCoordinator:
                 miss_dst=self._miss_dst[:num_reqs],
                 miss_count=self._miss_count[:num_reqs],
                 staging=stage_plan,
+                plan_ready=plan_ready_event,
             )
             self._split_pending = pending
             self._split_followers_seen = 0
@@ -2602,23 +2813,44 @@ class HiSparseCoordinator:
                     len(group[1:]),
                     plan_ready_event=plan_ready_event,
                 )
-                if (
-                    getattr(self, "_overlap_enabled", False)
-                    and getattr(self, "_urgent_done_event", None) is not None
-                ):
-                    device_module.current_stream().wait_event(self._urgent_done_event)
             else:
                 self.wait_for_pending_backup()
                 self._run_copy_only_kernel(num_reqs, layer_id)
             followers = group[1:]
             if followers:
-                self.prefetch_stream.wait_stream(device_module.current_stream())
-                with device_module.stream(self.prefetch_stream):
+                if plan_ready_event is not None:
+                    self.prefetch_stream.wait_event(plan_ready_event)
+                else:
+                    self.prefetch_stream.wait_stream(device_module.current_stream())
+                with (
+                    device_module.stream(self.prefetch_stream),
+                    _nvtx_range(
+                        "dualdecoder.N.follower",
+                        enabled=bool(getattr(self, "_overlap_nvtx_enabled", False)),
+                    ),
+                ):
                     for follower in followers:
                         self._run_copy_only_kernel(num_reqs, follower)
                         self._prefetch_events[self._prefetch_slot[follower]].record(
                             self.prefetch_stream
                         )
+            if (
+                getattr(self, "_overlap_enabled", False)
+                and getattr(self, "_urgent_done_event", None) is not None
+            ):
+                current = device_module.current_stream()
+                row = self._staging_observation_rows[layer_id]
+                wait_events = self._overlap_timing_events.get("attention_wait")
+                wait_timing = wait_events[row] if wait_events is not None else None
+                with _nvtx_range(
+                    "dualdecoder.C.attention_wait",
+                    enabled=bool(getattr(self, "_overlap_nvtx_enabled", False)),
+                ):
+                    if wait_timing is not None:
+                        wait_timing[0].record(current)
+                    current.wait_event(self._urgent_done_event)
+                    if wait_timing is not None:
+                        wait_timing[1].record(current)
         except BaseException:
             self._split_aborted_generation = active.generation
             raise
