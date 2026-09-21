@@ -522,8 +522,9 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         self.assertEqual(admitted, [0, 1, 2, 6])
 
     def test_predictive_consumer_never_retries_a_missed_admission(self) -> None:
-        coordinator, _request, _identity = self._bindable_staging_coordinator()
+        coordinator, _request, identity = self._bindable_staging_coordinator()
         coordinator._overlap_enabled = True
+        coordinator._staging_identity = identity
         valid = torch.tensor(2, dtype=torch.int32)
         coordinator._staging_admission_attempted = {2}
         coordinator._staging_admitted_counts = {2: (valid, valid)}
@@ -541,6 +542,24 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         self.assertIs(skipped, valid)
         with self.assertRaisesRegex(RuntimeError, "before admission"):
             coordinator._prediction_stage_for_anchor(6)
+
+    def test_unbound_predictive_seed_requires_only_native_repair(self) -> None:
+        coordinator, _request, _identity = self._bindable_staging_coordinator()
+        coordinator._overlap_enabled = True
+        self.assertIsNone(coordinator._staging_identity)
+        with (
+            patch.object(coordinator, "_stage_prediction_rows") as stage,
+            patch.object(coordinator, "wait_for_pending_backup") as backup,
+        ):
+            for anchor in (0, 1, 2, 6):
+                plan, eligible, skipped = coordinator._prediction_stage_for_anchor(
+                    anchor
+                )
+                self.assertIsNone(plan)
+                self.assertIs(eligible, coordinator._staging_zero_count)
+                self.assertIs(skipped, coordinator._staging_zero_count)
+            stage.assert_not_called()
+            self.assertEqual(backup.call_count, 4)
 
     def test_scoped_retirement_joins_events_without_query_or_global_sync(self) -> None:
         coordinator, _request, identity = self._bindable_staging_coordinator()

@@ -1568,6 +1568,11 @@ class HiSparseCoordinator:
         if not getattr(self, "_overlap_enabled", False):
             self.wait_for_pending_backup()
             return self._stage_prediction_rows(layer_id)
+        if self._staging_identity is None:
+            # Seed/reference traversals have no bound prediction step. Their
+            # complete real miss plan still uses native repair and followers.
+            self.wait_for_pending_backup()
+            return None, self._staging_zero_count, self._staging_zero_count
         if layer_id not in self._staging_admission_attempted:
             raise RuntimeError(
                 f"predictive anchor {layer_id} reached consumption before admission"
