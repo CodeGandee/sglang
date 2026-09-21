@@ -872,6 +872,60 @@ class HiSparseCoordinator:
             raise RuntimeError("HiSparse split request changed during a partial step")
         self._split_next_request = identity
 
+    def bind_split_materialization_request(self, req: Req) -> None:
+        """Authorize a validated request to continue split materialization.
+
+        Parameters
+        ----------
+        req:
+            Live native request already validated by the owning execution path.
+
+        Raises
+        ------
+        RuntimeError
+            The request generation is stale or aborted, or the preceding
+            native traversal has not reached its fully consumed final group.
+        """
+        if not self.split_materialization_enabled:
+            return
+        self._assert_split_worker_reusable()
+        request_slot = getattr(req, "req_pool_idx", None)
+        if request_slot is None:
+            raise RuntimeError("HiSparse split request has no native request slot")
+        identity = self._split_requests.get(int(request_slot))
+        if identity is None or identity.object_id != id(req):
+            raise RuntimeError(
+                "stale request generation cannot bind HiSparse split materialization"
+            )
+        if self._split_aborted_generation == identity.generation:
+            raise RuntimeError("aborted HiSparse request cannot bind another step")
+        if self._split_anchor_index != 0:
+            raise RuntimeError("HiSparse split request changed during a partial step")
+
+        pending = self._split_pending
+        if pending is not None:
+            self._validate_split_plan(pending)
+            follower_count = len(pending.group_layers) - 1
+            if (
+                pending.anchor_layer != self._split_anchor_layers[-1]
+                or pending.step != self._split_step
+                or self._split_followers_seen != follower_count
+            ):
+                raise RuntimeError(
+                    "HiSparse split request bound before the prior traversal completed"
+                )
+
+        bound = self._split_next_request
+        if bound is not None:
+            if bound != identity:
+                raise RuntimeError("HiSparse split request binding changed generation")
+            return
+        if pending is None or self._split_step_request != identity:
+            raise RuntimeError(
+                "HiSparse split continuation has no completed request traversal"
+            )
+        self._split_next_request = identity
+
     def _eager_backup_previous_token(
         self,
         seq_lens: torch.Tensor,

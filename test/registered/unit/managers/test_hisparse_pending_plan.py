@@ -251,7 +251,32 @@ class TestHiSparsePendingPlan(unittest.TestCase):
                 )
             self.assertEqual(changed._split_aborted_generation, 1)
 
+            rebound, original_indices, request = prepare()
+            rebound_indices = original_indices.clone()
+            rebound.bind_split_materialization_request(request)
+            for layer_id in range(10):
+                rebound.swap_in_selected_pages(
+                    rebound_indices,
+                    torch.tensor([5], dtype=torch.int32),
+                    torch.tensor([[1, 2]], dtype=torch.int32),
+                    layer_id,
+                )
+            self.assertEqual(rebound._split_pending.step, 2)
+            self.assertEqual(
+                rebound._split_pending.request_indices_ptr,
+                rebound_indices.data_ptr(),
+            )
+
+            stale_request = SimpleNamespace(req_pool_idx=7)
+            with self.assertRaisesRegex(RuntimeError, "stale request generation"):
+                rebound.bind_split_materialization_request(stale_request)
+
             partial = _coordinator()
+            partial_request = SimpleNamespace(req_pool_idx=7)
+            partial_identity = _HiSparseRequestIdentity(7, 1, id(partial_request))
+            partial._split_requests = {7: partial_identity}
+            partial._split_step_request = partial_identity
+            partial._split_next_request = partial_identity
             partial._run_copy_only_kernel = MethodType(
                 lambda _self, _num_reqs, _layer_id: None, partial
             )
@@ -261,6 +286,8 @@ class TestHiSparsePendingPlan(unittest.TestCase):
                 partial.swap_in_selected_pages(
                     request_indices, seq_lens, selected, layer_id
                 )
+            with self.assertRaisesRegex(RuntimeError, "partial step"):
+                partial.bind_split_materialization_request(partial_request)
             with self.assertRaisesRegex(RuntimeError, "before every follower"):
                 partial.swap_in_selected_pages(
                     request_indices, seq_lens, selected, layer_id=6
