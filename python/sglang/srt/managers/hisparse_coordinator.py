@@ -10,6 +10,8 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     plan_cache_to_device_buffer_mla,
+    plan_prediction_staging_mla,
+    resolve_prediction_staging_mla,
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
@@ -85,6 +87,19 @@ class _HiSparseStagePlan:
     valid_count: torch.Tensor
     buffer: torch.Tensor
     step: int
+    lease_epoch: int
+    request: _HiSparseRequestIdentity
+    project_identity: object
+    representation: str
+
+
+def _tensor_collection_nbytes(value: object) -> int:
+    """Return owned tensor bytes for a tensor or nested tensor collection."""
+    if isinstance(value, torch.Tensor):
+        return int(value.numel() * value.element_size())
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_collection_nbytes(item) for item in value)
+    return 0
 
 
 def resolve_shared_index_layers(
@@ -397,9 +412,31 @@ class HiSparseCoordinator:
                 "row_stride_bytes": int(self.item_size_bytes),
                 "payload_bytes": 0,
                 "metadata_bytes": 0,
+                "matching_workspace_bytes": 0,
+                "repair_workspace_bytes": 0,
+                "observation_bytes": 0,
+                "repair_capacity_rows": 0,
+                "additional_device_bytes": 0,
+                "admission_device_bytes": 0,
+                "native_device_bytes": 0,
+                "native_host_bytes": 0,
                 "total_bytes": 0,
             }
         return dict(self._staging_allocation_receipt)
+
+    @property
+    def staging_runtime_receipt(self) -> dict[str, object] | None:
+        """Return host-only staging lease and host-publication counters."""
+        if not self.prediction_staging_enabled:
+            return None
+        self._retire_completed_staging_slots()
+        return {
+            "schema": "sglang.hisparse.prediction-staging-runtime.v1",
+            "slot_stats": [dict(stats) for stats in self._staging_slot_stats],
+            "skipped_admissions": self._staging_skipped_admissions,
+            "generated_publications": self._staging_generated_publications,
+            "last_generated_positions": list(self._staging_last_generated_positions),
+        }
 
     @property
     def staging_observation(self) -> dict[str, object] | None:
@@ -417,7 +454,12 @@ class HiSparseCoordinator:
         return receipt
 
     def enable_split_materialization(
-        self, *, logical_batch_size: int, eager: bool, staging: bool = False
+        self,
+        *,
+        logical_batch_size: int,
+        eager: bool,
+        staging: bool = False,
+        additional_device_bytes: int = 0,
     ) -> None:
         """Pin this coordinator to the admitted GLM plan/materialize path.
 
@@ -477,7 +519,19 @@ class HiSparseCoordinator:
             )
 
         if not isinstance(staging, bool):
-            raise RuntimeError("HiSparse prediction staging selection is malformed")
+            raise TypeError("HiSparse prediction staging selection is malformed")
+        if (
+            isinstance(additional_device_bytes, bool)
+            or not isinstance(additional_device_bytes, int)
+            or additional_device_bytes < 0
+        ):
+            raise RuntimeError(
+                "HiSparse additional device-byte reservation is malformed"
+            )
+        if not staging and additional_device_bytes:
+            raise RuntimeError(
+                "HiSparse additional device-byte reservation requires staging"
+            )
 
         # Split-only state is installed here, not in __init__, so feature-off
         # workers retain the fused route without another state owner.
@@ -506,12 +560,27 @@ class HiSparseCoordinator:
         self._staging_history_limit = 0
         self._staging_request_slot = -1
         self._staging_slot_next = 0
+        self._staging_slot_epochs = [0, 0]
         self._staging_active: dict[int, _HiSparseStagePlan] = {}
         self._staging_device_records: dict[int, dict[str, object]] = {}
         self._staging_slots_busy = [False, False]
         self._staging_slot_events = (None, None)
         self._staging_observation_anchor_ids: tuple[int, ...] = ()
         self._staging_stats: dict[str, torch.Tensor] = {}
+        self._staging_slot_stats = [
+            {
+                "slot": slot,
+                "admissions": 0,
+                "reuses": 0,
+                "retirements": 0,
+                "busy": False,
+            }
+            for slot in range(2)
+        ]
+        self._staging_skipped_admissions = 0
+        self._staging_generated_publications = 0
+        self._staging_last_generated_positions: tuple[int, ...] = ()
+        self._staging_pending_generated_positions: tuple[int, ...] = ()
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
             "request_slot": -1,
@@ -526,10 +595,10 @@ class HiSparseCoordinator:
             "skipped_stage_rows": 0,
         }
         if staging:
-            self._enable_prediction_staging()
+            self._enable_prediction_staging(additional_device_bytes)
         self._split_materialization_enabled = True
 
-    def _enable_prediction_staging(self) -> None:
+    def _enable_prediction_staging(self, additional_device_bytes: int) -> None:
         """Allocate the bounded native-owned staging ring."""
         if self.item_size_bytes % self.mem_pool_device.kv_buffer[0].element_size():
             raise RuntimeError("HiSparse staging row stride is not element aligned")
@@ -538,10 +607,21 @@ class HiSparseCoordinator:
         )
         kv_shape = tuple(self.mem_pool_device.kv_buffer[0].shape[1:])
         capacity = self.top_k
-        metadata_bytes = 2 * capacity * (4 + 8 + 4)
-        workspace_bytes = 2 * capacity * (4 + 4)
+        anchor_count = len(self._split_anchor_layers)
+        metadata_bytes = 2 * capacity * (8 + 8 + 4) + 8 * 4
+        matching_workspace_bytes = capacity * (8 + 4) + 4
+        repair_workspace_bytes = capacity * (8 + 4) + 4
+        observation_bytes = anchor_count * capacity * (8 + 8 + 8 + 4 + 8 + 4 + 8 + 4)
+        observation_bytes += anchor_count * 6 * 4
         payload_bytes = 2 * capacity * self.item_size_bytes
-        required_bytes = payload_bytes + metadata_bytes + 2 * workspace_bytes
+        stage_owned_bytes = (
+            payload_bytes
+            + metadata_bytes
+            + matching_workspace_bytes
+            + repair_workspace_bytes
+            + observation_bytes
+        )
+        required_bytes = stage_owned_bytes + additional_device_bytes
         device_type = torch.device(self.device).type
         if device_type == "cuda":
             free_bytes, _ = torch.cuda.mem_get_info(self.device)
@@ -563,23 +643,80 @@ class HiSparseCoordinator:
         self._staging_host_locs = torch.empty(
             (2, capacity), dtype=torch.int64, device=self.device
         )
+        self._staging_dst_locs = torch.empty(
+            (2, capacity), dtype=torch.int32, device=self.device
+        )
         self._staging_valid_counts = torch.zeros(
             (2,), dtype=torch.int32, device=self.device
         )
-        self._staging_matching_workspace = torch.empty(
-            (2, capacity), dtype=torch.int32, device=self.device
+        self._staging_eligible_counts = torch.zeros(
+            (2,), dtype=torch.int32, device=self.device
         )
-        self._staging_repair_workspace = torch.empty(
-            (2, capacity), dtype=torch.int32, device=self.device
+        self._staging_skipped_counts = torch.zeros(
+            (2,), dtype=torch.int32, device=self.device
         )
+        self._staging_one_request = torch.ones(
+            (1,), dtype=torch.int32, device=self.device
+        )
+        self._staging_zero_count = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
+        self._staging_promotion_src = torch.empty(
+            (1, capacity), dtype=torch.int64, device=self.device
+        )
+        self._staging_promotion_dst = torch.empty(
+            (1, capacity), dtype=torch.int32, device=self.device
+        )
+        self._staging_promotion_count = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
+        self._staging_repair_src = torch.empty(
+            (1, capacity), dtype=torch.int64, device=self.device
+        )
+        self._staging_repair_dst = torch.empty(
+            (1, capacity), dtype=torch.int32, device=self.device
+        )
+        self._staging_repair_count = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
+        self._staging_observation_counts = torch.zeros(
+            (anchor_count, 6), dtype=torch.int32, device=self.device
+        )
+        self._staging_observation_plans = {
+            "stage_logical": torch.empty(
+                (anchor_count, capacity), dtype=torch.int64, device=self.device
+            ),
+            "stage_source": torch.empty(
+                (anchor_count, capacity), dtype=torch.int64, device=self.device
+            ),
+            "promotion_source": torch.empty(
+                (anchor_count, capacity), dtype=torch.int64, device=self.device
+            ),
+            "promotion_destination": torch.empty(
+                (anchor_count, capacity), dtype=torch.int32, device=self.device
+            ),
+            "repair_source": torch.empty(
+                (anchor_count, capacity), dtype=torch.int64, device=self.device
+            ),
+            "repair_destination": torch.empty(
+                (anchor_count, capacity), dtype=torch.int32, device=self.device
+            ),
+            "follower_source": torch.empty(
+                (anchor_count, capacity), dtype=torch.int64, device=self.device
+            ),
+            "follower_destination": torch.empty(
+                (anchor_count, capacity), dtype=torch.int32, device=self.device
+            ),
+        }
+        self._staging_observation_rows = {
+            layer_id: row for row, layer_id in enumerate(self._split_anchor_layers)
+        }
         if device_type == "cuda":
             self._staging_slot_events = tuple(
                 torch.cuda.Event(enable_timing=False) for _ in range(2)
             )
-        native_device_bytes = sum(
-            int(buffer.numel() * buffer.element_size())
-            for buffer in self.mem_pool_device.kv_buffer
-        )
+        native_device_bytes = int(self.mem_pool_device.get_kv_size_bytes())
+        native_host_bytes = _tensor_collection_nbytes(self.mem_pool_host.kv_buffer)
         actual_payload_bytes = sum(
             int(buffer.numel() * buffer.element_size())
             for buffer in self._staging_buffers
@@ -589,15 +726,39 @@ class HiSparseCoordinator:
             for tensor in (
                 self._staging_logical_ids,
                 self._staging_host_locs,
+                self._staging_dst_locs,
                 self._staging_valid_counts,
+                self._staging_eligible_counts,
+                self._staging_skipped_counts,
+                self._staging_one_request,
+                self._staging_zero_count,
             )
         )
-        actual_workspace_bytes = sum(
+        actual_matching_workspace_bytes = sum(
             int(tensor.numel() * tensor.element_size())
             for tensor in (
-                self._staging_matching_workspace,
-                self._staging_repair_workspace,
+                self._staging_promotion_src,
+                self._staging_promotion_dst,
+                self._staging_promotion_count,
             )
+        )
+        actual_repair_workspace_bytes = sum(
+            int(tensor.numel() * tensor.element_size())
+            for tensor in (
+                self._staging_repair_src,
+                self._staging_repair_dst,
+                self._staging_repair_count,
+            )
+        )
+        actual_observation_bytes = _tensor_collection_nbytes(
+            tuple(self._staging_observation_plans.values())
+        ) + _tensor_collection_nbytes(self._staging_observation_counts)
+        actual_total_bytes = (
+            actual_payload_bytes
+            + actual_metadata_bytes
+            + actual_matching_workspace_bytes
+            + actual_repair_workspace_bytes
+            + actual_observation_bytes
         )
         self._staging_allocation_receipt = {
             "schema": "sglang.hisparse.prediction-staging.v1",
@@ -607,13 +768,15 @@ class HiSparseCoordinator:
             "row_stride_bytes": int(self.item_size_bytes),
             "payload_bytes": actual_payload_bytes,
             "metadata_bytes": actual_metadata_bytes,
-            "matching_workspace_bytes": actual_workspace_bytes // 2,
-            "repair_workspace_bytes": actual_workspace_bytes // 2,
+            "matching_workspace_bytes": actual_matching_workspace_bytes,
+            "repair_workspace_bytes": actual_repair_workspace_bytes,
+            "observation_bytes": actual_observation_bytes,
             "repair_capacity_rows": capacity,
+            "additional_device_bytes": additional_device_bytes,
+            "admission_device_bytes": actual_total_bytes + additional_device_bytes,
             "native_device_bytes": native_device_bytes,
-            "total_bytes": (
-                actual_payload_bytes + actual_metadata_bytes + actual_workspace_bytes
-            ),
+            "native_host_bytes": native_host_bytes,
+            "total_bytes": actual_total_bytes,
             "row_elements": row_elements,
         }
         self._prediction_staging_enabled = True
@@ -635,18 +798,72 @@ class HiSparseCoordinator:
         native_identity = self._split_requests.get(slot)
         if native_identity is None or native_identity.object_id != id(req):
             raise RuntimeError("staging request generation is stale")
-        if target_step < 0 or committed_history_limit < 0:
+        if (
+            target_step < 0
+            or committed_history_limit < 0
+            or committed_history_limit > self.req_to_host_pool.shape[1]
+        ):
             raise RuntimeError("staging logical identity is malformed")
         if not isinstance(eligible_views, dict):
-            raise RuntimeError("staging prediction views are malformed")
+            raise TypeError("staging prediction views are malformed")
+        host_map = self.req_to_host_pool[slot]
+        if (
+            host_map.dtype != torch.int64
+            or not host_map.is_contiguous()
+            or host_map.device != self._staging_buffers[0].device
+        ):
+            raise RuntimeError("staging host mapping is malformed")
+        if int(getattr(identity, "request_pool_index", -1)) != slot:
+            raise RuntimeError("staging project/native request identity differs")
+        request_id = str(getattr(identity, "request_id", ""))
+        native_request_id = getattr(req, "rid", None)
+        if not request_id or (
+            native_request_id is not None and request_id != str(native_request_id)
+        ):
+            raise RuntimeError("staging project/native request identity differs")
+        admitted_anchors = set(self._split_anchor_layers)
+        for anchor, view in eligible_views.items():
+            if (
+                isinstance(anchor, bool)
+                or not isinstance(anchor, int)
+                or anchor not in admitted_anchors
+            ):
+                raise RuntimeError("staging prediction anchor is not admitted")
+            tag = getattr(view, "tag", None)
+            expected_group = (anchor, *self._prefetch_groups.get(anchor, ()))
+            if (
+                tag is None
+                or getattr(tag, "identity", None) != identity
+                or int(getattr(tag, "target_step", -1)) != target_step
+                or int(getattr(tag, "anchor", -1)) != anchor
+                or int(getattr(tag, "group", -1)) != anchor
+                or tuple(getattr(tag, "group_layers", ())) != expected_group
+                or getattr(tag, "representation", None) != "logical_position"
+                or int(getattr(tag, "committed_history_limit", -1))
+                != committed_history_limit
+            ):
+                raise RuntimeError("staging prediction tag is stale or mis-keyed")
+            logical_ids = getattr(view, "logical_ids", None)
+            valid_count = getattr(view, "valid_count", None)
+            if (
+                not isinstance(logical_ids, torch.Tensor)
+                or logical_ids.dtype != torch.int32
+                or logical_ids.shape != (self.top_k,)
+                or not logical_ids.is_contiguous()
+                or logical_ids.device != self._staging_buffers[0].device
+                or not isinstance(valid_count, torch.Tensor)
+                or valid_count.dtype != torch.int32
+                or valid_count.numel() != 1
+                or not valid_count.is_contiguous()
+                or valid_count.device != logical_ids.device
+            ):
+                raise RuntimeError("staging prediction view tensors are malformed")
         self._staging_identity = identity
         self._staging_target_step = int(target_step)
         self._staging_history_limit = int(committed_history_limit)
         self._staging_request_slot = slot
         self._staging_views = dict(eligible_views)
-        self._staging_observation_anchor_ids = tuple(
-            sorted(self._prefetch_groups)
-        )
+        self._staging_observation_anchor_ids = self._split_anchor_layers
         self._staging_device_records = {}
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
@@ -689,6 +906,7 @@ class HiSparseCoordinator:
         device_module.current_stream().synchronize()
         if self.enable_prefetch:
             self.prefetch_stream.synchronize()
+        self._retire_completed_staging_slots()
         anchors: dict[str, dict[str, object]] = {}
         totals = {
             "stage_h2d_bytes": 0,
@@ -723,26 +941,61 @@ class HiSparseCoordinator:
                     "unused_stage_bytes": 0,
                 }
                 continue
-            receipt = dict(record["receipt"])
-            plan = record.get("plan")
-            if plan is not None:
-                receipt["stage_logical_ids"] = plan.logical_ids.detach().cpu().tolist()
-                receipt["stage_source_rows"] = plan.host_locs.detach().cpu().tolist()
-            for name, tensor_name in (
-                ("promotion_stage_rows", "promotion_stage"),
-                ("promotion_destination_rows", "promotion_destination"),
-                ("repair_source_rows", "repair_source"),
-                ("repair_destination_rows", "repair_destination"),
-            ):
-                receipt[name] = record[tensor_name].detach().cpu().tolist()
-            follower_count = int(
-                record["follower_count"].detach().to(device="cpu").item()
-            )
+            row = int(record["observation_row"])
+            (
+                eligible_count,
+                staged_count,
+                promoted_count,
+                repaired_count,
+                skipped_count,
+                follower_count,
+            ) = self._staging_observation_counts[row].detach().cpu().tolist()
+            plans = self._staging_observation_plans
+            receipt = {
+                "eligible_prediction_rows": eligible_count,
+                "staged_rows": staged_count,
+                "promoted_rows": promoted_count,
+                "repaired_rows": repaired_count,
+                "follower_rows": 0,
+                "skipped_stage_rows": skipped_count,
+                "unused_stage_rows": max(0, staged_count - promoted_count),
+                "stage_logical_ids": plans["stage_logical"][row, :staged_count]
+                .detach()
+                .cpu()
+                .tolist(),
+                "stage_source_rows": plans["stage_source"][row, :staged_count]
+                .detach()
+                .cpu()
+                .tolist(),
+                "promotion_stage_rows": plans["promotion_source"][row, :promoted_count]
+                .detach()
+                .cpu()
+                .tolist(),
+                "promotion_destination_rows": plans["promotion_destination"][
+                    row, :promoted_count
+                ]
+                .detach()
+                .cpu()
+                .tolist(),
+                "repair_source_rows": plans["repair_source"][row, :repaired_count]
+                .detach()
+                .cpu()
+                .tolist(),
+                "repair_destination_rows": plans["repair_destination"][
+                    row, :repaired_count
+                ]
+                .detach()
+                .cpu()
+                .tolist(),
+            }
             follower_sources = (
-                record["follower_source"][:follower_count].detach().cpu().tolist()
+                plans["follower_source"][row, :follower_count].detach().cpu().tolist()
             )
             follower_destinations = (
-                record["follower_destination"][:follower_count].detach().cpu().tolist()
+                plans["follower_destination"][row, :follower_count]
+                .detach()
+                .cpu()
+                .tolist()
             )
             follower_layers = int(record["follower_layers"])
             receipt["follower_source_rows"] = follower_sources * follower_layers
@@ -757,6 +1010,9 @@ class HiSparseCoordinator:
             receipt["unused_stage_bytes"] = (
                 int(receipt["unused_stage_rows"]) * self.item_size_bytes
             )
+            receipt["stage_h2d_bytes"] = staged_count * self.item_size_bytes
+            receipt["promotion_d2d_bytes"] = promoted_count * self.item_size_bytes
+            receipt["repair_h2d_bytes"] = repaired_count * self.item_size_bytes
             anchors[str(layer_id)] = receipt
             for field in totals:
                 if field == "skipped_stage_rows":
@@ -771,167 +1027,173 @@ class HiSparseCoordinator:
 
     def _stage_prediction_rows(
         self, layer_id: int
-    ) -> tuple[_HiSparseStagePlan | None, dict[str, object]]:
+    ) -> tuple[_HiSparseStagePlan | None, torch.Tensor, torch.Tensor]:
         """Filter one anchor's eligible IDs and copy published host rows to stage."""
         view = self._staging_views.get(layer_id)
-        empty: dict[str, object] = {
-            "eligible_prediction_rows": 0,
-            "staged_rows": 0,
-            "promoted_rows": 0,
-            "repaired_rows": 0,
-            "follower_rows": 0,
-            "skipped_stage_rows": 0,
-            "unused_stage_rows": 0,
-            "stage_logical_ids": [],
-            "stage_source_rows": [],
-            "promotion_stage_rows": [],
-            "promotion_destination_rows": [],
-            "repair_source_rows": [],
-            "repair_destination_rows": [],
-            "follower_source_rows": [],
-            "follower_destination_rows": [],
-        }
         if view is None:
-            return None, empty
-        ids = getattr(view, "logical_ids", None)
-        valid_count = getattr(view, "valid_count", None)
-        if not isinstance(ids, torch.Tensor) or not isinstance(
-            valid_count, torch.Tensor
-        ):
-            raise RuntimeError("staging prediction view tensors are malformed")
-        ids = ids.to(dtype=torch.int64)
-        positions = torch.arange(ids.numel(), device=ids.device)
-        valid = (positions < valid_count) & (ids >= 0)
-        valid &= ids < self._staging_history_limit
-        valid_ids = ids[valid]
-        unique = torch.unique(valid_ids, sorted=True)
-        host_map = self.req_to_host_pool[self._staging_request_slot]
-        host_rows = host_map[unique]
-        available = host_rows >= 0
-        unique = unique[available]
-        host_rows = host_rows[available]
-        skipped = int(ids.numel()) - int(unique.numel())
+            return None, self._staging_zero_count, self._staging_zero_count
+        self._retire_completed_staging_slots()
         slot = None
-        for index, busy in enumerate(self._staging_slots_busy):
-            if busy:
-                event = self._staging_slot_events[index]
-                if event is not None and event.query():
-                    self._staging_slots_busy[index] = False
-                    busy = False
+        for offset in range(len(self._staging_slots_busy)):
+            index = (self._staging_slot_next + offset) % len(self._staging_slots_busy)
+            busy = self._staging_slots_busy[index]
             if not busy:
                 slot = index
                 break
-        if slot is None or unique.numel() == 0:
-            empty["eligible_prediction_rows"] = int(ids.numel())
-            empty["skipped_stage_rows"] = skipped
-            return None, empty
+        valid_count = view.valid_count
+        if slot is None:
+            self._staging_skipped_admissions += 1
+            return None, valid_count, valid_count
+        self._staging_slot_next = (slot + 1) % len(self._staging_slots_busy)
         self._staging_slots_busy[slot] = True
+        self._staging_slot_epochs[slot] += 1
+        slot_stats = self._staging_slot_stats[slot]
+        if slot_stats["admissions"]:
+            slot_stats["reuses"] += 1
+        slot_stats["admissions"] += 1
+        slot_stats["busy"] = True
         stage = self._staging_buffers[slot]
-        stage_positions = torch.arange(
-            unique.numel(), dtype=torch.int64, device=self.device
+        plan_prediction_staging_mla(
+            logical_ids=view.logical_ids,
+            valid_count=valid_count,
+            host_cache_locs=self.req_to_host_pool[self._staging_request_slot],
+            history_limit=self._staging_history_limit,
+            staged_logical_ids=self._staging_logical_ids[slot],
+            staged_host_locs=self._staging_host_locs[slot],
+            staged_dst_locs=self._staging_dst_locs[slot],
+            staged_count=self._staging_valid_counts[slot : slot + 1],
+            eligible_count=self._staging_eligible_counts[slot : slot + 1],
+            skipped_count=self._staging_skipped_counts[slot : slot + 1],
         )
-        from sgl_kernel.kvcacheio import transfer_kv_per_layer_mla
-
-        transfer_kv_per_layer_mla(
-            src=self.mem_pool_host.kv_buffer[layer_id],
-            dst=stage,
-            src_indices=host_rows,
-            dst_indices=stage_positions,
-            item_size=self.item_size_bytes,
+        copy_cache_planned_mla(
+            miss_src=self._staging_host_locs[slot : slot + 1],
+            miss_dst=self._staging_dst_locs[slot : slot + 1],
+            miss_count=self._staging_valid_counts[slot : slot + 1],
+            num_real_reqs=self._staging_one_request,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=stage,
+            item_size_bytes=self.item_size_bytes,
         )
-        self._staging_logical_ids[slot, : unique.numel()].copy_(unique)
-        self._staging_host_locs[slot, : unique.numel()].copy_(host_rows)
-        self._staging_valid_counts[slot] = unique.numel()
-        event = self._staging_slot_events[slot]
-        if event is not None:
-            event.record(device_module.current_stream())
         plan = _HiSparseStagePlan(
             slot=slot,
             anchor_layer=layer_id,
-            logical_ids=self._staging_logical_ids[slot, : unique.numel()],
-            host_locs=self._staging_host_locs[slot, : unique.numel()],
+            logical_ids=self._staging_logical_ids[slot],
+            host_locs=self._staging_host_locs[slot],
             valid_count=self._staging_valid_counts[slot],
             buffer=stage,
             step=self._staging_target_step,
+            lease_epoch=self._staging_slot_epochs[slot],
+            request=self._split_requests[self._staging_request_slot],
+            project_identity=self._staging_identity,
+            representation="mla-bf16-width-576",
         )
         self._staging_active[layer_id] = plan
-        empty.update(
-            {
-                "eligible_prediction_rows": int(ids.numel()),
-                "staged_rows": unique.numel(),
-                "skipped_stage_rows": skipped,
-                "stage_logical_ids": [],
-                "stage_source_rows": [],
-            }
+        return (
+            plan,
+            self._staging_eligible_counts[slot],
+            self._staging_skipped_counts[slot],
         )
-        return plan, empty
+
+    def _retire_completed_staging_slots(self) -> None:
+        """Reclaim leases whose final-reader events have completed."""
+        active_slots = {plan.slot for plan in self._staging_active.values()}
+        for slot, busy in enumerate(self._staging_slots_busy):
+            if not busy or slot in active_slots:
+                continue
+            event = self._staging_slot_events[slot]
+            if event is not None and event.query():
+                self._staging_slots_busy[slot] = False
+                self._staging_slot_stats[slot]["busy"] = False
+                self._staging_slot_stats[slot]["retirements"] += 1
 
     def _materialize_staged_anchor(
         self,
         layer_id: int,
-        top_k_result: torch.Tensor,
+        plan: _HiSparseStagePlan | None,
+        eligible_count: torch.Tensor,
+        skipped_count: torch.Tensor,
         miss_src: torch.Tensor,
         miss_dst: torch.Tensor,
         miss_count: torch.Tensor,
-        receipt: dict[str, object],
+        follower_layers: int,
     ) -> None:
-        plan = self._staging_active.get(layer_id)
-        miss_positions = torch.arange(miss_src.shape[1], device=miss_src.device)
-        valid_misses = miss_positions < miss_count[0]
-        if plan is None:
-            promotion_mask = torch.zeros_like(valid_misses)
-            promotion_stage = torch.empty(0, dtype=torch.int64, device=self.device)
-        else:
-            matches = miss_src[0].unsqueeze(1) == plan.host_locs.unsqueeze(0)
-            promotion_mask = matches.any(dim=1) & valid_misses
-            promotion_stage = matches.to(dtype=torch.int32).argmax(dim=1)[
-                promotion_mask
-            ]
-        repair_mask = valid_misses & ~promotion_mask
-        promotion_dst = miss_dst[0][promotion_mask]
-        repair_src = miss_src[0][repair_mask]
-        # The placement planner stores destinations as int32, while the
-        # existing HiCache host-repair kernels require int64 indices.
-        repair_dst = miss_dst[0][repair_mask].to(dtype=torch.int64)
+        if plan is not None and (
+            plan.anchor_layer != layer_id
+            or plan.step != self._staging_target_step
+            or plan.lease_epoch != self._staging_slot_epochs[plan.slot]
+            or plan.request != self._split_step_request
+            or plan.project_identity != self._staging_identity
+            or plan.representation != "mla-bf16-width-576"
+        ):
+            raise RuntimeError("stale HiSparse prediction-staging lease")
+        staged_host_locs = (
+            plan.host_locs if plan is not None else self._staging_host_locs[0]
+        )
+        staged_count = (
+            plan.valid_count if plan is not None else self._staging_zero_count[0]
+        )
+        resolve_prediction_staging_mla(
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+            staged_host_locs=staged_host_locs,
+            staged_count=staged_count.view(1),
+            promotion_src=self._staging_promotion_src,
+            promotion_dst=self._staging_promotion_dst,
+            promotion_count=self._staging_promotion_count,
+            repair_src=self._staging_repair_src,
+            repair_dst=self._staging_repair_dst,
+            repair_count=self._staging_repair_count,
+        )
         if plan is not None:
-            destination_tensor = self.mem_pool_device.kv_buffer[layer_id]
-            destination_tensor[promotion_dst].copy_(plan.buffer[promotion_stage])
+            copy_cache_planned_mla(
+                miss_src=self._staging_promotion_src,
+                miss_dst=self._staging_promotion_dst,
+                miss_count=self._staging_promotion_count,
+                num_real_reqs=self._staging_one_request,
+                host_cache=plan.buffer,
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                item_size_bytes=self.item_size_bytes,
+            )
+        copy_cache_planned_mla(
+            miss_src=self._staging_repair_src,
+            miss_dst=self._staging_repair_dst,
+            miss_count=self._staging_repair_count,
+            num_real_reqs=self._staging_one_request,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            item_size_bytes=self.item_size_bytes,
+        )
+        row = self._staging_observation_rows[layer_id]
+        counts = self._staging_observation_counts[row]
+        counts[0].copy_(eligible_count)
+        counts[1].copy_(staged_count)
+        counts[2].copy_(self._staging_promotion_count[0])
+        counts[3].copy_(self._staging_repair_count[0])
+        counts[4].copy_(skipped_count)
+        counts[5].copy_(miss_count[0])
+        plans = self._staging_observation_plans
+        if plan is not None:
+            plans["stage_logical"][row].copy_(plan.logical_ids)
+            plans["stage_source"][row].copy_(plan.host_locs)
+        plans["promotion_source"][row].copy_(self._staging_promotion_src[0])
+        plans["promotion_destination"][row].copy_(self._staging_promotion_dst[0])
+        plans["repair_source"][row].copy_(self._staging_repair_src[0])
+        plans["repair_destination"][row].copy_(self._staging_repair_dst[0])
+        plans["follower_source"][row].copy_(miss_src[0])
+        plans["follower_destination"][row].copy_(miss_dst[0])
+        if plan is not None:
             event = self._staging_slot_events[plan.slot]
             if event is not None:
                 event.record(device_module.current_stream())
             else:
                 self._staging_slots_busy[plan.slot] = False
+                self._staging_slot_stats[plan.slot]["busy"] = False
+                self._staging_slot_stats[plan.slot]["retirements"] += 1
             self._staging_active.pop(layer_id, None)
-        if repair_src.numel() > 0:
-            self.mem_pool_host.load_to_device_per_layer(
-                self.mem_pool_device,
-                repair_src,
-                repair_dst,
-                layer_id,
-                io_backend="kernel",
-            )
-        receipt.update(
-            {
-                "promoted_rows": promotion_dst.numel(),
-                "repaired_rows": repair_dst.numel(),
-                "stage_h2d_bytes": int(receipt["staged_rows"]) * self.item_size_bytes,
-                "promotion_d2d_bytes": promotion_dst.numel() * self.item_size_bytes,
-                "repair_h2d_bytes": repair_dst.numel() * self.item_size_bytes,
-            }
-        )
         self._staging_device_records[layer_id] = {
-            "receipt": receipt,
-            "plan": plan,
-            "promotion_stage": promotion_stage,
-            "promotion_destination": promotion_dst,
-            "repair_source": repair_src,
-            "repair_destination": repair_dst,
-            "follower_source": torch.empty(0, dtype=torch.int64, device=self.device),
-            "follower_destination": torch.empty(
-                0, dtype=torch.int64, device=self.device
-            ),
-            "follower_layers": 0,
-            "follower_count": miss_count[0],
+            "observation_row": row,
+            "follower_layers": follower_layers,
         }
 
     def abort_split_materialization(self, *, safe_to_reuse: bool) -> None:
@@ -967,6 +1229,10 @@ class HiSparseCoordinator:
             self.prefetch_stream.synchronize()
             current_stream.synchronize()
             if self.prediction_staging_enabled:
+                for slot, busy in enumerate(self._staging_slots_busy):
+                    if busy:
+                        self._staging_slot_stats[slot]["retirements"] += 1
+                    self._staging_slot_stats[slot]["busy"] = False
                 self._staging_active.clear()
                 self._staging_device_records.clear()
                 self._staging_slots_busy[:] = [False, False]
@@ -1513,12 +1779,22 @@ class HiSparseCoordinator:
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
+        if self.prediction_staging_enabled:
+            self._staging_pending_generated_positions = tuple(
+                (int(seq_lens_cpu[index]) - 1) // self.compress_ratio - 1
+                for index in backup_indices
+            )
 
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
             return
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
+        if self.prediction_staging_enabled:
+            positions = self._staging_pending_generated_positions
+            self._staging_generated_publications += len(positions)
+            self._staging_last_generated_positions = positions
+            self._staging_pending_generated_positions = ()
 
     def naive_load_topk(
         self,
@@ -1900,7 +2176,16 @@ class HiSparseCoordinator:
         table = self.top_k_device_locs_buffer[:num_reqs]
         group = (layer_id, *self._prefetch_groups.get(layer_id, []))
         try:
-            stage_receipt: dict[str, object] = {}
+            stage_plan = None
+            eligible_count = None
+            skipped_count = None
+            if self.prediction_staging_enabled:
+                # Optional staging reads only published host history and completes
+                # into isolated storage before authoritative placement can change.
+                self.wait_for_pending_backup()
+                stage_plan, eligible_count, skipped_count = self._stage_prediction_rows(
+                    layer_id
+                )
             plan_cache_to_device_buffer_mla(
                 top_k_tokens=top_k_result,
                 device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -1930,33 +2215,25 @@ class HiSparseCoordinator:
                 miss_src=self._miss_src[:num_reqs],
                 miss_dst=self._miss_dst[:num_reqs],
                 miss_count=self._miss_count[:num_reqs],
+                staging=stage_plan,
             )
             self._split_pending = pending
             self._split_followers_seen = 0
 
-            # Planning only reads metadata. Materialization reads pinned host
-            # rows, so it must observe publication of the previous generated
-            # token before either the anchor or followers copy those bytes.
-            self.wait_for_pending_backup()
             if self.prediction_staging_enabled:
-                # Stage reads are host reads too.  Keep them after the native
-                # publication fence, not merely the later real-destination
-                # repair, so staged bytes cannot observe an unfinished backup.
-                _, stage_receipt = self._stage_prediction_rows(layer_id)
+                assert eligible_count is not None and skipped_count is not None
                 self._materialize_staged_anchor(
                     layer_id,
-                    top_k_result,
+                    stage_plan,
+                    eligible_count,
+                    skipped_count,
                     self._miss_src[:num_reqs],
                     self._miss_dst[:num_reqs],
                     self._miss_count[:num_reqs],
-                    stage_receipt,
+                    len(group[1:]),
                 )
-                record = self._staging_device_records[layer_id]
-                record["follower_source"] = self._miss_src[0]
-                record["follower_destination"] = self._miss_dst[0]
-                record["follower_count"] = self._miss_count[0]
-                record["follower_layers"] = len(group[1:])
             else:
+                self.wait_for_pending_backup()
                 self._run_copy_only_kernel(num_reqs, layer_id)
             followers = group[1:]
             if followers:

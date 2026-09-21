@@ -1,4 +1,5 @@
 import sys
+from typing import Literal
 
 import pytest
 import torch
@@ -7,6 +8,8 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     plan_cache_to_device_buffer_mla,
+    plan_prediction_staging_mla,
+    resolve_prediction_staging_mla,
     transfer_cache_dsv4_mla,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -560,7 +563,10 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
 
 
 @pytest.mark.skipif(is_hip(), reason="M4.2 qualifies the CUDA GLM MLA profile.")
-def test_plan_then_copy_matches_fused_bytes_at_glm_profile() -> None:
+@pytest.mark.parametrize("prediction_staging", ["off", "mixed", "zero_hit"])
+def test_plan_then_copy_matches_fused_bytes_at_glm_profile(
+    prediction_staging: Literal["off", "mixed", "zero_hit"],
+) -> None:
     """Plan/replay must exactly match fused placement and bytes over two steps."""
     num_top_k = 2048
     hot_buffer_size = 4096
@@ -638,6 +644,8 @@ def test_plan_then_copy_matches_fused_bytes_at_glm_profile() -> None:
     initial_device_before = initial_device.clone()
 
     host_cache_locs = host_locs_cpu.to(DEVICE)
+    # This optional prediction source is unpublished and never real demand.
+    host_cache_locs[1, 7001] = -1
     device_buffer_locs = device_locs_cpu.to(DEVICE)
     req_pool_indices = torch.tensor([1], dtype=torch.int64, device=DEVICE)
     seq_lens = torch.tensor([seq_capacity], dtype=torch.int32, device=DEVICE)
@@ -684,6 +692,81 @@ def test_plan_then_copy_matches_fused_bytes_at_glm_profile() -> None:
 
     for raw_top_k, miss_tokens in round_inputs:
         top_k_tokens = raw_top_k[permutation].view(1, -1).to(DEVICE)
+        if prediction_staging != "off":
+            authoritative_before = {
+                name: tensor.clone() for name, tensor in split.items()
+            }
+            host_map_before = host_cache_locs.clone()
+            # Predict half the misses, one resident and one unnecessary row.
+            # Include duplicates, unavailable history, the newest device-only
+            # row and a private future position in the valid prediction prefix.
+            predicted = torch.cat(
+                (
+                    miss_tokens[::2],
+                    miss_tokens[:1],
+                    torch.tensor([2500, 7000, 7001, newest_token, seq_capacity, -1]),
+                )
+            ).to(torch.int32)
+            if prediction_staging == "zero_hit":
+                predicted = torch.tensor(
+                    [7000, 7000, 7001, newest_token, seq_capacity, -1],
+                    dtype=torch.int32,
+                )
+            prediction_ids = torch.full(
+                (num_top_k,), -1, dtype=torch.int32, device=DEVICE
+            )
+            prediction_ids[: predicted.numel()].copy_(predicted)
+            staged_ids = torch.empty(num_top_k, dtype=torch.int64, device=DEVICE)
+            stage_src, stage_dst, stage_count = _make_plan(1, num_top_k)
+            eligible_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+            skipped_count = torch.zeros_like(eligible_count)
+            stage = torch.full(
+                (num_top_k, 1, row_width), -999, dtype=torch.bfloat16, device=DEVICE
+            )
+            plan_prediction_staging_mla(
+                logical_ids=prediction_ids,
+                valid_count=torch.tensor(
+                    [predicted.numel()], dtype=torch.int32, device=DEVICE
+                ),
+                host_cache_locs=host_cache_locs[1],
+                history_limit=newest_token,
+                staged_logical_ids=staged_ids,
+                staged_host_locs=stage_src[0],
+                staged_dst_locs=stage_dst[0],
+                staged_count=stage_count,
+                eligible_count=eligible_count,
+                skipped_count=skipped_count,
+            )
+            copy_cache_planned_mla(
+                miss_src=stage_src,
+                miss_dst=stage_dst,
+                miss_count=stage_count,
+                num_real_reqs=num_real_reqs,
+                host_cache=host_cache,
+                device_buffer=stage,
+                item_size_bytes=item_size_bytes,
+            )
+            torch.cuda.synchronize()
+            expected_stage_ids = sorted(
+                {
+                    token
+                    for token in predicted.tolist()
+                    if 0 <= token < newest_token and token != 7001
+                }
+            )
+            staged_count = int(stage_count.item())
+            actual_stage_ids = staged_ids[:staged_count].cpu()
+            assert sorted(actual_stage_ids.tolist()) == expected_stage_ids
+            assert int(eligible_count.item()) == predicted.numel()
+            assert int(skipped_count.item()) == predicted.numel() - staged_count
+            assert torch.equal(
+                byte_view(stage[:staged_count].cpu()),
+                byte_view(source_rows[actual_stage_ids]),
+            )
+            for name, previous in authoritative_before.items():
+                assert torch.equal(split[name], previous), name
+            assert torch.equal(host_cache_locs, host_map_before)
+            assert torch.equal(byte_view(host_cache), byte_view(host_before))
         fused_out = torch.full_like(top_k_tokens, -1)
         load_cache_to_device_buffer_mla(
             top_k_tokens=top_k_tokens,
@@ -742,15 +825,63 @@ def test_plan_then_copy_matches_fused_bytes_at_glm_profile() -> None:
 
         independently_replayed = split_before.clone()
         independently_replayed[recorded_dst] = host_cache[recorded_src].to(DEVICE)
+        host_only = (
+            split_before.clone()
+            if prediction_staging != "off"
+            else split["device_buffer"]
+        )
         copy_cache_planned_mla(
             miss_src=miss_src,
             miss_dst=miss_dst,
             miss_count=miss_count,
             num_real_reqs=num_real_reqs,
             host_cache=host_cache,
-            device_buffer=split["device_buffer"],
+            device_buffer=host_only,
             item_size_bytes=item_size_bytes,
         )
+        if prediction_staging != "off":
+            original_plan = (miss_src.clone(), miss_dst.clone(), miss_count.clone())
+            promotion_src, promotion_dst, promotion_count = _make_plan(1, num_top_k)
+            repair_src, repair_dst, repair_count = _make_plan(1, num_top_k)
+            resolve_prediction_staging_mla(
+                miss_src=miss_src,
+                miss_dst=miss_dst,
+                miss_count=miss_count,
+                staged_host_locs=stage_src[0],
+                staged_count=stage_count,
+                promotion_src=promotion_src,
+                promotion_dst=promotion_dst,
+                promotion_count=promotion_count,
+                repair_src=repair_src,
+                repair_dst=repair_dst,
+                repair_count=repair_count,
+            )
+            for src, dst, valid, source in (
+                (promotion_src, promotion_dst, promotion_count, stage),
+                (repair_src, repair_dst, repair_count, host_cache),
+            ):
+                copy_cache_planned_mla(
+                    miss_src=src,
+                    miss_dst=dst,
+                    miss_count=valid,
+                    num_real_reqs=num_real_reqs,
+                    host_cache=source,
+                    device_buffer=split["device_buffer"],
+                    item_size_bytes=item_size_bytes,
+                )
+            # Followers always replay every original miss from their own layer.
+            follower_host = torch.empty_like(host_cache, pin_memory=True)
+            follower_host.copy_(-host_cache)
+            follower = -split_before
+            copy_cache_planned_mla(
+                miss_src=miss_src,
+                miss_dst=miss_dst,
+                miss_count=miss_count,
+                num_real_reqs=num_real_reqs,
+                host_cache=follower_host,
+                device_buffer=follower,
+                item_size_bytes=item_size_bytes,
+            )
         torch.cuda.synchronize()
 
         assert torch.equal(
@@ -759,6 +890,7 @@ def test_plan_then_copy_matches_fused_bytes_at_glm_profile() -> None:
         assert torch.equal(
             byte_view(split["device_buffer"]), byte_view(fused["device_buffer"])
         )
+        assert torch.equal(byte_view(split["device_buffer"]), byte_view(host_only))
         selected_tokens = raw_top_k[permutation]
         expected_selected = source_rows[selected_tokens.to(torch.int64)].clone()
         expected_selected[selected_tokens == newest_token] = -source_rows[newest_token]
@@ -772,6 +904,64 @@ def test_plan_then_copy_matches_fused_bytes_at_glm_profile() -> None:
         )
         assert torch.equal(split["device_buffer_tokens"][0].cpu(), request_zero_tokens)
         assert torch.equal(split["lru_slots"][0].cpu(), request_zero_lru)
+        if prediction_staging != "off":
+            promoted = int(promotion_count.item())
+            repaired = int(repair_count.item())
+            assert repaired > 0 and promoted + repaired == count
+            if prediction_staging == "mixed":
+                assert promoted > 0
+            else:
+                assert promoted == 0 and repaired == count
+            promotion_destinations = promotion_dst[0, :promoted].to(torch.int64)
+            repair_destinations = repair_dst[0, :repaired].cpu().tolist()
+            promoted_set = set(promotion_destinations.cpu().tolist())
+            assert promoted_set.isdisjoint(repair_destinations)
+            assert promoted_set | set(repair_destinations) == set(
+                recorded_dst.cpu().tolist()
+            )
+            for actual, before in zip((miss_src, miss_dst, miss_count), original_plan):
+                assert torch.equal(actual, before)
+            assert torch.equal(byte_view(follower), byte_view(-host_only))
+            assert torch.equal(
+                byte_view(follower.index_select(0, split_out.view(-1)).cpu()),
+                byte_view(-expected_selected),
+            )
+
+            if promoted == 0:
+                continue
+
+            # A separate source-use probe: completed staged bytes must survive
+            # changing only their synthetic host source. Host repair would now
+            # return a different pattern, so hidden host-only copying fails.
+            saved = (
+                split["device_buffer"].index_select(0, promotion_destinations).clone()
+            )
+            source_positions = promotion_src[0, :promoted]
+            altered_host_positions = (
+                stage_src[0].index_select(0, source_positions).cpu()
+            )
+            host_cache[altered_host_positions] = 123
+            split["device_buffer"][promotion_destinations] = -777
+            copy_cache_planned_mla(
+                miss_src=promotion_src,
+                miss_dst=promotion_dst,
+                miss_count=promotion_count,
+                num_real_reqs=num_real_reqs,
+                host_cache=stage,
+                device_buffer=split["device_buffer"],
+                item_size_bytes=item_size_bytes,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(
+                byte_view(
+                    split["device_buffer"].index_select(0, promotion_destinations)
+                ),
+                byte_view(saved),
+            )
+            assert not torch.equal(
+                byte_view(saved.cpu()), byte_view(host_cache[altered_host_positions])
+            )
+            host_cache.copy_(host_before)
 
 
 def test_load_cache_to_device_buffer_dsv4_mla_miss_copy_layout() -> None:

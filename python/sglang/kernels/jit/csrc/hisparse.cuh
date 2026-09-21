@@ -935,4 +935,160 @@ void copy_cache_planned(
       item_size_bytes);
 }
 
+/** Build a bounded host-to-stage plan without host scalar extraction.
+ *
+ * Each thread owns one prediction position. A retained row is the first valid
+ * occurrence of its logical ID and must have a published host mapping. Output
+ * order is intentionally unspecified; logical/source pairs remain exact.
+ */
+template <int BLOCK_SIZE>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void plan_prediction_staging_kernel(
+    const int32_t* __restrict__ logical_ids,
+    const int32_t* __restrict__ valid_count,
+    const int64_t* __restrict__ host_cache_locs,
+    int64_t history_limit,
+    int64_t capacity,
+    int64_t* __restrict__ staged_logical_ids,
+    int64_t* __restrict__ staged_host_locs,
+    int32_t* __restrict__ staged_dst_locs,
+    int32_t* __restrict__ staged_count,
+    int32_t* __restrict__ eligible_count,
+    int32_t* __restrict__ skipped_count) {
+  const int32_t prefix_count = max(0, min(valid_count[0], static_cast<int32_t>(capacity)));
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    eligible_count[0] = prefix_count;
+  }
+  for (int64_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < capacity;
+       i += gridDim.x * BLOCK_SIZE) {
+    if (i >= prefix_count) continue;
+    const int64_t logical_id = static_cast<int64_t>(logical_ids[i]);
+    bool retain = logical_id >= 0 && logical_id < history_limit;
+    int64_t host_loc = -1;
+    if (retain) {
+      host_loc = host_cache_locs[logical_id];
+      retain = host_loc >= 0;
+    }
+    if (retain) {
+      for (int64_t previous = 0; previous < i; ++previous) {
+        if (static_cast<int64_t>(logical_ids[previous]) == logical_id) {
+          retain = false;
+          break;
+        }
+      }
+    }
+    if (!retain) {
+      atomicAdd(skipped_count, 1);
+      continue;
+    }
+    const int32_t output = atomicAdd(staged_count, 1);
+    staged_logical_ids[output] = logical_id;
+    staged_host_locs[output] = host_loc;
+    staged_dst_locs[output] = output;
+  }
+}
+
+/** Launch fixed-capacity prediction filtering and host-source planning. */
+template <int BLOCK_SIZE>
+void plan_prediction_staging(
+    tvm::ffi::TensorView logical_ids,
+    tvm::ffi::TensorView valid_count,
+    tvm::ffi::TensorView host_cache_locs,
+    int64_t history_limit,
+    tvm::ffi::TensorView staged_logical_ids,
+    tvm::ffi::TensorView staged_host_locs,
+    tvm::ffi::TensorView staged_dst_locs,
+    tvm::ffi::TensorView staged_count,
+    tvm::ffi::TensorView eligible_count,
+    tvm::ffi::TensorView skipped_count) {
+  using namespace host;
+  const int64_t capacity = logical_ids.numel();
+  const int64_t num_blocks = (capacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  const auto device = LaunchKernel::resolve_device(logical_ids.device());
+  LaunchKernel(num_blocks, BLOCK_SIZE, device)(
+      plan_prediction_staging_kernel<BLOCK_SIZE>,
+      static_cast<const int32_t*>(logical_ids.data_ptr()),
+      static_cast<const int32_t*>(valid_count.data_ptr()),
+      static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+      history_limit,
+      capacity,
+      static_cast<int64_t*>(staged_logical_ids.data_ptr()),
+      static_cast<int64_t*>(staged_host_locs.data_ptr()),
+      static_cast<int32_t*>(staged_dst_locs.data_ptr()),
+      static_cast<int32_t*>(staged_count.data_ptr()),
+      static_cast<int32_t*>(eligible_count.data_ptr()),
+      static_cast<int32_t*>(skipped_count.data_ptr()));
+}
+
+/** Resolve every real miss to exactly one staged or host source on device. */
+template <int BLOCK_SIZE>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_prediction_staging_kernel(
+    const int64_t* __restrict__ miss_src,
+    const int32_t* __restrict__ miss_dst,
+    const int32_t* __restrict__ miss_count,
+    const int64_t* __restrict__ staged_host_locs,
+    const int32_t* __restrict__ staged_count,
+    int64_t capacity,
+    int64_t* __restrict__ promotion_src,
+    int32_t* __restrict__ promotion_dst,
+    int32_t* __restrict__ promotion_count,
+    int64_t* __restrict__ repair_src,
+    int32_t* __restrict__ repair_dst,
+    int32_t* __restrict__ repair_count) {
+  const int32_t real_misses = max(0, min(miss_count[0], static_cast<int32_t>(capacity)));
+  const int32_t staged_rows = max(0, min(staged_count[0], static_cast<int32_t>(capacity)));
+  for (int32_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < real_misses;
+       i += gridDim.x * BLOCK_SIZE) {
+    int32_t stage_position = -1;
+    for (int32_t staged = 0; staged < staged_rows; ++staged) {
+      if (staged_host_locs[staged] == miss_src[i]) {
+        stage_position = staged;
+        break;
+      }
+    }
+    if (stage_position >= 0) {
+      const int32_t output = atomicAdd(promotion_count, 1);
+      promotion_src[output] = static_cast<int64_t>(stage_position);
+      promotion_dst[output] = miss_dst[i];
+    } else {
+      const int32_t output = atomicAdd(repair_count, 1);
+      repair_src[output] = miss_src[i];
+      repair_dst[output] = miss_dst[i];
+    }
+  }
+}
+
+/** Launch fixed-capacity staged-promotion versus host-repair resolution. */
+template <int BLOCK_SIZE>
+void resolve_prediction_staging(
+    tvm::ffi::TensorView miss_src,
+    tvm::ffi::TensorView miss_dst,
+    tvm::ffi::TensorView miss_count,
+    tvm::ffi::TensorView staged_host_locs,
+    tvm::ffi::TensorView staged_count,
+    tvm::ffi::TensorView promotion_src,
+    tvm::ffi::TensorView promotion_dst,
+    tvm::ffi::TensorView promotion_count,
+    tvm::ffi::TensorView repair_src,
+    tvm::ffi::TensorView repair_dst,
+    tvm::ffi::TensorView repair_count) {
+  using namespace host;
+  const int64_t capacity = miss_src.shape()[1];
+  const int64_t num_blocks = (capacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  const auto device = LaunchKernel::resolve_device(miss_src.device());
+  LaunchKernel(num_blocks, BLOCK_SIZE, device)(
+      resolve_prediction_staging_kernel<BLOCK_SIZE>,
+      static_cast<const int64_t*>(miss_src.data_ptr()),
+      static_cast<const int32_t*>(miss_dst.data_ptr()),
+      static_cast<const int32_t*>(miss_count.data_ptr()),
+      static_cast<const int64_t*>(staged_host_locs.data_ptr()),
+      static_cast<const int32_t*>(staged_count.data_ptr()),
+      capacity,
+      static_cast<int64_t*>(promotion_src.data_ptr()),
+      static_cast<int32_t*>(promotion_dst.data_ptr()),
+      static_cast<int32_t*>(promotion_count.data_ptr()),
+      static_cast<int64_t*>(repair_src.data_ptr()),
+      static_cast<int32_t*>(repair_dst.data_ptr()),
+      static_cast<int32_t*>(repair_count.data_ptr()));
+}
+
 }  // namespace sglang

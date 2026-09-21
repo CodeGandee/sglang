@@ -32,15 +32,19 @@ class _FakeStream:
 
 
 class _FakeEvent:
-    def __init__(self) -> None:
+    def __init__(self, *, complete: bool = False) -> None:
         self.recorded: list[object] = []
         self.waited: list[object] = []
+        self.complete = complete
 
     def record(self, stream: object) -> None:
         self.recorded.append(stream)
 
     def wait(self, stream: object) -> None:
         self.waited.append(stream)
+
+    def query(self) -> bool:
+        return self.complete
 
 
 class _FakeDeviceModule:
@@ -109,6 +113,145 @@ def _coordinator() -> HiSparseCoordinator:
 
 
 class TestHiSparsePendingPlan(unittest.TestCase):
+    @staticmethod
+    def _bindable_staging_coordinator() -> tuple[
+        HiSparseCoordinator, SimpleNamespace, SimpleNamespace
+    ]:
+        coordinator = _coordinator()
+        request = SimpleNamespace(req_pool_idx=7, rid="request-a")
+        native_identity = _HiSparseRequestIdentity(7, 3, id(request))
+        coordinator._split_requests = {7: native_identity}
+        coordinator._split_step_request = native_identity
+        coordinator._split_next_request = native_identity
+        coordinator._prediction_staging_enabled = True
+        coordinator.req_to_host_pool = coordinator.req_to_host_pool.repeat(8, 1)
+        coordinator._staging_buffers = (
+            torch.empty((2, 1, 576), dtype=torch.bfloat16),
+            torch.empty((2, 1, 576), dtype=torch.bfloat16),
+        )
+        coordinator._staging_views = {}
+        coordinator._staging_identity = None
+        coordinator._staging_target_step = -1
+        coordinator._staging_history_limit = 0
+        coordinator._staging_request_slot = -1
+        coordinator._staging_observation_anchor_ids = ()
+        coordinator._staging_device_records = {}
+        coordinator._staging_zero_count = torch.zeros(1, dtype=torch.int32)
+        coordinator._staging_slots_busy = [False, False]
+        coordinator._staging_slot_events = (None, None)
+        coordinator._staging_slot_next = 0
+        coordinator._staging_slot_epochs = [0, 0]
+        coordinator._staging_active = {}
+        coordinator._staging_slot_stats = [
+            {
+                "slot": slot,
+                "admissions": 0,
+                "reuses": 0,
+                "retirements": 0,
+                "busy": False,
+            }
+            for slot in range(2)
+        ]
+        coordinator._staging_skipped_admissions = 0
+        coordinator._staging_generated_publications = 0
+        coordinator._staging_last_generated_positions = ()
+        project_identity = SimpleNamespace(
+            request_id="request-a", request_pool_index=7, generation=91
+        )
+        return coordinator, request, project_identity
+
+    @staticmethod
+    def _prediction_view(
+        identity: SimpleNamespace, *, anchor: int = 2, target_step: int = 4
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            tag=SimpleNamespace(
+                identity=identity,
+                target_step=target_step,
+                anchor=anchor,
+                group=anchor,
+                group_layers=(anchor, 3, 4, 5) if anchor == 2 else (anchor,),
+                representation="logical_position",
+                committed_history_limit=8,
+            ),
+            logical_ids=torch.tensor([1, 2], dtype=torch.int32),
+            valid_count=torch.tensor(2, dtype=torch.int32),
+        )
+
+    def test_prediction_binding_bridges_independent_generations_and_rejects_stale_tag(
+        self,
+    ) -> None:
+        coordinator, request, identity = self._bindable_staging_coordinator()
+        view = self._prediction_view(identity)
+
+        coordinator.bind_prediction_staging(
+            request,
+            identity=identity,
+            target_step=4,
+            committed_history_limit=8,
+            eligible_views={2: view},
+        )
+
+        self.assertEqual(coordinator._staging_identity, identity)
+        self.assertEqual(coordinator._staging_observation_anchor_ids, (0, 1, 2, 6))
+        self.assertNotEqual(identity.generation, 3)
+
+        stale = self._prediction_view(identity, target_step=5)
+        with self.assertRaisesRegex(RuntimeError, "stale or mis-keyed"):
+            coordinator.bind_prediction_staging(
+                request,
+                identity=identity,
+                target_step=4,
+                committed_history_limit=8,
+                eligible_views={2: stale},
+            )
+
+    def test_first_step_observation_covers_every_fresh_anchor(self) -> None:
+        coordinator, request, identity = self._bindable_staging_coordinator()
+        coordinator.bind_prediction_staging(
+            request,
+            identity=identity,
+            target_step=0,
+            committed_history_limit=0,
+            eligible_views={},
+        )
+        coordinator.enable_prefetch = True
+        fake_device = _FakeDeviceModule()
+        with patch.object(hisparse_module, "device_module", fake_device):
+            coordinator._synchronize_staging_observation()
+
+        self.assertEqual(
+            set(coordinator._staging_observation["anchors"]), {"0", "1", "2", "6"}
+        )
+        self.assertTrue(
+            all(
+                anchor["staged_rows"] == 0
+                for anchor in coordinator._staging_observation["anchors"].values()
+            )
+        )
+
+    def test_full_stage_ring_skips_without_waiting_or_losing_prediction_count(
+        self,
+    ) -> None:
+        coordinator, request, identity = self._bindable_staging_coordinator()
+        view = self._prediction_view(identity)
+        coordinator.bind_prediction_staging(
+            request,
+            identity=identity,
+            target_step=4,
+            committed_history_limit=8,
+            eligible_views={2: view},
+        )
+        coordinator._staging_slots_busy[:] = [True, True]
+        coordinator._staging_slot_events = (_FakeEvent(), _FakeEvent())
+
+        plan, eligible_count, skipped_count = coordinator._stage_prediction_rows(2)
+
+        self.assertIsNone(plan)
+        self.assertIs(eligible_count, view.valid_count)
+        self.assertIs(skipped_count, view.valid_count)
+        self.assertEqual(coordinator._staging_skipped_admissions, 1)
+
     def test_every_anchor_materializes_and_one_borrowed_plan_is_reused(self) -> None:
         coordinator = _coordinator()
         copies: list[int] = []
@@ -329,6 +472,38 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unsafe; retire it"):
             coordinator._prepare_split_request_release(req)
 
+    def test_cancel_drains_and_retires_busy_stage_leases(self) -> None:
+        coordinator, _request, identity = self._bindable_staging_coordinator()
+        coordinator._staging_active = {2: SimpleNamespace()}
+        coordinator._staging_device_records = {2: {"observation_row": 2}}
+        coordinator._staging_slots_busy[:] = [True, True]
+        coordinator._staging_slot_stats[0]["busy"] = True
+        coordinator._staging_slot_stats[1]["busy"] = True
+        coordinator._staging_views = {2: self._prediction_view(identity)}
+        coordinator._staging_identity = identity
+        coordinator._staging_target_step = 4
+        coordinator._staging_history_limit = 8
+        coordinator._staging_request_slot = 7
+        coordinator._split_pending = SimpleNamespace()
+        fake_device = _FakeDeviceModule()
+
+        with patch.object(hisparse_module, "device_module", fake_device):
+            coordinator.abort_split_materialization(safe_to_reuse=True)
+
+        self.assertEqual(coordinator._staging_active, {})
+        self.assertEqual(coordinator._staging_device_records, {})
+        self.assertEqual(coordinator._staging_slots_busy, [False, False])
+        self.assertEqual(
+            [stats["retirements"] for stats in coordinator._staging_slot_stats],
+            [1, 1],
+        )
+        self.assertEqual(
+            [stats["busy"] for stats in coordinator._staging_slot_stats],
+            [False, False],
+        )
+        self.assertIsNone(coordinator._staging_identity)
+        self.assertTrue(coordinator.split_worker_reusable)
+
     def test_allocated_requests_keep_independent_slot_generations(self) -> None:
         coordinator = _coordinator()
         coordinator._split_generation = 0
@@ -527,6 +702,149 @@ class TestHiSparsePendingPlan(unittest.TestCase):
                 torch.equal(actual.cpu(), expected),
                 f"layer {layer_id} consumed another layer's or poisoned bytes",
             )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None,
+        "CUDA is required for the delayed prediction-stage reader check",
+    )
+    def test_delayed_stage_readers_block_reuse_until_completion(self) -> None:
+        device = torch.device("cuda")
+        capacity = 4
+        row_width = 576
+        layer_count = 10
+        host_rows = 8
+        physical_rows = 12
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        host_layers = [
+            torch.empty(
+                (host_rows, 1, row_width),
+                dtype=torch.bfloat16,
+                pin_memory=True,
+            )
+            for _ in range(layer_count)
+        ]
+        device_layers = [
+            torch.full(
+                (physical_rows, 1, row_width),
+                -700 - layer_id,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            for layer_id in range(layer_count)
+        ]
+        for layer_id, host in enumerate(host_layers):
+            for row in range(host_rows):
+                host[row].fill_(layer_id * 16 + row)
+        native_bytes = sum(tensor.nbytes for tensor in device_layers)
+        coordinator.device = str(device)
+        coordinator.top_k = capacity
+        coordinator.item_size_bytes = row_width * torch.bfloat16.itemsize
+        coordinator.mem_pool_device = SimpleNamespace(
+            kv_buffer=device_layers,
+            get_kv_size_bytes=lambda: native_bytes,
+        )
+        coordinator.mem_pool_host = SimpleNamespace(kv_buffer=host_layers)
+        coordinator._split_anchor_layers = (0, 1, 2, 6)
+        coordinator._staging_slot_events = (None, None)
+        coordinator._staging_slot_stats = [
+            {
+                "slot": slot,
+                "admissions": 0,
+                "reuses": 0,
+                "retirements": 0,
+                "busy": False,
+            }
+            for slot in range(2)
+        ]
+        coordinator._staging_slot_epochs = [0, 0]
+        coordinator._staging_skipped_admissions = 0
+        coordinator._enable_prediction_staging(0)
+        coordinator._staging_slots_busy = [False, False]
+        coordinator._staging_active = {}
+        coordinator._staging_device_records = {}
+        coordinator._staging_generated_publications = 0
+        coordinator._staging_last_generated_positions = ()
+        coordinator.req_to_host_pool = torch.arange(
+            host_rows, dtype=torch.int64, device=device
+        ).view(1, -1)
+        native_identity = _HiSparseRequestIdentity(0, 7, 101)
+        project_identity = SimpleNamespace(
+            request_id="device-reader", request_pool_index=0, generation=19
+        )
+        coordinator._split_requests = {0: native_identity}
+        coordinator._split_step_request = native_identity
+        coordinator._staging_identity = project_identity
+        coordinator._staging_target_step = 4
+        coordinator._staging_history_limit = 7
+        coordinator._staging_request_slot = 0
+        coordinator._staging_slot_next = 0
+        coordinator._staging_observation_anchor_ids = (0, 1, 2, 6)
+        coordinator._staging_views = {
+            layer_id: SimpleNamespace(
+                logical_ids=torch.tensor(
+                    [layer_id, -1, -1, -1], dtype=torch.int32, device=device
+                ),
+                valid_count=torch.tensor(1, dtype=torch.int32, device=device),
+            )
+            for layer_id in (0, 1, 2)
+        }
+        miss_src = torch.tensor([[0, 0, 0, 0]], dtype=torch.int64, device=device)
+        second_miss_src = torch.tensor([[1, 0, 0, 0]], dtype=torch.int64, device=device)
+        miss_dst = torch.tensor([[5, 0, 0, 0]], dtype=torch.int32, device=device)
+        miss_count = torch.tensor([1], dtype=torch.int32, device=device)
+        delayed = torch.cuda.Stream()
+        delayed.wait_stream(torch.cuda.current_stream())
+        allocated_bytes = coordinator.staging_allocation_receipt["total_bytes"]
+
+        with torch.cuda.stream(delayed):
+            first, first_eligible, first_skipped = coordinator._stage_prediction_rows(0)
+            self.assertIsNotNone(first)
+            torch.cuda._sleep(500_000_000)
+            coordinator._materialize_staged_anchor(
+                0,
+                first,
+                first_eligible,
+                first_skipped,
+                miss_src,
+                miss_dst,
+                miss_count,
+                0,
+            )
+            second, second_eligible, second_skipped = (
+                coordinator._stage_prediction_rows(1)
+            )
+            self.assertIsNotNone(second)
+            torch.cuda._sleep(500_000_000)
+            coordinator._materialize_staged_anchor(
+                1,
+                second,
+                second_eligible,
+                second_skipped,
+                second_miss_src,
+                miss_dst,
+                miss_count,
+                0,
+            )
+            blocked, _, _ = coordinator._stage_prediction_rows(2)
+
+        self.assertIsNone(blocked)
+        self.assertEqual(coordinator._staging_skipped_admissions, 1)
+        self.assertEqual(
+            coordinator.staging_allocation_receipt["total_bytes"], allocated_bytes
+        )
+        delayed.synchronize()
+        self.assertTrue(torch.equal(device_layers[0][5].cpu(), host_layers[0][0]))
+        self.assertTrue(torch.equal(device_layers[1][5].cpu(), host_layers[1][1]))
+
+        reused, _, _ = coordinator._stage_prediction_rows(2)
+        self.assertIsNotNone(reused)
+        torch.cuda.current_stream().synchronize()
+        runtime = coordinator.staging_runtime_receipt
+        self.assertIsNotNone(runtime)
+        self.assertGreaterEqual(sum(row["reuses"] for row in runtime["slot_stats"]), 1)
+        self.assertGreaterEqual(
+            sum(row["retirements"] for row in runtime["slot_stats"]), 1
+        )
 
 
 if __name__ == "__main__":

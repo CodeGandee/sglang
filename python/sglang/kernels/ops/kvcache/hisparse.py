@@ -87,6 +87,25 @@ def _jit_copy_planned_module(
 
 
 @functools.cache
+def _jit_prediction_staging_module(block_size: int) -> Module:
+    return load_jit(
+        "sparse_prediction_staging",
+        block_size,
+        cuda_files=["hisparse.cuh"],
+        cuda_wrappers=[
+            (
+                "plan_prediction_staging",
+                f"plan_prediction_staging<{block_size}>",
+            ),
+            (
+                "resolve_prediction_staging",
+                f"resolve_prediction_staging<{block_size}>",
+            ),
+        ],
+    )
+
+
+@functools.cache
 def _jit_dsv4_transfer_module(block_size: int) -> Module:
     template_args = make_cpp_args(block_size)
     return load_jit(
@@ -456,6 +475,136 @@ def copy_cache_planned_mla(
         empty,
         num_blocks,
         item_size_bytes,
+    )
+
+
+def plan_prediction_staging_mla(
+    *,
+    logical_ids: torch.Tensor,
+    valid_count: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    history_limit: int,
+    staged_logical_ids: torch.Tensor,
+    staged_host_locs: torch.Tensor,
+    staged_dst_locs: torch.Tensor,
+    staged_count: torch.Tensor,
+    eligible_count: torch.Tensor,
+    skipped_count: torch.Tensor,
+    block_size: int = 256,
+) -> None:
+    """Build a fixed-capacity, duplicate-free host-to-stage plan on device.
+
+    All outputs are caller-owned fixed tensors. Counts remain on device, so the
+    ordinary inference path performs no scalar download or dynamic compaction.
+    """
+    assert logical_ids.dtype == torch.int32
+    assert valid_count.dtype == torch.int32 and valid_count.numel() == 1
+    assert host_cache_locs.dtype == torch.int64
+    assert staged_logical_ids.dtype == torch.int64
+    assert staged_host_locs.dtype == torch.int64
+    assert staged_dst_locs.dtype == torch.int32
+    assert staged_count.dtype == torch.int32 and staged_count.numel() == 1
+    assert eligible_count.dtype == torch.int32 and eligible_count.numel() == 1
+    assert skipped_count.dtype == torch.int32 and skipped_count.numel() == 1
+    assert 0 <= history_limit <= host_cache_locs.numel()
+    assert logical_ids.numel() == staged_logical_ids.numel()
+    assert logical_ids.numel() == staged_host_locs.numel()
+    assert logical_ids.numel() == staged_dst_locs.numel()
+    tensors = (
+        logical_ids,
+        valid_count,
+        host_cache_locs,
+        staged_logical_ids,
+        staged_host_locs,
+        staged_dst_locs,
+        staged_count,
+        eligible_count,
+        skipped_count,
+    )
+    assert all(tensor.is_contiguous() for tensor in tensors)
+    assert all(tensor.device == logical_ids.device for tensor in tensors)
+    staged_count.zero_()
+    eligible_count.zero_()
+    skipped_count.zero_()
+    module = _jit_prediction_staging_module(block_size)
+    module.plan_prediction_staging(
+        logical_ids,
+        valid_count,
+        host_cache_locs,
+        history_limit,
+        staged_logical_ids,
+        staged_host_locs,
+        staged_dst_locs,
+        staged_count,
+        eligible_count,
+        skipped_count,
+    )
+
+
+def resolve_prediction_staging_mla(
+    *,
+    miss_src: torch.Tensor,
+    miss_dst: torch.Tensor,
+    miss_count: torch.Tensor,
+    staged_host_locs: torch.Tensor,
+    staged_count: torch.Tensor,
+    promotion_src: torch.Tensor,
+    promotion_dst: torch.Tensor,
+    promotion_count: torch.Tensor,
+    repair_src: torch.Tensor,
+    repair_dst: torch.Tensor,
+    repair_count: torch.Tensor,
+    block_size: int = 256,
+) -> None:
+    """Split one native miss plan into fixed promotion and repair plans."""
+    assert miss_src.dtype == torch.int64 and miss_src.ndim == 2
+    assert miss_dst.dtype == torch.int32 and miss_dst.ndim == 2
+    assert miss_count.dtype == torch.int32 and miss_count.numel() == 1
+    assert staged_host_locs.dtype == torch.int64
+    assert staged_count.dtype == torch.int32 and staged_count.numel() == 1
+    assert promotion_src.dtype == torch.int64 and promotion_src.ndim == 2
+    assert promotion_dst.dtype == torch.int32 and promotion_dst.ndim == 2
+    assert promotion_count.dtype == torch.int32 and promotion_count.numel() == 1
+    assert repair_src.dtype == torch.int64 and repair_src.ndim == 2
+    assert repair_dst.dtype == torch.int32 and repair_dst.ndim == 2
+    assert repair_count.dtype == torch.int32 and repair_count.numel() == 1
+    capacity = miss_src.shape[1]
+    assert miss_dst.shape == miss_src.shape
+    assert promotion_src.shape == miss_src.shape
+    assert promotion_dst.shape == miss_dst.shape
+    assert repair_src.shape == miss_src.shape
+    assert repair_dst.shape == miss_dst.shape
+    assert staged_host_locs.numel() == capacity
+    tensors = (
+        miss_src,
+        miss_dst,
+        miss_count,
+        staged_host_locs,
+        staged_count,
+        promotion_src,
+        promotion_dst,
+        promotion_count,
+        repair_src,
+        repair_dst,
+        repair_count,
+    )
+    assert all(tensor.is_contiguous() for tensor in tensors)
+    assert all(tensor.device == miss_src.device for tensor in tensors)
+    promotion_count.zero_()
+    repair_count.zero_()
+    module = _jit_prediction_staging_module(block_size)
+    module.resolve_prediction_staging(
+        miss_src,
+        miss_dst,
+        miss_count,
+        staged_host_locs,
+        staged_count,
+        promotion_src,
+        promotion_dst,
+        promotion_count,
+        repair_src,
+        repair_dst,
+        repair_count,
     )
 
 
