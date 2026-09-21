@@ -101,6 +101,14 @@ def _jit_prediction_staging_module(block_size: int) -> Module:
                 "resolve_prediction_staging",
                 f"resolve_prediction_staging<{block_size}>",
             ),
+            (
+                "publish_prediction_staging_ready",
+                f"publish_prediction_staging_ready<{block_size}>",
+            ),
+            (
+                "resolve_prediction_staging_ready",
+                f"resolve_prediction_staging_ready<{block_size}>",
+            ),
         ],
     )
 
@@ -555,8 +563,16 @@ def resolve_prediction_staging_mla(
     repair_dst: torch.Tensor,
     repair_count: torch.Tensor,
     block_size: int = 256,
+    ready_tag: torch.Tensor | None = None,
+    expected_tag: int | None = None,
 ) -> None:
-    """Split one native miss plan into fixed promotion and repair plans."""
+    """Split one native miss plan into fixed promotion and repair plans.
+
+    ``ready_tag`` and ``expected_tag`` are optional for the M4.3 synchronous
+    path.  When supplied, the native resolver takes one device-side snapshot
+    and treats a non-matching tag as an empty stage.  It never waits for the
+    speculative producer, so late predictions fall through to urgent repair.
+    """
     assert miss_src.dtype == torch.int64 and miss_src.ndim == 2
     assert miss_dst.dtype == torch.int32 and miss_dst.ndim == 2
     assert miss_count.dtype == torch.int32 and miss_count.numel() == 1
@@ -568,6 +584,11 @@ def resolve_prediction_staging_mla(
     assert repair_src.dtype == torch.int64 and repair_src.ndim == 2
     assert repair_dst.dtype == torch.int32 and repair_dst.ndim == 2
     assert repair_count.dtype == torch.int32 and repair_count.numel() == 1
+    if ready_tag is not None:
+        assert ready_tag.dtype == torch.int64 and ready_tag.numel() == 1
+        assert ready_tag.is_contiguous()
+        if expected_tag is None or expected_tag < 0:
+            raise ValueError("expected_tag is required with ready_tag")
     capacity = miss_src.shape[1]
     assert miss_dst.shape == miss_src.shape
     assert promotion_src.shape == miss_src.shape
@@ -593,19 +614,53 @@ def resolve_prediction_staging_mla(
     promotion_count.zero_()
     repair_count.zero_()
     module = _jit_prediction_staging_module(block_size)
-    module.resolve_prediction_staging(
-        miss_src,
-        miss_dst,
-        miss_count,
-        staged_host_locs,
-        staged_count,
-        promotion_src,
-        promotion_dst,
-        promotion_count,
-        repair_src,
-        repair_dst,
-        repair_count,
-    )
+    if ready_tag is None:
+        module.resolve_prediction_staging(
+            miss_src,
+            miss_dst,
+            miss_count,
+            staged_host_locs,
+            staged_count,
+            promotion_src,
+            promotion_dst,
+            promotion_count,
+            repair_src,
+            repair_dst,
+            repair_count,
+        )
+    else:
+        module.resolve_prediction_staging_ready(
+            miss_src,
+            miss_dst,
+            miss_count,
+            staged_host_locs,
+            staged_count,
+            ready_tag,
+            int(expected_tag),
+            promotion_src,
+            promotion_dst,
+            promotion_count,
+            repair_src,
+            repair_dst,
+            repair_count,
+        )
+
+
+def publish_prediction_staging_ready_mla(
+    *, ready_tag: torch.Tensor, expected_tag: int, block_size: int = 256
+) -> None:
+    """Publish one lease tag after its payload and metadata writes.
+
+    The publication is a device kernel so it is ordered on the speculative
+    stream and visible to a resolver running on the urgent stream without a
+    host event query or scalar download.
+    """
+    if ready_tag.dtype != torch.int64 or ready_tag.numel() != 1:
+        raise ValueError("ready_tag must be one contiguous int64 tensor")
+    if expected_tag < 0:
+        raise ValueError("expected_tag must be non-negative")
+    module = _jit_prediction_staging_module(block_size)
+    module.publish_prediction_staging_ready(ready_tag, int(expected_tag))
 
 
 def load_cache_to_device_buffer_dsv4_mla(

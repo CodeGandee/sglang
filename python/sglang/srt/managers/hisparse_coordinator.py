@@ -11,6 +11,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_mla,
     plan_cache_to_device_buffer_mla,
     plan_prediction_staging_mla,
+    publish_prediction_staging_ready_mla,
     resolve_prediction_staging_mla,
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
@@ -91,6 +92,10 @@ class _HiSparseStagePlan:
     request: _HiSparseRequestIdentity
     project_identity: object
     representation: str
+    ready_tag: torch.Tensor
+    expected_tag: int
+    producer_done: device_module.Event | None = None
+    reader_done: device_module.Event | None = None
 
 
 def _tensor_collection_nbytes(value: object) -> int:
@@ -430,12 +435,20 @@ class HiSparseCoordinator:
         if not self.prediction_staging_enabled:
             return None
         self._retire_completed_staging_slots()
+        if not hasattr(self, "_staging_admitted_counts"):
+            self._staging_admitted_counts = {}
+        if not hasattr(self, "_staging_admission_events"):
+            self._staging_admission_events = []
         return {
             "schema": "sglang.hisparse.prediction-staging-runtime.v1",
             "slot_stats": [dict(stats) for stats in self._staging_slot_stats],
             "skipped_admissions": self._staging_skipped_admissions,
             "generated_publications": self._staging_generated_publications,
             "last_generated_positions": list(self._staging_last_generated_positions),
+            "admission_events": [
+                dict(event)
+                for event in getattr(self, "_staging_admission_events", [])
+            ],
         }
 
     @property
@@ -460,6 +473,7 @@ class HiSparseCoordinator:
         eager: bool,
         staging: bool = False,
         additional_device_bytes: int = 0,
+        predictive_overlap: bool = False,
     ) -> None:
         """Pin this coordinator to the admitted GLM plan/materialize path.
 
@@ -562,6 +576,10 @@ class HiSparseCoordinator:
         self._staging_slot_next = 0
         self._staging_slot_epochs = [0, 0]
         self._staging_active: dict[int, _HiSparseStagePlan] = {}
+        self._staging_admitted_counts: dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._staging_admission_events: list[dict[str, int | str]] = []
         self._staging_device_records: dict[int, dict[str, object]] = {}
         self._staging_slots_busy = [False, False]
         self._staging_slot_events = (None, None)
@@ -581,6 +599,20 @@ class HiSparseCoordinator:
         self._staging_generated_publications = 0
         self._staging_last_generated_positions: tuple[int, ...] = ()
         self._staging_pending_generated_positions: tuple[int, ...] = ()
+        # M4.4 resources are created only after startup explicitly enables
+        # prediction staging.  The existing prefetch stream remains the
+        # native-exact follower queue; speculative and urgent work get their
+        # own streams and lease-scoped events.
+        self._overlap_enabled = False
+        self._speculative_stream = None
+        self._urgent_stream = None
+        self._overlap_compute_stream = None
+        self._staging_ready_tags: tuple[torch.Tensor, ...] = ()
+        self._staging_producer_events: tuple[object, ...] = ()
+        self._staging_reader_events: tuple[object, ...] = ()
+        self._urgent_done_event = None
+        self._prediction_ready_event = None
+        self._overlap_stream_priorities: dict[str, int] = {}
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
             "request_slot": -1,
@@ -595,10 +627,15 @@ class HiSparseCoordinator:
             "skipped_stage_rows": 0,
         }
         if staging:
-            self._enable_prediction_staging(additional_device_bytes)
+            self._enable_prediction_staging(
+                additional_device_bytes,
+                predictive_overlap=predictive_overlap,
+            )
         self._split_materialization_enabled = True
 
-    def _enable_prediction_staging(self, additional_device_bytes: int) -> None:
+    def _enable_prediction_staging(
+        self, additional_device_bytes: int, *, predictive_overlap: bool = False
+    ) -> None:
         """Allocate the bounded native-owned staging ring."""
         if self.item_size_bytes % self.mem_pool_device.kv_buffer[0].element_size():
             raise RuntimeError("HiSparse staging row stride is not element aligned")
@@ -609,6 +646,10 @@ class HiSparseCoordinator:
         capacity = self.top_k
         anchor_count = len(self._split_anchor_layers)
         metadata_bytes = 2 * capacity * (8 + 8 + 4) + 8 * 4
+        if predictive_overlap:
+            # One int64 device tag per fixed lease; tags are part of the
+            # startup memory receipt rather than an unaccounted side array.
+            metadata_bytes += 2 * 8
         matching_workspace_bytes = capacity * (8 + 4) + 4
         repair_workspace_bytes = capacity * (8 + 4) + 4
         observation_bytes = anchor_count * capacity * (8 + 8 + 8 + 4 + 8 + 4 + 8 + 4)
@@ -734,6 +775,8 @@ class HiSparseCoordinator:
                 self._staging_zero_count,
             )
         )
+        if predictive_overlap:
+            actual_metadata_bytes += 2 * 8
         actual_matching_workspace_bytes = sum(
             int(tensor.numel() * tensor.element_size())
             for tensor in (
@@ -780,6 +823,109 @@ class HiSparseCoordinator:
             "row_elements": row_elements,
         }
         self._prediction_staging_enabled = True
+        if predictive_overlap:
+            self._initialize_overlap_resources()
+
+    def _initialize_overlap_resources(self) -> None:
+        """Create the bounded M4.4 stream/event bundle once at startup.
+
+        This method intentionally has no effect when staging is disabled.  A
+        coordinator using the accepted fused/native route therefore retains
+        the same allocations and stream topology as M4.3.
+        """
+        if getattr(self, "_overlap_enabled", False):
+            return
+        if not self.prediction_staging_enabled:
+            return
+        # Current-stream capture is the compute lane.  Stream priorities are
+        # hints only; correctness comes from explicit event dependencies.
+        self._overlap_compute_stream = device_module.current_stream()
+        try:
+            self._urgent_stream = device_module.Stream(priority=-1)
+            self._speculative_stream = device_module.Stream(priority=0)
+        except TypeError:
+            # The CPU test device shim and older ROCm wrappers do not expose
+            # the priority keyword.  Separate streams remain mandatory.
+            self._urgent_stream = device_module.Stream()
+            self._speculative_stream = device_module.Stream()
+        self._overlap_stream_priorities = {
+            "compute": int(getattr(self._overlap_compute_stream, "priority", 0)),
+            "urgent": int(getattr(self._urgent_stream, "priority", -1)),
+            "native_exact": int(getattr(self.prefetch_stream, "priority", 0)),
+            "speculative": int(getattr(self._speculative_stream, "priority", 0)),
+        }
+        self._staging_ready_tags = tuple(
+            torch.zeros((1,), dtype=torch.int64, device=self.device) for _ in range(2)
+        )
+        self._staging_producer_events = tuple(
+            device_module.Event(enable_timing=False) for _ in range(2)
+        )
+        self._staging_reader_events = tuple(
+            device_module.Event(enable_timing=False) for _ in range(2)
+        )
+        # Reuse the existing reader-event slot array for overlap mode rather
+        # than introducing a second retirement owner.
+        self._staging_slot_events = self._staging_reader_events
+        self._urgent_done_event = device_module.Event(enable_timing=False)
+        self._prediction_ready_event = device_module.Event(enable_timing=False)
+        self._overlap_enabled = True
+
+    @property
+    def overlap_enabled(self) -> bool:
+        """Whether the fixed M4.4 stream and ready-tag bundle is active."""
+        return bool(getattr(self, "_overlap_enabled", False))
+
+    @property
+    def predictive_overlap_enabled(self) -> bool:
+        """Stable startup flag for the M4.4 predictive scheduler."""
+        return bool(getattr(self, "_overlap_enabled", False))
+
+    @property
+    def overlap_stream_priorities(self) -> dict[str, int]:
+        """Effective stream priorities captured at overlap startup."""
+        return dict(self._overlap_stream_priorities)
+
+    def enable_predictive_overlap(
+        self,
+        *,
+        stage_slot_count: int,
+        rows_per_lease: int,
+        urgent_priority: int,
+        speculative_priority: int,
+        native_exact_role: str,
+    ) -> dict[str, int]:
+        """Validate or activate the fixed M4.4 native overlap bundle.
+
+        Startup may call this after split materialization has been enabled.  A
+        repeated call is idempotent only when every bounded resource value
+        matches the already-installed bundle.
+        """
+        if stage_slot_count != 2 or rows_per_lease != self.top_k:
+            raise RuntimeError("predictive overlap lease bounds differ from native staging")
+        if urgent_priority != -1 or speculative_priority != 0:
+            raise RuntimeError("predictive overlap stream priorities are unsupported")
+        if native_exact_role != "prefetch_stream":
+            raise RuntimeError("predictive overlap native-exact role is unsupported")
+        if not self.prediction_staging_enabled:
+            raise RuntimeError("predictive overlap requires prediction staging")
+        self._initialize_overlap_resources()
+        return self.overlap_stream_priorities
+
+    @property
+    def overlap_resource_receipt(self) -> dict[str, object] | None:
+        """Return immutable-shaped startup metadata for the overlap bundle."""
+        if not getattr(self, "_overlap_enabled", False):
+            return None
+        return {
+            "schema": "sglang.hisparse.predictive-overlap-resources.v1",
+            "slot_count": 2,
+            "capacity_rows_per_slot": int(self.top_k),
+            "native_exact_stream": "prefetch_stream",
+            "urgent_stream": "urgent_stream",
+            "speculative_stream": "speculative_stream",
+            "stream_priorities": dict(self._overlap_stream_priorities),
+            "ready_tags_device_resident": True,
+        }
 
     def bind_prediction_staging(
         self,
@@ -865,6 +1011,8 @@ class HiSparseCoordinator:
         self._staging_views = dict(eligible_views)
         self._staging_observation_anchor_ids = self._split_anchor_layers
         self._staging_device_records = {}
+        self._staging_admitted_counts = {}
+        self._staging_admission_events = []
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
             "request_slot": slot,
@@ -886,6 +1034,12 @@ class HiSparseCoordinator:
             "unused_stage_bytes": 0,
             "skipped_stage_rows": 0,
         }
+        # Prediction tensors are produced before the carrier traversal.  A
+        # stream event captures that dependency once; ordinary decode never
+        # queries a scalar readiness value on the host.
+        prediction_ready_event = getattr(self, "_prediction_ready_event", None)
+        if prediction_ready_event is not None:
+            prediction_ready_event.record(device_module.current_stream())
 
     def clear_prediction_staging(self, identity: object, target_step: int) -> None:
         """Clear the project consumer binding after the pair forward."""
@@ -895,11 +1049,29 @@ class HiSparseCoordinator:
             self._staging_identity == identity
             and self._staging_target_step == target_step
         ):
+            self.retire_prediction_step(identity, target_step)
             self._staging_views = {}
             self._staging_identity = None
             self._staging_target_step = -1
             self._staging_history_limit = 0
             self._staging_request_slot = -1
+
+    def retire_prediction_step(self, identity: object, target_step: int) -> bool:
+        """Attempt scoped retirement after one real step has committed.
+
+        The method only queries lease-owned events and never synchronizes the
+        device.  A ``False`` result leaves the two fixed slots busy until a
+        later admission observes their producer and reader completion.
+        """
+        if not self.prediction_staging_enabled:
+            return True
+        if self._staging_identity is not None and (
+            self._staging_identity != identity
+            or self._staging_target_step != target_step
+        ):
+            raise RuntimeError("predictive staging retirement identity is stale")
+        self._retire_completed_staging_slots()
+        return not any(self._staging_slots_busy)
 
     def _synchronize_staging_observation(self) -> None:
         """Synchronize only for an explicit post-forward diagnostic read."""
@@ -1028,10 +1200,20 @@ class HiSparseCoordinator:
     def _stage_prediction_rows(
         self, layer_id: int
     ) -> tuple[_HiSparseStagePlan | None, torch.Tensor, torch.Tensor]:
-        """Filter one anchor's eligible IDs and copy published host rows to stage."""
+        """Filter one anchor and stage rows on the independent P stream."""
         view = self._staging_views.get(layer_id)
         if view is None:
             return None, self._staging_zero_count, self._staging_zero_count
+        if not hasattr(self, "_staging_admitted_counts"):
+            self._staging_admitted_counts = {}
+        if not hasattr(self, "_staging_admission_events"):
+            self._staging_admission_events = []
+        existing = self._staging_active.get(layer_id)
+        if existing is not None:
+            counts = self._staging_admitted_counts.get(layer_id)
+            if counts is None:
+                raise RuntimeError("staged prediction lease lost admission metadata")
+            return existing, counts[0], counts[1]
         self._retire_completed_staging_slots()
         slot = None
         for offset in range(len(self._staging_slots_busy)):
@@ -1043,6 +1225,14 @@ class HiSparseCoordinator:
         valid_count = view.valid_count
         if slot is None:
             self._staging_skipped_admissions += 1
+            self._staging_admission_events.append(
+                {
+                    "anchor": layer_id,
+                    "status": "skipped",
+                    "reason": "leases-busy",
+                    "phase": self._staging_admission_phase(layer_id),
+                }
+            )
             return None, valid_count, valid_count
         self._staging_slot_next = (slot + 1) % len(self._staging_slots_busy)
         self._staging_slots_busy[slot] = True
@@ -1052,28 +1242,109 @@ class HiSparseCoordinator:
             slot_stats["reuses"] += 1
         slot_stats["admissions"] += 1
         slot_stats["busy"] = True
+        self._staging_admission_events.append(
+            {
+                "anchor": layer_id,
+                "status": "admitted",
+                "slot": slot,
+                "phase": self._staging_admission_phase(layer_id),
+            }
+        )
         stage = self._staging_buffers[slot]
-        plan_prediction_staging_mla(
-            logical_ids=view.logical_ids,
-            valid_count=valid_count,
-            host_cache_locs=self.req_to_host_pool[self._staging_request_slot],
-            history_limit=self._staging_history_limit,
-            staged_logical_ids=self._staging_logical_ids[slot],
-            staged_host_locs=self._staging_host_locs[slot],
-            staged_dst_locs=self._staging_dst_locs[slot],
-            staged_count=self._staging_valid_counts[slot : slot + 1],
-            eligible_count=self._staging_eligible_counts[slot : slot + 1],
-            skipped_count=self._staging_skipped_counts[slot : slot + 1],
+        if not getattr(self, "_overlap_enabled", False):
+            plan_prediction_staging_mla(
+                logical_ids=view.logical_ids,
+                valid_count=valid_count,
+                host_cache_locs=self.req_to_host_pool[self._staging_request_slot],
+                history_limit=self._staging_history_limit,
+                staged_logical_ids=self._staging_logical_ids[slot],
+                staged_host_locs=self._staging_host_locs[slot],
+                staged_dst_locs=self._staging_dst_locs[slot],
+                staged_count=self._staging_valid_counts[slot : slot + 1],
+                eligible_count=self._staging_eligible_counts[slot : slot + 1],
+                skipped_count=self._staging_skipped_counts[slot : slot + 1],
+            )
+            copy_cache_planned_mla(
+                miss_src=self._staging_host_locs[slot : slot + 1],
+                miss_dst=self._staging_dst_locs[slot : slot + 1],
+                miss_count=self._staging_valid_counts[slot : slot + 1],
+                num_real_reqs=self._staging_one_request,
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=stage,
+                item_size_bytes=self.item_size_bytes,
+            )
+            plan = _HiSparseStagePlan(
+                slot=slot,
+                anchor_layer=layer_id,
+                logical_ids=self._staging_logical_ids[slot],
+                host_locs=self._staging_host_locs[slot],
+                valid_count=self._staging_valid_counts[slot],
+                buffer=stage,
+                step=self._staging_target_step,
+                lease_epoch=self._staging_slot_epochs[slot],
+                request=self._split_requests[self._staging_request_slot],
+                project_identity=self._staging_identity,
+                representation="mla-bf16-width-576",
+                ready_tag=self._staging_valid_counts[slot],
+                expected_tag=0,
+                reader_done=self._staging_slot_events[slot],
+            )
+            self._staging_active[layer_id] = plan
+            self._staging_admitted_counts[layer_id] = (
+                self._staging_eligible_counts[slot],
+                self._staging_skipped_counts[slot],
+            )
+            return (
+                plan,
+                self._staging_eligible_counts[slot],
+                self._staging_skipped_counts[slot],
+            )
+        epoch = self._staging_slot_epochs[slot]
+        request = self._split_requests[self._staging_request_slot]
+        expected_tag = self._encode_stage_tag(
+            request,
+            target_step=self._staging_target_step,
+            anchor_layer=layer_id,
+            lease_epoch=epoch,
         )
-        copy_cache_planned_mla(
-            miss_src=self._staging_host_locs[slot : slot + 1],
-            miss_dst=self._staging_dst_locs[slot : slot + 1],
-            miss_count=self._staging_valid_counts[slot : slot + 1],
-            num_real_reqs=self._staging_one_request,
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=stage,
-            item_size_bytes=self.item_size_bytes,
-        )
+        ready_tag = self._staging_ready_tags[slot]
+        producer_done = self._staging_producer_events[slot]
+        speculative = self._speculative_stream
+        if speculative is None:
+            raise RuntimeError("predictive staging has no speculative stream")
+        with device_module.stream(speculative):
+            prediction_ready_event = getattr(self, "_prediction_ready_event", None)
+            if prediction_ready_event is not None:
+                speculative.wait_event(prediction_ready_event)
+            # Invalidate the previous tag on the producer stream before any
+            # new metadata is visible to an urgent resolver.
+            ready_tag.zero_()
+            plan_prediction_staging_mla(
+                logical_ids=view.logical_ids,
+                valid_count=valid_count,
+                host_cache_locs=self.req_to_host_pool[self._staging_request_slot],
+                history_limit=self._staging_history_limit,
+                staged_logical_ids=self._staging_logical_ids[slot],
+                staged_host_locs=self._staging_host_locs[slot],
+                staged_dst_locs=self._staging_dst_locs[slot],
+                staged_count=self._staging_valid_counts[slot : slot + 1],
+                eligible_count=self._staging_eligible_counts[slot : slot + 1],
+                skipped_count=self._staging_skipped_counts[slot : slot + 1],
+            )
+            copy_cache_planned_mla(
+                miss_src=self._staging_host_locs[slot : slot + 1],
+                miss_dst=self._staging_dst_locs[slot : slot + 1],
+                miss_count=self._staging_valid_counts[slot : slot + 1],
+                num_real_reqs=self._staging_one_request,
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=stage,
+                item_size_bytes=self.item_size_bytes,
+            )
+            publish_prediction_staging_ready_mla(
+                ready_tag=ready_tag,
+                expected_tag=expected_tag,
+            )
+            producer_done.record(speculative)
         plan = _HiSparseStagePlan(
             slot=slot,
             anchor_layer=layer_id,
@@ -1082,16 +1353,64 @@ class HiSparseCoordinator:
             valid_count=self._staging_valid_counts[slot],
             buffer=stage,
             step=self._staging_target_step,
-            lease_epoch=self._staging_slot_epochs[slot],
-            request=self._split_requests[self._staging_request_slot],
+            lease_epoch=epoch,
+            request=request,
             project_identity=self._staging_identity,
             representation="mla-bf16-width-576",
+            ready_tag=ready_tag,
+            expected_tag=expected_tag,
+            producer_done=producer_done,
+            reader_done=self._staging_reader_events[slot],
         )
         self._staging_active[layer_id] = plan
+        self._staging_admitted_counts[layer_id] = (
+            self._staging_eligible_counts[slot],
+            self._staging_skipped_counts[slot],
+        )
         return (
             plan,
             self._staging_eligible_counts[slot],
             self._staging_skipped_counts[slot],
+        )
+
+    @staticmethod
+    def _staging_admission_phase(layer_id: int) -> str:
+        """Return the fixed M4.4 layer-timed admission phase for one anchor."""
+        if layer_id in (0, 1):
+            return "step-entry"
+        if layer_id == 2:
+            return "after-layer-0-reader"
+        if layer_id == 6:
+            return "after-layer-4-reader"
+        return "unsupported"
+
+    @staticmethod
+    def _encode_stage_tag(
+        request: _HiSparseRequestIdentity,
+        *,
+        target_step: int,
+        anchor_layer: int,
+        lease_epoch: int,
+    ) -> int:
+        """Pack the qualified request/step/anchor/epoch identity into int64."""
+        values = (request.slot, request.generation, target_step, anchor_layer, lease_epoch)
+        if any(value < 0 for value in values):
+            raise RuntimeError("negative predictive stage identity")
+        # The qualified profile has a 4096-slot request pool, 16-bit step and
+        # generation counters, ten managed layers, and a bounded two-lease
+        # epoch.  Keeping the top bit clear lets the tag live in torch.int64.
+        slot, generation, step, anchor, epoch = values
+        if slot >= (1 << 12) or generation >= (1 << 16) or step >= (1 << 16):
+            raise RuntimeError("predictive stage identity exceeds tag capacity")
+        if anchor >= (1 << 8) or epoch >= (1 << 8):
+            raise RuntimeError("predictive stage anchor/epoch exceeds tag capacity")
+        return (
+            (slot << 51)
+            | (generation << 35)
+            | (step << 19)
+            | (anchor << 11)
+            | (epoch << 3)
+            | 0x5
         )
 
     def _retire_completed_staging_slots(self) -> None:
@@ -1100,8 +1419,12 @@ class HiSparseCoordinator:
         for slot, busy in enumerate(self._staging_slots_busy):
             if not busy or slot in active_slots:
                 continue
-            event = self._staging_slot_events[slot]
-            if event is not None and event.query():
+            if getattr(self, "_overlap_enabled", False):
+                producer = self._staging_producer_events[slot]
+                reader = self._staging_reader_events[slot]
+            else:
+                producer = reader = self._staging_slot_events[slot]
+            if producer is not None and reader is not None and producer.query() and reader.query():
                 self._staging_slots_busy[slot] = False
                 self._staging_slot_stats[slot]["busy"] = False
                 self._staging_slot_stats[slot]["retirements"] += 1
@@ -1116,6 +1439,7 @@ class HiSparseCoordinator:
         miss_dst: torch.Tensor,
         miss_count: torch.Tensor,
         follower_layers: int,
+        plan_ready_event: object | None = None,
     ) -> None:
         if plan is not None and (
             plan.anchor_layer != layer_id
@@ -1132,38 +1456,61 @@ class HiSparseCoordinator:
         staged_count = (
             plan.valid_count if plan is not None else self._staging_zero_count[0]
         )
-        resolve_prediction_staging_mla(
-            miss_src=miss_src,
-            miss_dst=miss_dst,
-            miss_count=miss_count,
-            staged_host_locs=staged_host_locs,
-            staged_count=staged_count.view(1),
-            promotion_src=self._staging_promotion_src,
-            promotion_dst=self._staging_promotion_dst,
-            promotion_count=self._staging_promotion_count,
-            repair_src=self._staging_repair_src,
-            repair_dst=self._staging_repair_dst,
-            repair_count=self._staging_repair_count,
+        urgent = (
+            self._urgent_stream
+            if getattr(self, "_overlap_enabled", False)
+            else device_module.current_stream()
         )
-        if plan is not None:
+        if urgent is None:
+            raise RuntimeError("predictive staging has no urgent stream")
+        with device_module.stream(urgent):
+            if plan_ready_event is not None:
+                urgent.wait_event(plan_ready_event)
+            resolve_prediction_staging_mla(
+                miss_src=miss_src,
+                miss_dst=miss_dst,
+                miss_count=miss_count,
+                staged_host_locs=staged_host_locs,
+                staged_count=staged_count.view(1),
+                ready_tag=(
+                    plan.ready_tag
+                    if plan is not None and getattr(self, "_overlap_enabled", False)
+                    else None
+                ),
+                expected_tag=(
+                    plan.expected_tag
+                    if plan is not None and getattr(self, "_overlap_enabled", False)
+                    else None
+                ),
+                promotion_src=self._staging_promotion_src,
+                promotion_dst=self._staging_promotion_dst,
+                promotion_count=self._staging_promotion_count,
+                repair_src=self._staging_repair_src,
+                repair_dst=self._staging_repair_dst,
+                repair_count=self._staging_repair_count,
+            )
+            if plan is not None:
+                copy_cache_planned_mla(
+                    miss_src=self._staging_promotion_src,
+                    miss_dst=self._staging_promotion_dst,
+                    miss_count=self._staging_promotion_count,
+                    num_real_reqs=self._staging_one_request,
+                    host_cache=plan.buffer,
+                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                    item_size_bytes=self.item_size_bytes,
+                )
             copy_cache_planned_mla(
-                miss_src=self._staging_promotion_src,
-                miss_dst=self._staging_promotion_dst,
-                miss_count=self._staging_promotion_count,
+                miss_src=self._staging_repair_src,
+                miss_dst=self._staging_repair_dst,
+                miss_count=self._staging_repair_count,
                 num_real_reqs=self._staging_one_request,
-                host_cache=plan.buffer,
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
                 device_buffer=self.mem_pool_device.kv_buffer[layer_id],
                 item_size_bytes=self.item_size_bytes,
             )
-        copy_cache_planned_mla(
-            miss_src=self._staging_repair_src,
-            miss_dst=self._staging_repair_dst,
-            miss_count=self._staging_repair_count,
-            num_real_reqs=self._staging_one_request,
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-            item_size_bytes=self.item_size_bytes,
-        )
+            urgent_done_event = getattr(self, "_urgent_done_event", None)
+            if urgent_done_event is not None:
+                urgent_done_event.record(urgent)
         row = self._staging_observation_rows[layer_id]
         counts = self._staging_observation_counts[row]
         counts[0].copy_(eligible_count.reshape(()))
@@ -1183,14 +1530,15 @@ class HiSparseCoordinator:
         plans["follower_source"][row].copy_(miss_src[0])
         plans["follower_destination"][row].copy_(miss_dst[0])
         if plan is not None:
-            event = self._staging_slot_events[plan.slot]
+            event = plan.reader_done
             if event is not None:
-                event.record(device_module.current_stream())
+                event.record(urgent)
             else:
                 self._staging_slots_busy[plan.slot] = False
                 self._staging_slot_stats[plan.slot]["busy"] = False
                 self._staging_slot_stats[plan.slot]["retirements"] += 1
             self._staging_active.pop(layer_id, None)
+            self._staging_admitted_counts.pop(layer_id, None)
         self._staging_device_records[layer_id] = {
             "observation_row": row,
             "follower_layers": follower_layers,
@@ -1227,6 +1575,11 @@ class HiSparseCoordinator:
                 current_stream.wait_stream(self.decode_producer_stream)
             self.wait_for_pending_backup()
             self.prefetch_stream.synchronize()
+            if getattr(self, "_overlap_enabled", False):
+                if self._speculative_stream is not None:
+                    self._speculative_stream.synchronize()
+                if self._urgent_stream is not None:
+                    self._urgent_stream.synchronize()
             current_stream.synchronize()
             if self.prediction_staging_enabled:
                 for slot, busy in enumerate(self._staging_slots_busy):
@@ -1234,6 +1587,8 @@ class HiSparseCoordinator:
                         self._staging_slot_stats[slot]["retirements"] += 1
                     self._staging_slot_stats[slot]["busy"] = False
                 self._staging_active.clear()
+                getattr(self, "_staging_admitted_counts", {}).clear()
+                getattr(self, "_staging_admission_events", []).clear()
                 self._staging_device_records.clear()
                 self._staging_slots_busy[:] = [False, False]
                 self._staging_views = {}
@@ -1898,6 +2253,11 @@ class HiSparseCoordinator:
         self.ack_staging_queue = [
             act for act in self.ack_staging_queue if act.req is not req
         ]
+        if getattr(self, "_overlap_enabled", False):
+            # Cancellation is the one path allowed to drain owned CUDA work.
+            # Do it before native request and host-pool rows are returned so a
+            # late speculative writer cannot touch a reused request slot.
+            self._drain_split_materialization()
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
@@ -2186,6 +2546,11 @@ class HiSparseCoordinator:
                 stage_plan, eligible_count, skipped_count = self._stage_prediction_rows(
                     layer_id
                 )
+                if getattr(self, "_overlap_enabled", False) and layer_id == 0:
+                    # Fresh anchors 0 and 1 are admitted at step entry. Anchor 1
+                    # is retained in its own lease until layer 1 consumes it;
+                    # no compute stream wait is added for its producer.
+                    self._stage_prediction_rows(1)
             plan_cache_to_device_buffer_mla(
                 top_k_tokens=top_k_result,
                 device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -2203,6 +2568,10 @@ class HiSparseCoordinator:
                 block_size=self.swap_in_block_size,
                 num_real_reqs=self.num_real_reqs,
             )
+            plan_ready_event = None
+            if getattr(self, "_overlap_enabled", False):
+                plan_ready_event = device_module.Event(enable_timing=False)
+                plan_ready_event.record(device_module.current_stream())
             pending = _HiSparsePendingPlan(
                 request=active,
                 request_indices_ptr=request_indices_ptr,
@@ -2231,7 +2600,13 @@ class HiSparseCoordinator:
                     self._miss_dst[:num_reqs],
                     self._miss_count[:num_reqs],
                     len(group[1:]),
+                    plan_ready_event=plan_ready_event,
                 )
+                if (
+                    getattr(self, "_overlap_enabled", False)
+                    and getattr(self, "_urgent_done_event", None) is not None
+                ):
+                    device_module.current_stream().wait_event(self._urgent_done_event)
             else:
                 self.wait_for_pending_backup()
                 self._run_copy_only_kernel(num_reqs, layer_id)

@@ -1057,6 +1057,69 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_prediction_staging_kern
   }
 }
 
+/** Publish a lease-specific ready tag after the speculative payload writes. */
+template <int BLOCK_SIZE>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void publish_prediction_staging_ready_kernel(
+    int64_t* __restrict__ ready_tag,
+    int64_t expected_tag) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  // The copy and metadata kernels are submitted before this kernel on the
+  // same stream.  The device fence makes those writes visible before the
+  // acquire snapshot used by the urgent resolver.
+  __threadfence();
+  atomicExch(reinterpret_cast<unsigned long long*>(ready_tag),
+             static_cast<unsigned long long>(expected_tag));
+}
+
+/** Tagged resolver variant used by the asynchronous predictive path. */
+template <int BLOCK_SIZE>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_prediction_staging_ready_kernel(
+    const int64_t* __restrict__ miss_src,
+    const int32_t* __restrict__ miss_dst,
+    const int32_t* __restrict__ miss_count,
+    const int64_t* __restrict__ staged_host_locs,
+    const int32_t* __restrict__ staged_count,
+    const int64_t* __restrict__ ready_tag,
+    int64_t expected_tag,
+    int64_t capacity,
+    int64_t* __restrict__ promotion_src,
+    int32_t* __restrict__ promotion_dst,
+    int32_t* __restrict__ promotion_count,
+    int64_t* __restrict__ repair_src,
+    int32_t* __restrict__ repair_dst,
+    int32_t* __restrict__ repair_count) {
+  // An atomic compare/exchange with an identical zero value gives one device
+  // snapshot without a plain load racing the producer's atomic publication.
+  // A stale or unpublished tag intentionally resolves as host repair.
+  const auto observed = atomicCAS(
+      reinterpret_cast<unsigned long long*>(const_cast<int64_t*>(ready_tag)),
+      0ull, 0ull);
+  const bool stage_ready = observed == static_cast<unsigned long long>(expected_tag);
+  const int32_t real_misses = max(0, min(miss_count[0], static_cast<int32_t>(capacity)));
+  const int32_t staged_rows = stage_ready
+      ? max(0, min(staged_count[0], static_cast<int32_t>(capacity)))
+      : 0;
+  for (int32_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < real_misses;
+       i += gridDim.x * BLOCK_SIZE) {
+    int32_t stage_position = -1;
+    for (int32_t staged = 0; staged < staged_rows; ++staged) {
+      if (staged_host_locs[staged] == miss_src[i]) {
+        stage_position = staged;
+        break;
+      }
+    }
+    if (stage_position >= 0) {
+      const int32_t output = atomicAdd(promotion_count, 1);
+      promotion_src[output] = static_cast<int64_t>(stage_position);
+      promotion_dst[output] = miss_dst[i];
+    } else {
+      const int32_t output = atomicAdd(repair_count, 1);
+      repair_src[output] = miss_src[i];
+      repair_dst[output] = miss_dst[i];
+    }
+  }
+}
+
 /** Launch fixed-capacity staged-promotion versus host-repair resolution. */
 template <int BLOCK_SIZE>
 void resolve_prediction_staging(
@@ -1089,6 +1152,57 @@ void resolve_prediction_staging(
       static_cast<int64_t*>(repair_src.data_ptr()),
       static_cast<int32_t*>(repair_dst.data_ptr()),
       static_cast<int32_t*>(repair_count.data_ptr()));
+}
+
+/** Launch one-shot tagged source resolution without a host readiness query. */
+template <int BLOCK_SIZE>
+void resolve_prediction_staging_ready(
+    tvm::ffi::TensorView miss_src,
+    tvm::ffi::TensorView miss_dst,
+    tvm::ffi::TensorView miss_count,
+    tvm::ffi::TensorView staged_host_locs,
+    tvm::ffi::TensorView staged_count,
+    tvm::ffi::TensorView ready_tag,
+    int64_t expected_tag,
+    tvm::ffi::TensorView promotion_src,
+    tvm::ffi::TensorView promotion_dst,
+    tvm::ffi::TensorView promotion_count,
+    tvm::ffi::TensorView repair_src,
+    tvm::ffi::TensorView repair_dst,
+    tvm::ffi::TensorView repair_count) {
+  using namespace host;
+  const int64_t capacity = miss_src.shape()[1];
+  const int64_t num_blocks = (capacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  const auto device = LaunchKernel::resolve_device(miss_src.device());
+  LaunchKernel(num_blocks, BLOCK_SIZE, device)(
+      resolve_prediction_staging_ready_kernel<BLOCK_SIZE>,
+      static_cast<const int64_t*>(miss_src.data_ptr()),
+      static_cast<const int32_t*>(miss_dst.data_ptr()),
+      static_cast<const int32_t*>(miss_count.data_ptr()),
+      static_cast<const int64_t*>(staged_host_locs.data_ptr()),
+      static_cast<const int32_t*>(staged_count.data_ptr()),
+      static_cast<const int64_t*>(ready_tag.data_ptr()),
+      expected_tag,
+      capacity,
+      static_cast<int64_t*>(promotion_src.data_ptr()),
+      static_cast<int32_t*>(promotion_dst.data_ptr()),
+      static_cast<int32_t*>(promotion_count.data_ptr()),
+      static_cast<int64_t*>(repair_src.data_ptr()),
+      static_cast<int32_t*>(repair_dst.data_ptr()),
+      static_cast<int32_t*>(repair_count.data_ptr()));
+}
+
+/** Launch the device-scope ready-tag publication kernel. */
+template <int BLOCK_SIZE>
+void publish_prediction_staging_ready(
+    tvm::ffi::TensorView ready_tag,
+    int64_t expected_tag) {
+  using namespace host;
+  const auto device = LaunchKernel::resolve_device(ready_tag.device());
+  LaunchKernel(1, BLOCK_SIZE, device)(
+      publish_prediction_staging_ready_kernel<BLOCK_SIZE>,
+      static_cast<int64_t*>(ready_tag.data_ptr()),
+      expected_tag);
 }
 
 }  // namespace sglang
