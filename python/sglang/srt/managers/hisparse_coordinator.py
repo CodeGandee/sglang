@@ -862,7 +862,9 @@ class HiSparseCoordinator:
         repair_mask = valid_misses & ~promotion_mask
         promotion_dst = miss_dst[0][promotion_mask]
         repair_src = miss_src[0][repair_mask]
-        repair_dst = miss_dst[0][repair_mask]
+        # The placement planner stores destinations as int32, while the
+        # existing HiCache host-repair kernels require int64 indices.
+        repair_dst = miss_dst[0][repair_mask].to(dtype=torch.int64)
         if plan is not None:
             destination_tensor = self.mem_pool_device.kv_buffer[layer_id]
             destination_tensor[promotion_dst].copy_(plan.buffer[promotion_stage])
