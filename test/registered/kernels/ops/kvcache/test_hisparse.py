@@ -2,10 +2,11 @@ import sys
 
 import pytest
 import torch
-
 from sglang.kernels.ops.kvcache.hisparse import (
+    copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
+    plan_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -181,6 +182,16 @@ def _make_state(
         "lru_slots": lru_slots,
         "host_cache_locs": host_cache_locs,
     }
+
+
+def _make_plan(
+    batch_size: int, num_top_k: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.full((batch_size, num_top_k), -1, dtype=torch.int64, device=DEVICE),
+        torch.full((batch_size, num_top_k), -1, dtype=torch.int32, device=DEVICE),
+        torch.full((batch_size,), -1, dtype=torch.int32, device=DEVICE),
+    )
 
 
 @pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")
@@ -546,6 +557,221 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     )
     assert torch.equal(state["lru_slots"][2].cpu(), padded_lru_before.cpu())
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
+
+
+@pytest.mark.skipif(is_hip(), reason="M4.2 qualifies the CUDA GLM MLA profile.")
+def test_plan_then_copy_matches_fused_bytes_at_glm_profile() -> None:
+    """Plan/replay must exactly match fused placement and bytes over two steps."""
+    num_top_k = 2048
+    hot_buffer_size = 4096
+    row_width = 576
+    seq_capacity = 8192
+    newest_token = seq_capacity - 1
+    item_size_bytes = row_width * torch.empty((), dtype=torch.bfloat16).element_size()
+    num_requests = 2
+    slots_per_request = hot_buffer_size + 1
+
+    token_ids = torch.arange(seq_capacity, dtype=torch.int32)
+    byte_columns = torch.arange(row_width, dtype=torch.int32)
+    source_rows = (
+        ((token_ids[:, None] * 131 + byte_columns[None, :] * 17) % 32749)
+        .sub(16384)
+        .to(torch.bfloat16)
+        .view(seq_capacity, 1, row_width)
+    )
+
+    # Request 1 owns odd, permuted host/device rows; request 0 occupies the even
+    # guard rows and must remain byte- and metadata-identical throughout.
+    host_rows = num_requests * seq_capacity
+    host_cache = torch.full(
+        (host_rows, 1, row_width),
+        -321,
+        dtype=torch.bfloat16,
+        device="cpu",
+        pin_memory=True,
+    )
+    host_locs_cpu = torch.stack(
+        (
+            2 * torch.arange(seq_capacity, dtype=torch.int64),
+            2
+            * ((torch.arange(seq_capacity, dtype=torch.int64) * 37 + 11) % seq_capacity)
+            + 1,
+        )
+    )
+    host_cache[host_locs_cpu[1]] = source_rows
+    host_before = host_cache.clone()
+
+    slot_ids = torch.arange(slots_per_request, dtype=torch.int64)
+    device_locs_cpu = torch.stack(
+        (
+            2 * slot_ids,
+            2 * ((slot_ids * 31 + 7) % slots_per_request) + 1,
+        )
+    ).to(torch.int32)
+    device_buffer_tokens_cpu = torch.full(
+        (num_requests, slots_per_request), -1, dtype=torch.int32
+    )
+    device_buffer_tokens_cpu[:, :hot_buffer_size] = torch.arange(
+        hot_buffer_size, dtype=torch.int32
+    )
+    lru_slots_cpu = torch.arange(hot_buffer_size, dtype=torch.int16).repeat(
+        num_requests, 1
+    )
+
+    device_rows = num_requests * slots_per_request
+    initial_device = torch.full(
+        (device_rows, 1, row_width),
+        -777,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+    initial_device[device_locs_cpu[0].to(DEVICE)] = -555
+    request_device_locs = device_locs_cpu[1].to(DEVICE)
+    initial_device[request_device_locs[:hot_buffer_size]] = source_rows[
+        :hot_buffer_size
+    ].to(DEVICE)
+    # Both rounds evict from this poisoned prefix. Hits live outside it.
+    initial_device[request_device_locs[:num_top_k]] = -777
+    initial_device[request_device_locs[hot_buffer_size]] = -source_rows[
+        newest_token
+    ].to(DEVICE)
+    initial_device_before = initial_device.clone()
+
+    host_cache_locs = host_locs_cpu.to(DEVICE)
+    device_buffer_locs = device_locs_cpu.to(DEVICE)
+    req_pool_indices = torch.tensor([1], dtype=torch.int64, device=DEVICE)
+    seq_lens = torch.tensor([seq_capacity], dtype=torch.int32, device=DEVICE)
+    num_real_reqs = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+
+    def make_mutable_state() -> dict[str, torch.Tensor]:
+        return {
+            "device_buffer_tokens": device_buffer_tokens_cpu.to(DEVICE),
+            "lru_slots": lru_slots_cpu.to(DEVICE),
+            "device_buffer": initial_device.clone(),
+        }
+
+    fused = make_mutable_state()
+    split = make_mutable_state()
+    request_zero_tokens = device_buffer_tokens_cpu[0].clone()
+    request_zero_lru = lru_slots_cpu[0].clone()
+
+    def byte_view(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.contiguous().view(torch.uint8)
+
+    round_inputs = (
+        (
+            torch.cat(
+                (
+                    torch.arange(2048, 3072, dtype=torch.int32),
+                    torch.arange(4096, 5119, dtype=torch.int32),
+                    torch.tensor([newest_token], dtype=torch.int32),
+                )
+            ),
+            torch.arange(4096, 5119, dtype=torch.int32),
+        ),
+        (
+            torch.cat(
+                (
+                    torch.arange(4096, 5119, dtype=torch.int32),
+                    torch.arange(5119, 6143, dtype=torch.int32),
+                    torch.tensor([newest_token], dtype=torch.int32),
+                )
+            ),
+            torch.arange(5119, 6143, dtype=torch.int32),
+        ),
+    )
+    permutation = (torch.arange(num_top_k, dtype=torch.int64) * 1031) % num_top_k
+
+    for raw_top_k, miss_tokens in round_inputs:
+        top_k_tokens = raw_top_k[permutation].view(1, -1).to(DEVICE)
+        fused_out = torch.full_like(top_k_tokens, -1)
+        load_cache_to_device_buffer_mla(
+            top_k_tokens=top_k_tokens,
+            device_buffer_tokens=fused["device_buffer_tokens"],
+            host_cache_locs=host_cache_locs,
+            device_buffer_locs=device_buffer_locs,
+            host_cache=host_cache,
+            device_buffer=fused["device_buffer"],
+            top_k_device_locs=fused_out,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            lru_slots=fused["lru_slots"],
+            item_size_bytes=item_size_bytes,
+            num_top_k=num_top_k,
+            hot_buffer_size=hot_buffer_size,
+            block_size=960,
+            num_real_reqs=num_real_reqs,
+        )
+
+        split_before = split["device_buffer"].clone()
+        split_out = torch.full_like(top_k_tokens, -1)
+        miss_src, miss_dst, miss_count = _make_plan(1, num_top_k)
+        plan_cache_to_device_buffer_mla(
+            top_k_tokens=top_k_tokens,
+            device_buffer_tokens=split["device_buffer_tokens"],
+            host_cache_locs=host_cache_locs,
+            device_buffer_locs=device_buffer_locs,
+            top_k_device_locs=split_out,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            lru_slots=split["lru_slots"],
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+            num_top_k=num_top_k,
+            hot_buffer_size=hot_buffer_size,
+            block_size=960,
+            num_real_reqs=num_real_reqs,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(split_out, fused_out)
+        assert torch.equal(split["device_buffer_tokens"], fused["device_buffer_tokens"])
+        assert torch.equal(split["lru_slots"], fused["lru_slots"])
+        assert torch.equal(byte_view(split["device_buffer"]), byte_view(split_before))
+        assert torch.equal(byte_view(host_cache), byte_view(host_before))
+
+        count = int(miss_count.item())
+        assert count == miss_tokens.numel()
+        recorded_src = miss_src[0, :count].cpu()
+        recorded_dst = miss_dst[0, :count].to(torch.int64)
+        expected_src = host_locs_cpu[1, miss_tokens.to(torch.int64)]
+        assert torch.equal(recorded_src.sort().values, expected_src.sort().values)
+        assert torch.unique(recorded_dst).numel() == count
+        assert torch.all(split_before[recorded_dst] == -777)
+
+        independently_replayed = split_before.clone()
+        independently_replayed[recorded_dst] = host_cache[recorded_src].to(DEVICE)
+        copy_cache_planned_mla(
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+            num_real_reqs=num_real_reqs,
+            host_cache=host_cache,
+            device_buffer=split["device_buffer"],
+            item_size_bytes=item_size_bytes,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(
+            byte_view(split["device_buffer"]), byte_view(independently_replayed)
+        )
+        assert torch.equal(
+            byte_view(split["device_buffer"]), byte_view(fused["device_buffer"])
+        )
+        selected_tokens = raw_top_k[permutation]
+        expected_selected = source_rows[selected_tokens.to(torch.int64)].clone()
+        expected_selected[selected_tokens == newest_token] = -source_rows[newest_token]
+        actual_selected = split["device_buffer"].index_select(0, split_out.view(-1))
+        assert torch.equal(
+            byte_view(actual_selected.cpu()), byte_view(expected_selected)
+        )
+        assert torch.equal(
+            byte_view(split["device_buffer"][device_locs_cpu[0].to(DEVICE)]),
+            byte_view(initial_device_before[device_locs_cpu[0].to(DEVICE)]),
+        )
+        assert torch.equal(split["device_buffer_tokens"][0].cpu(), request_zero_tokens)
+        assert torch.equal(split["lru_slots"][0].cpu(), request_zero_lru)
 
 
 def test_load_cache_to_device_buffer_dsv4_mla_miss_copy_layout() -> None:

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
-
 from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
@@ -60,7 +59,7 @@ class _HiSparsePendingPlan:
     request_indices_ptr: int
     step: int
     anchor_layer: int
-    group_layers: Tuple[int, ...]
+    group_layers: tuple[int, ...]
     representation: str
     num_reqs: int
     table: torch.Tensor
@@ -350,9 +349,12 @@ class HiSparseCoordinator:
     @property
     def split_materialization_callable(self) -> str:
         """Return the stable receipt name for this instance's retrieval path."""
-        if self.split_materialization_enabled:
-            return "native-plan-materialize"
-        return "native-fused"
+        selected = (
+            self._run_split_anchor
+            if self.split_materialization_enabled
+            else self._run_swap_in_kernel
+        )
+        return f"{selected.__module__}.{selected.__qualname__}"
 
     @property
     def split_worker_reusable(self) -> bool:
@@ -423,16 +425,19 @@ class HiSparseCoordinator:
         # workers retain the fused route without another state owner.
         self._split_worker_reusable = True
         self._split_generation = 0
-        self._split_active_request: Optional[_HiSparseRequestIdentity] = None
-        self._split_aborted_generation: Optional[int] = None
+        self._split_requests: dict[int, _HiSparseRequestIdentity] = {}
+        self._split_step_request: _HiSparseRequestIdentity | None = None
+        self._split_next_request: _HiSparseRequestIdentity | None = None
+        self._split_aborted_generation: int | None = None
         self._split_step = 0
         self._split_anchor_index = 0
+        self._split_step_request_ptr: int | None = None
         self._split_anchor_layers = tuple(
             layer
             for layer, shared in enumerate(self._is_shared_index_layer)
             if not shared
         )
-        self._split_pending: Optional[_HiSparsePendingPlan] = None
+        self._split_pending: _HiSparsePendingPlan | None = None
         self._split_followers_seen = 0
         self._split_materialization_enabled = True
 
@@ -448,7 +453,7 @@ class HiSparseCoordinator:
         """
         if not self.split_materialization_enabled:
             return
-        active = self._split_active_request
+        active = self._split_step_request
         if active is not None:
             self._split_aborted_generation = active.generation
         if not safe_to_reuse:
@@ -478,29 +483,21 @@ class HiSparseCoordinator:
         if not self.split_materialization_enabled:
             return
         self._assert_split_worker_reusable()
-        if self._split_active_request is not None:
-            raise RuntimeError(
-                "HiSparse split materialization admits one live request generation"
-            )
-        if self._split_pending is not None:
-            raise RuntimeError("HiSparse split materialization retained a stale plan")
         if req.req_pool_idx is None:
             raise RuntimeError("HiSparse split request has no native request slot")
+        if int(req.req_pool_idx) in self._split_requests:
+            raise RuntimeError("HiSparse split request slot is already allocated")
 
     def _activate_split_request(self, req: Req) -> None:
         if not self.split_materialization_enabled:
             return
         self._split_generation += 1
-        self._split_active_request = _HiSparseRequestIdentity(
+        identity = _HiSparseRequestIdentity(
             slot=int(req.req_pool_idx),
             generation=self._split_generation,
             object_id=id(req),
         )
-        self._split_aborted_generation = None
-        self._split_step = 0
-        self._split_anchor_index = 0
-        self._split_pending = None
-        self._split_followers_seen = 0
+        self._split_requests[identity.slot] = identity
 
     def destroy(self) -> None:
         # Drain in-flight transfers so the buffer is idle, then unregister it.
@@ -786,6 +783,7 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
+        self._bind_split_step_request(req_pool_indices_cpu)
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -849,6 +847,24 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             reserved_buffer_loc
         )
+
+    def _bind_split_step_request(self, req_pool_indices_cpu: torch.Tensor) -> None:
+        if not self.split_materialization_enabled:
+            return
+        self._assert_split_worker_reusable()
+        if req_pool_indices_cpu.numel() != 1:
+            raise RuntimeError("HiSparse split materialization requires B1")
+        request_slot = int(req_pool_indices_cpu[0])
+        identity = self._split_requests.get(request_slot)
+        if identity is None:
+            raise RuntimeError(
+                "HiSparse split step has no allocated request generation"
+            )
+        if self._split_aborted_generation == identity.generation:
+            raise RuntimeError("aborted HiSparse request cannot bind another step")
+        if self._split_anchor_index != 0:
+            raise RuntimeError("HiSparse split request changed during a partial step")
+        self._split_next_request = identity
 
     def _eager_backup_previous_token(
         self,
@@ -969,9 +985,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert (
-            not self.is_dsv4_hisparse
-        ), "naive_load_topk is not implemented for dsv4 hisparse"
+        assert not self.is_dsv4_hisparse, (
+            "naive_load_topk is not implemented for dsv4 hisparse"
+        )
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -986,9 +1002,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(
-                selected_tokens >= 0
-            ), f"Req {req_idx}: selected tokens contain negative positions"
+            assert torch.all(selected_tokens >= 0), (
+                f"Req {req_idx}: selected tokens contain negative positions"
+            )
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"
@@ -1077,36 +1093,42 @@ class HiSparseCoordinator:
     def _prepare_split_request_release(self, req: Req) -> bool:
         if not self.split_materialization_enabled:
             return True
-        active = self._split_active_request
-        if active is None:
+        identity = self._split_requests.get(int(req.req_pool_idx))
+        if identity is None:
             # Coordinator cleanup is idempotent after the request-owned native
             # storage has already been returned.
             return bool(
                 int(self.req_device_buffer_size[req.req_pool_idx])
                 or int(self.req_to_host_pool_allocated_len[req.req_pool_idx])
             )
-        if active.slot != int(req.req_pool_idx) or active.object_id != id(req):
+        if identity.object_id != id(req):
             raise RuntimeError(
                 "stale request generation cannot release HiSparse split storage"
             )
-        self._drain_split_materialization()
+        if self._split_step_request == identity:
+            self._drain_split_materialization()
         return True
 
     def _finish_split_request_release(self, req: Req) -> None:
         if not self.split_materialization_enabled:
             return
-        active = self._split_active_request
-        if active is not None and (
-            active.slot != int(req.req_pool_idx) or active.object_id != id(req)
-        ):
+        request_slot = int(req.req_pool_idx)
+        identity = self._split_requests.get(request_slot)
+        if identity is not None and identity.object_id != id(req):
             raise RuntimeError(
                 "HiSparse split request identity changed during native release"
             )
-        self._split_active_request = None
-        self._split_pending = None
-        self._split_followers_seen = 0
-        self._split_aborted_generation = None
-        self._split_anchor_index = 0
+        self._split_requests.pop(request_slot, None)
+        if self._split_next_request == identity:
+            self._split_next_request = None
+        if self._split_step_request == identity:
+            self._split_step_request = None
+            self._split_pending = None
+            self._split_followers_seen = 0
+            if self._split_aborted_generation == identity.generation:
+                self._split_aborted_generation = None
+            self._split_anchor_index = 0
+            self._split_step_request_ptr = None
 
     def request_finished(self, req: Req):
         if not self._prepare_split_request_release(req):
@@ -1227,6 +1249,155 @@ class HiSparseCoordinator:
             skip_io=self.skip_io,
         )
 
+    def _validate_split_plan(self, plan: _HiSparsePendingPlan) -> None:
+        active = self._split_step_request
+        if active is None or plan.request != active:
+            raise RuntimeError("stale HiSparse pending-plan request generation")
+        if self._split_aborted_generation == active.generation:
+            raise RuntimeError("aborted HiSparse request cannot consume a pending plan")
+        if plan is not self._split_pending:
+            raise RuntimeError("stale HiSparse pending-plan handle")
+        if plan.representation != "mla-bf16-width-576":
+            raise RuntimeError("HiSparse pending-plan representation changed")
+
+    def _retire_split_plan_before_anchor(self) -> None:
+        pending = self._split_pending
+        if pending is None:
+            return
+        self._validate_split_plan(pending)
+        follower_count = len(pending.group_layers) - 1
+        if self._split_followers_seen != follower_count:
+            raise RuntimeError(
+                "HiSparse pending plan reached the next anchor before every follower"
+            )
+        # The next anchor is submitted on the compute stream after the prior
+        # real and private-hint reads. Every follower also made that stream wait
+        # for its copy event, so the borrowed buffers are now reusable.
+        self._split_pending = None
+        self._split_followers_seen = 0
+
+    def _run_split_anchor(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        self._assert_split_worker_reusable()
+        if req_pool_indices.size(0) != 1:
+            raise RuntimeError("HiSparse split materialization requires B1")
+
+        self._retire_split_plan_before_anchor()
+        expected_layer = self._split_anchor_layers[self._split_anchor_index]
+        if layer_id != expected_layer:
+            raise RuntimeError(
+                "HiSparse split anchor order changed: "
+                f"received {layer_id}, expected {expected_layer}"
+            )
+        if self._split_anchor_index == 0:
+            active = self._split_next_request
+            if active is None:
+                raise RuntimeError(
+                    "HiSparse split step has no bound request generation"
+                )
+            self._split_step_request = active
+            self._split_next_request = None
+        else:
+            active = self._split_step_request
+        if active is None:
+            raise RuntimeError("HiSparse split materialization has no live request")
+        if self._split_aborted_generation == active.generation:
+            raise RuntimeError("aborted HiSparse request cannot start another plan")
+        request_indices_ptr = req_pool_indices.data_ptr()
+        if self._split_anchor_index == 0:
+            self._split_step += 1
+            self._split_step_request_ptr = request_indices_ptr
+        elif request_indices_ptr != self._split_step_request_ptr:
+            raise RuntimeError("HiSparse split request tensor changed within a step")
+
+        num_reqs = req_pool_indices.size(0)
+        table = self.top_k_device_locs_buffer[:num_reqs]
+        group = (layer_id, *self._prefetch_groups.get(layer_id, []))
+        try:
+            plan_cache_to_device_buffer_mla(
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                host_cache_locs=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                top_k_device_locs=table,
+                req_pool_indices=req_pool_indices,
+                seq_lens=compressed_seq_lens,
+                lru_slots=self.lru_slots[layer_id],
+                miss_src=self._miss_src[:num_reqs],
+                miss_dst=self._miss_dst[:num_reqs],
+                miss_count=self._miss_count[:num_reqs],
+                num_top_k=self.top_k,
+                hot_buffer_size=self.device_buffer_size,
+                block_size=self.swap_in_block_size,
+                num_real_reqs=self.num_real_reqs,
+            )
+            pending = _HiSparsePendingPlan(
+                request=active,
+                request_indices_ptr=request_indices_ptr,
+                step=self._split_step,
+                anchor_layer=layer_id,
+                group_layers=group,
+                representation="mla-bf16-width-576",
+                num_reqs=num_reqs,
+                table=table,
+                miss_src=self._miss_src[:num_reqs],
+                miss_dst=self._miss_dst[:num_reqs],
+                miss_count=self._miss_count[:num_reqs],
+            )
+            self._split_pending = pending
+            self._split_followers_seen = 0
+
+            # Planning only reads metadata. Materialization reads pinned host
+            # rows, so it must observe publication of the previous generated
+            # token before either the anchor or followers copy those bytes.
+            self.wait_for_pending_backup()
+            self._run_copy_only_kernel(num_reqs, layer_id)
+            followers = group[1:]
+            if followers:
+                self.prefetch_stream.wait_stream(device_module.current_stream())
+                with device_module.stream(self.prefetch_stream):
+                    for follower in followers:
+                        self._run_copy_only_kernel(num_reqs, follower)
+                        self._prefetch_events[self._prefetch_slot[follower]].record(
+                            self.prefetch_stream
+                        )
+        except BaseException:
+            self._split_aborted_generation = active.generation
+            raise
+
+        self._split_anchor_index = (self._split_anchor_index + 1) % len(
+            self._split_anchor_layers
+        )
+        return table
+
+    def _consume_split_follower(
+        self, req_pool_indices: torch.Tensor, layer_id: int
+    ) -> torch.Tensor:
+        pending = self._split_pending
+        if pending is None:
+            raise RuntimeError("HiSparse split follower has no pending anchor plan")
+        self._validate_split_plan(pending)
+        if req_pool_indices.size(0) != pending.num_reqs:
+            raise RuntimeError("HiSparse split follower batch size changed")
+        if req_pool_indices.data_ptr() != pending.request_indices_ptr:
+            raise RuntimeError("HiSparse split follower request identity changed")
+        next_index = self._split_followers_seen + 1
+        if (
+            next_index >= len(pending.group_layers)
+            or pending.group_layers[next_index] != layer_id
+        ):
+            raise RuntimeError("HiSparse split follower order changed")
+        self._prefetch_events[self._prefetch_slot[layer_id]].wait(
+            device_module.current_stream()
+        )
+        self._split_followers_seen += 1
+        return pending.table
+
     def swap_in_selected_pages(
         self,
         req_pool_indices: torch.Tensor,
@@ -1239,6 +1410,13 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        if self.split_materialization_enabled:
+            if self._is_shared_index_layer[layer_id]:
+                return self._consume_split_follower(req_pool_indices, layer_id)
+            return self._run_split_anchor(
+                req_pool_indices, compressed_seq_lens, top_k_result, layer_id
+            )
+
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices, compressed_seq_lens, top_k_result, layer_id
