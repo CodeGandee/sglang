@@ -510,6 +510,7 @@ class HiSparseCoordinator:
         self._staging_device_records: dict[int, dict[str, object]] = {}
         self._staging_slots_busy = [False, False]
         self._staging_slot_events = (None, None)
+        self._staging_observation_anchor_ids: tuple[int, ...] = ()
         self._staging_stats: dict[str, torch.Tensor] = {}
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
@@ -643,6 +644,9 @@ class HiSparseCoordinator:
         self._staging_history_limit = int(committed_history_limit)
         self._staging_request_slot = slot
         self._staging_views = dict(eligible_views)
+        self._staging_observation_anchor_ids = tuple(
+            sorted(self._prefetch_groups)
+        )
         self._staging_device_records = {}
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
@@ -694,7 +698,31 @@ class HiSparseCoordinator:
             "unused_stage_bytes": 0,
             "skipped_stage_rows": 0,
         }
-        for layer_id, record in self._staging_device_records.items():
+        records = self._staging_device_records
+        anchor_ids = self._staging_observation_anchor_ids or tuple(records)
+        for layer_id in anchor_ids:
+            record = records.get(layer_id)
+            if record is None:
+                anchors[str(layer_id)] = {
+                    "eligible_prediction_rows": 0,
+                    "staged_rows": 0,
+                    "promoted_rows": 0,
+                    "repaired_rows": 0,
+                    "follower_rows": 0,
+                    "skipped_stage_rows": 0,
+                    "unused_stage_rows": 0,
+                    "stage_logical_ids": [],
+                    "stage_source_rows": [],
+                    "promotion_stage_rows": [],
+                    "promotion_destination_rows": [],
+                    "repair_source_rows": [],
+                    "repair_destination_rows": [],
+                    "follower_source_rows": [],
+                    "follower_destination_rows": [],
+                    "follower_bytes": 0,
+                    "unused_stage_bytes": 0,
+                }
+                continue
             receipt = dict(record["receipt"])
             plan = record.get("plan")
             if plan is not None:
