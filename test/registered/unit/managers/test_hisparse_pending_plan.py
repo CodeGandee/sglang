@@ -469,24 +469,38 @@ class TestHiSparsePendingPlan(unittest.TestCase):
     def test_full_stage_ring_skips_without_waiting_or_losing_prediction_count(
         self,
     ) -> None:
-        coordinator, request, identity = self._bindable_staging_coordinator()
-        view = self._prediction_view(identity)
-        coordinator.bind_prediction_staging(
-            request,
-            identity=identity,
-            target_step=4,
-            committed_history_limit=8,
-            eligible_views={2: view},
-        )
-        coordinator._staging_slots_busy[:] = [True, True]
-        coordinator._staging_slot_events = (_FakeEvent(), _FakeEvent())
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                coordinator, request, identity = self._bindable_staging_coordinator()
+                view = self._prediction_view(identity)
+                coordinator.bind_prediction_staging(
+                    request,
+                    identity=identity,
+                    target_step=4,
+                    committed_history_limit=8,
+                    eligible_views={2: view},
+                )
+                coordinator._overlap_enabled = overlap
+                coordinator._staging_slots_busy[:] = [True, True]
+                coordinator._staging_slot_events = (_FakeEvent(), _FakeEvent())
+                coordinator._staging_active = {
+                    0: SimpleNamespace(slot=0),
+                    1: SimpleNamespace(slot=1),
+                }
 
-        plan, eligible_count, skipped_count = coordinator._stage_prediction_rows(2)
+                plan, eligible, skipped = coordinator._stage_prediction_rows(2)
 
-        self.assertIsNone(plan)
-        self.assertIs(eligible_count, view.valid_count)
-        self.assertIs(skipped_count, view.valid_count)
-        self.assertEqual(coordinator._staging_skipped_admissions, 1)
+                self.assertIsNone(plan)
+                self.assertIs(eligible, view.valid_count)
+                self.assertIs(skipped, view.valid_count)
+                self.assertEqual(coordinator._staging_skipped_admissions, 1)
+                self.assertEqual(coordinator._staging_slot_epochs, [0, 0])
+                self.assertEqual(
+                    sum(
+                        event.query_count for event in coordinator._staging_slot_events
+                    ),
+                    0,
+                )
 
     def test_predictive_admission_uses_execution_boundaries(self) -> None:
         coordinator, request, identity = self._bindable_staging_coordinator()
