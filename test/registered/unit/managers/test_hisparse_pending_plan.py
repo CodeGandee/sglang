@@ -797,6 +797,20 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         allocated_bytes = coordinator.staging_allocation_receipt["total_bytes"]
 
         with torch.cuda.stream(delayed):
+            absent, absent_eligible, absent_skipped = (
+                coordinator._stage_prediction_rows(6)
+            )
+            self.assertIsNone(absent)
+            coordinator._materialize_staged_anchor(
+                6,
+                absent,
+                absent_eligible,
+                absent_skipped,
+                miss_src,
+                miss_dst,
+                miss_count,
+                0,
+            )
             first, first_eligible, first_skipped = coordinator._stage_prediction_rows(0)
             self.assertIsNotNone(first)
             torch.cuda._sleep(500_000_000)
@@ -835,6 +849,7 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         delayed.synchronize()
         self.assertTrue(torch.equal(device_layers[0][5].cpu(), host_layers[0][0]))
         self.assertTrue(torch.equal(device_layers[1][5].cpu(), host_layers[1][1]))
+        self.assertTrue(torch.equal(device_layers[6][5].cpu(), host_layers[6][0]))
 
         reused, _, _ = coordinator._stage_prediction_rows(2)
         self.assertIsNotNone(reused)

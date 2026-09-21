@@ -1166,11 +1166,11 @@ class HiSparseCoordinator:
         )
         row = self._staging_observation_rows[layer_id]
         counts = self._staging_observation_counts[row]
-        counts[0].copy_(eligible_count)
+        counts[0].copy_(eligible_count.reshape(()))
         counts[1].copy_(staged_count)
         counts[2].copy_(self._staging_promotion_count[0])
         counts[3].copy_(self._staging_repair_count[0])
-        counts[4].copy_(skipped_count)
+        counts[4].copy_(skipped_count.reshape(()))
         counts[5].copy_(miss_count[0])
         plans = self._staging_observation_plans
         if plan is not None:
