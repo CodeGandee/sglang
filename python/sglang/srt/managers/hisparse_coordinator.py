@@ -509,6 +509,7 @@ class HiSparseCoordinator:
         self._staging_active: dict[int, _HiSparseStagePlan] = {}
         self._staging_device_records: dict[int, dict[str, object]] = {}
         self._staging_slots_busy = [False, False]
+        self._staging_slot_events = (None, None)
         self._staging_stats: dict[str, torch.Tensor] = {}
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
@@ -536,6 +537,17 @@ class HiSparseCoordinator:
         )
         kv_shape = tuple(self.mem_pool_device.kv_buffer[0].shape[1:])
         capacity = self.top_k
+        metadata_bytes = 2 * capacity * (4 + 8 + 4)
+        workspace_bytes = 2 * capacity * (4 + 4)
+        payload_bytes = 2 * capacity * self.item_size_bytes
+        required_bytes = payload_bytes + metadata_bytes + 2 * workspace_bytes
+        device_type = torch.device(self.device).type
+        if device_type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            if free_bytes < required_bytes:
+                raise RuntimeError(
+                    "insufficient device memory for HiSparse prediction staging"
+                )
         self._staging_buffers = tuple(
             torch.empty(
                 (capacity, *kv_shape),
@@ -544,20 +556,63 @@ class HiSparseCoordinator:
             )
             for _ in range(2)
         )
-        payload_bytes = 2 * capacity * self.item_size_bytes
-        metadata_bytes = 2 * capacity * (4 + 8 + 4)
-        workspace_bytes = 2 * capacity * (4 + 4)
+        self._staging_logical_ids = torch.empty(
+            (2, capacity), dtype=torch.int64, device=self.device
+        )
+        self._staging_host_locs = torch.empty(
+            (2, capacity), dtype=torch.int64, device=self.device
+        )
+        self._staging_valid_counts = torch.zeros(
+            (2,), dtype=torch.int32, device=self.device
+        )
+        self._staging_matching_workspace = torch.empty(
+            (2, capacity), dtype=torch.int32, device=self.device
+        )
+        self._staging_repair_workspace = torch.empty(
+            (2, capacity), dtype=torch.int32, device=self.device
+        )
+        if device_type == "cuda":
+            self._staging_slot_events = tuple(
+                torch.cuda.Event(enable_timing=False) for _ in range(2)
+            )
+        native_device_bytes = sum(
+            int(buffer.numel() * buffer.element_size())
+            for buffer in self.mem_pool_device.kv_buffer
+        )
+        actual_payload_bytes = sum(
+            int(buffer.numel() * buffer.element_size())
+            for buffer in self._staging_buffers
+        )
+        actual_metadata_bytes = sum(
+            int(tensor.numel() * tensor.element_size())
+            for tensor in (
+                self._staging_logical_ids,
+                self._staging_host_locs,
+                self._staging_valid_counts,
+            )
+        )
+        actual_workspace_bytes = sum(
+            int(tensor.numel() * tensor.element_size())
+            for tensor in (
+                self._staging_matching_workspace,
+                self._staging_repair_workspace,
+            )
+        )
         self._staging_allocation_receipt = {
             "schema": "sglang.hisparse.prediction-staging.v1",
             "enabled": True,
             "slot_count": 2,
             "capacity_rows_per_slot": capacity,
             "row_stride_bytes": int(self.item_size_bytes),
-            "payload_bytes": payload_bytes,
-            "metadata_bytes": metadata_bytes,
-            "matching_workspace_bytes": workspace_bytes,
-            "repair_workspace_bytes": workspace_bytes,
-            "total_bytes": payload_bytes + metadata_bytes + 2 * workspace_bytes,
+            "payload_bytes": actual_payload_bytes,
+            "metadata_bytes": actual_metadata_bytes,
+            "matching_workspace_bytes": actual_workspace_bytes // 2,
+            "repair_workspace_bytes": actual_workspace_bytes // 2,
+            "repair_capacity_rows": capacity,
+            "native_device_bytes": native_device_bytes,
+            "total_bytes": (
+                actual_payload_bytes + actual_metadata_bytes + actual_workspace_bytes
+            ),
             "row_elements": row_elements,
         }
         self._prediction_staging_enabled = True
@@ -728,10 +783,16 @@ class HiSparseCoordinator:
         unique = unique[available]
         host_rows = host_rows[available]
         skipped = int(ids.numel()) - int(unique.numel())
-        slot = next(
-            (index for index, busy in enumerate(self._staging_slots_busy) if not busy),
-            None,
-        )
+        slot = None
+        for index, busy in enumerate(self._staging_slots_busy):
+            if busy:
+                event = self._staging_slot_events[index]
+                if event is not None and event.query():
+                    self._staging_slots_busy[index] = False
+                    busy = False
+            if not busy:
+                slot = index
+                break
         if slot is None or unique.numel() == 0:
             empty["eligible_prediction_rows"] = int(ids.numel())
             empty["skipped_stage_rows"] = skipped
@@ -750,14 +811,18 @@ class HiSparseCoordinator:
             dst_indices=stage_positions,
             item_size=self.item_size_bytes,
         )
+        self._staging_logical_ids[slot, : unique.numel()].copy_(unique)
+        self._staging_host_locs[slot, : unique.numel()].copy_(host_rows)
+        self._staging_valid_counts[slot] = unique.numel()
+        event = self._staging_slot_events[slot]
+        if event is not None:
+            event.record(device_module.current_stream())
         plan = _HiSparseStagePlan(
             slot=slot,
             anchor_layer=layer_id,
-            logical_ids=unique,
-            host_locs=host_rows,
-            valid_count=torch.tensor(
-                unique.numel(), dtype=torch.int32, device=self.device
-            ),
+            logical_ids=self._staging_logical_ids[slot, : unique.numel()],
+            host_locs=self._staging_host_locs[slot, : unique.numel()],
+            valid_count=self._staging_valid_counts[slot],
             buffer=stage,
             step=self._staging_target_step,
         )
@@ -801,7 +866,11 @@ class HiSparseCoordinator:
         if plan is not None:
             destination_tensor = self.mem_pool_device.kv_buffer[layer_id]
             destination_tensor[promotion_dst].copy_(plan.buffer[promotion_stage])
-            self._staging_slots_busy[plan.slot] = False
+            event = self._staging_slot_events[plan.slot]
+            if event is not None:
+                event.record(device_module.current_stream())
+            else:
+                self._staging_slots_busy[plan.slot] = False
             self._staging_active.pop(layer_id, None)
         if repair_src.numel() > 0:
             self.mem_pool_host.load_to_device_per_layer(
@@ -1801,11 +1870,7 @@ class HiSparseCoordinator:
         table = self.top_k_device_locs_buffer[:num_reqs]
         group = (layer_id, *self._prefetch_groups.get(layer_id, []))
         try:
-            _, stage_receipt = (
-                self._stage_prediction_rows(layer_id)
-                if self.prediction_staging_enabled
-                else (None, {})
-            )
+            stage_receipt: dict[str, object] = {}
             plan_cache_to_device_buffer_mla(
                 top_k_tokens=top_k_result,
                 device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -1844,6 +1909,10 @@ class HiSparseCoordinator:
             # token before either the anchor or followers copy those bytes.
             self.wait_for_pending_backup()
             if self.prediction_staging_enabled:
+                # Stage reads are host reads too.  Keep them after the native
+                # publication fence, not merely the later real-destination
+                # repair, so staged bytes cannot observe an unfinished backup.
+                _, stage_receipt = self._stage_prediction_rows(layer_id)
                 self._materialize_staged_anchor(
                     layer_id,
                     top_k_result,
