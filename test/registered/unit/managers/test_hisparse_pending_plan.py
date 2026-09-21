@@ -189,6 +189,83 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "stale HiSparse pending-plan"):
             coordinator._validate_split_plan(previous)
 
+    def test_completed_prepared_batch_reenters_only_with_same_identity(self) -> None:
+        def plan_only(**kwargs: torch.Tensor | int) -> None:
+            kwargs["top_k_device_locs"].fill_(3)
+            kwargs["miss_count"].zero_()
+
+        def prepare() -> tuple[HiSparseCoordinator, torch.Tensor, SimpleNamespace]:
+            coordinator = _coordinator()
+            request = SimpleNamespace(req_pool_idx=7)
+            identity = _HiSparseRequestIdentity(7, 1, id(request))
+            coordinator._split_requests = {7: identity}
+            coordinator._split_step_request = identity
+            coordinator._split_next_request = identity
+            coordinator._run_copy_only_kernel = MethodType(
+                lambda _self, _num_reqs, _layer_id: None, coordinator
+            )
+            request_indices = torch.tensor([7], dtype=torch.int64)
+            seq_lens = torch.tensor([5], dtype=torch.int32)
+            selected = torch.tensor([[1, 2]], dtype=torch.int32)
+            for layer_id in range(10):
+                coordinator.swap_in_selected_pages(
+                    request_indices, seq_lens, selected, layer_id
+                )
+            return coordinator, request_indices, request
+
+        fake_device = _FakeDeviceModule()
+        with (
+            patch.object(hisparse_module, "device_module", fake_device),
+            patch.object(
+                hisparse_module,
+                "plan_cache_to_device_buffer_mla",
+                side_effect=plan_only,
+            ),
+        ):
+            coordinator, request_indices, request = prepare()
+            seq_lens = torch.tensor([5], dtype=torch.int32)
+            selected = torch.tensor([[1, 2]], dtype=torch.int32)
+            for _ in range(3):
+                for layer_id in range(10):
+                    coordinator.swap_in_selected_pages(
+                        request_indices, seq_lens, selected, layer_id
+                    )
+            self.assertEqual(coordinator._split_pending.step, 4)
+            self.assertEqual(coordinator._split_pending.request.generation, 1)
+            coordinator._prepare_split_request_release(request)
+            coordinator._finish_split_request_release(request)
+            self.assertEqual(coordinator._split_requests, {})
+            self.assertIsNone(coordinator._split_pending)
+
+            changed, original_indices, _request = prepare()
+            changed_indices = original_indices.clone()
+            self.assertNotEqual(changed_indices.data_ptr(), original_indices.data_ptr())
+            with self.assertRaisesRegex(
+                RuntimeError, "completed-step reentry changed request identity"
+            ):
+                changed.swap_in_selected_pages(
+                    changed_indices,
+                    torch.tensor([5], dtype=torch.int32),
+                    torch.tensor([[1, 2]], dtype=torch.int32),
+                    layer_id=0,
+                )
+            self.assertEqual(changed._split_aborted_generation, 1)
+
+            partial = _coordinator()
+            partial._run_copy_only_kernel = MethodType(
+                lambda _self, _num_reqs, _layer_id: None, partial
+            )
+            seq_lens = torch.tensor([5], dtype=torch.int32)
+            selected = torch.tensor([[1, 2]], dtype=torch.int32)
+            for layer_id in (0, 1, 2):
+                partial.swap_in_selected_pages(
+                    request_indices, seq_lens, selected, layer_id
+                )
+            with self.assertRaisesRegex(RuntimeError, "before every follower"):
+                partial.swap_in_selected_pages(
+                    request_indices, seq_lens, selected, layer_id=6
+                )
+
     def test_abort_drains_safe_work_and_failed_fence_quarantines_worker(self) -> None:
         coordinator = _coordinator()
         coordinator._split_pending = SimpleNamespace()

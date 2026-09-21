@@ -429,6 +429,8 @@ class HiSparseCoordinator:
         self._split_step_request: _HiSparseRequestIdentity | None = None
         self._split_next_request: _HiSparseRequestIdentity | None = None
         self._split_aborted_generation: int | None = None
+        # Native traversal ordinal: one prepared logical decode step may run
+        # several complete traversals (seed, diagnostics, then real/hint).
         self._split_step = 0
         self._split_anchor_index = 0
         self._split_step_request_ptr: int | None = None
@@ -1265,10 +1267,10 @@ class HiSparseCoordinator:
         if plan.representation != "mla-bf16-width-576":
             raise RuntimeError("HiSparse pending-plan representation changed")
 
-    def _retire_split_plan_before_anchor(self) -> None:
+    def _retire_split_plan_before_anchor(self) -> _HiSparsePendingPlan | None:
         pending = self._split_pending
         if pending is None:
-            return
+            return None
         self._validate_split_plan(pending)
         follower_count = len(pending.group_layers) - 1
         if self._split_followers_seen != follower_count:
@@ -1280,6 +1282,7 @@ class HiSparseCoordinator:
         # for its copy event, so the borrowed buffers are now reusable.
         self._split_pending = None
         self._split_followers_seen = 0
+        return pending
 
     def _run_split_anchor(
         self,
@@ -1292,19 +1295,39 @@ class HiSparseCoordinator:
         if req_pool_indices.size(0) != 1:
             raise RuntimeError("HiSparse split materialization requires B1")
 
-        self._retire_split_plan_before_anchor()
+        retired = self._retire_split_plan_before_anchor()
         expected_layer = self._split_anchor_layers[self._split_anchor_index]
         if layer_id != expected_layer:
             raise RuntimeError(
                 "HiSparse split anchor order changed: "
                 f"received {layer_id}, expected {expected_layer}"
             )
+        request_indices_ptr = req_pool_indices.data_ptr()
         if self._split_anchor_index == 0:
             active = self._split_next_request
             if active is None:
-                raise RuntimeError(
-                    "HiSparse split step has no bound request generation"
+                active = self._split_step_request
+                completed_reentry = (
+                    retired is not None
+                    and active is not None
+                    and retired.request == active
+                    and retired.anchor_layer == self._split_anchor_layers[-1]
+                    and retired.step == self._split_step
+                    and self._split_requests.get(active.slot) == active
+                    and self._split_aborted_generation != active.generation
                 )
+                if not completed_reentry:
+                    raise RuntimeError(
+                        "HiSparse split step has no bound request generation"
+                    )
+                if (
+                    retired.request_indices_ptr != request_indices_ptr
+                    or self._split_step_request_ptr != request_indices_ptr
+                ):
+                    self._split_aborted_generation = active.generation
+                    raise RuntimeError(
+                        "HiSparse completed-step reentry changed request identity"
+                    )
             self._split_step_request = active
             self._split_next_request = None
         else:
@@ -1313,7 +1336,6 @@ class HiSparseCoordinator:
             raise RuntimeError("HiSparse split materialization has no live request")
         if self._split_aborted_generation == active.generation:
             raise RuntimeError("aborted HiSparse request cannot start another plan")
-        request_indices_ptr = req_pool_indices.data_ptr()
         if self._split_anchor_index == 0:
             self._split_step += 1
             self._split_step_request_ptr = request_indices_ptr
