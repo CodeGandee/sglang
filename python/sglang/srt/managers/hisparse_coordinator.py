@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -9,6 +10,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
+    plan_cache_to_device_buffer_mla,
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
@@ -43,6 +45,28 @@ class HiSparseTokenStats(NamedTuple):
     device_token_usage: float
     host_tokens: int
     host_token_usage: float
+
+
+@dataclass(frozen=True)
+class _HiSparseRequestIdentity:
+    slot: int
+    generation: int
+    object_id: int
+
+
+@dataclass(frozen=True)
+class _HiSparsePendingPlan:
+    request: _HiSparseRequestIdentity
+    request_indices_ptr: int
+    step: int
+    anchor_layer: int
+    group_layers: Tuple[int, ...]
+    representation: str
+    num_reqs: int
+    table: torch.Tensor
+    miss_src: torch.Tensor
+    miss_dst: torch.Tensor
+    miss_count: torch.Tensor
 
 
 def resolve_shared_index_layers(
@@ -318,9 +342,171 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    @property
+    def split_materialization_enabled(self) -> bool:
+        """Whether this instance was pinned to native plan/materialize."""
+        return bool(getattr(self, "_split_materialization_enabled", False))
+
+    @property
+    def split_materialization_callable(self) -> str:
+        """Return the stable receipt name for this instance's retrieval path."""
+        if self.split_materialization_enabled:
+            return "native-plan-materialize"
+        return "native-fused"
+
+    @property
+    def split_worker_reusable(self) -> bool:
+        """Whether owned device work has a proven-safe reuse boundary."""
+        return bool(getattr(self, "_split_worker_reusable", True))
+
+    def enable_split_materialization(
+        self, *, logical_batch_size: int, eager: bool
+    ) -> None:
+        """Pin this coordinator to the admitted GLM plan/materialize path.
+
+        Parameters
+        ----------
+        logical_batch_size:
+            Qualified request batch size. M4.2 admits exactly one request.
+        eager:
+            Whether CUDA graph replay is disabled for the worker.
+
+        Raises
+        ------
+        RuntimeError
+            The method was called more than once, after request allocation, or
+            on a coordinator outside the admitted BF16 MLA GLM profile.
+        """
+        if self.split_materialization_enabled:
+            raise RuntimeError("HiSparse split materialization is already enabled")
+        if logical_batch_size != 1 or not eager:
+            raise RuntimeError(
+                "HiSparse split materialization requires eager logical batch size 1"
+            )
+        if self.is_dsv4_hisparse:
+            raise RuntimeError("HiSparse split materialization does not admit DSV4")
+        if self.skip_io:
+            raise RuntimeError(
+                "HiSparse split materialization rejects the debug skip-IO probe"
+            )
+        expected = {
+            "top-k": (self.top_k, 2048),
+            "device buffer": (self.device_buffer_size, 4096),
+            "swap block": (self.swap_in_block_size, 960),
+            "TP world size": (self.tp_world_size, 1),
+            "MLA row bytes": (self.item_size_bytes, 576 * 2),
+            "layer count": (self.mem_pool_device.layer_num, 10),
+        }
+        mismatches = [
+            f"{name}={actual!r}, expected {wanted!r}"
+            for name, (actual, wanted) in expected.items()
+            if actual != wanted
+        ]
+        kv_dtype = self.mem_pool_device.kv_buffer[0].dtype
+        if kv_dtype != torch.bfloat16:
+            mismatches.append(f"KV dtype={kv_dtype!r}, expected torch.bfloat16")
+        expected_groups = {2: [3, 4, 5], 6: [7, 8, 9]}
+        if not self.enable_prefetch or self._prefetch_groups != expected_groups:
+            mismatches.append(
+                "shared-index groups="
+                f"{self._prefetch_groups!r}, expected {expected_groups!r}"
+            )
+        if bool(torch.any(self.req_device_buffer_size)):
+            mismatches.append("request storage is already allocated")
+        if mismatches:
+            raise RuntimeError(
+                "unsupported HiSparse split materialization profile: "
+                + "; ".join(mismatches)
+            )
+
+        # Split-only state is installed here, not in __init__, so feature-off
+        # workers retain the fused route without another state owner.
+        self._split_worker_reusable = True
+        self._split_generation = 0
+        self._split_active_request: Optional[_HiSparseRequestIdentity] = None
+        self._split_aborted_generation: Optional[int] = None
+        self._split_step = 0
+        self._split_anchor_index = 0
+        self._split_anchor_layers = tuple(
+            layer
+            for layer, shared in enumerate(self._is_shared_index_layer)
+            if not shared
+        )
+        self._split_pending: Optional[_HiSparsePendingPlan] = None
+        self._split_followers_seen = 0
+        self._split_materialization_enabled = True
+
+    def abort_split_materialization(self, *, safe_to_reuse: bool) -> None:
+        """Invalidate the current request after a failed split step.
+
+        Parameters
+        ----------
+        safe_to_reuse:
+            ``True`` only when owned stream fences remain usable. The method
+            drains them before allowing a later request generation. ``False``
+            quarantines this coordinator for process retirement.
+        """
+        if not self.split_materialization_enabled:
+            return
+        active = self._split_active_request
+        if active is not None:
+            self._split_aborted_generation = active.generation
+        if not safe_to_reuse:
+            self._split_worker_reusable = False
+            return
+        self._drain_split_materialization()
+        self._split_pending = None
+        self._split_followers_seen = 0
+
+    def _drain_split_materialization(self) -> None:
+        if not self.split_materialization_enabled:
+            return
+        try:
+            self.prefetch_stream.synchronize()
+            device_module.current_stream().synchronize()
+        except BaseException:
+            self._split_worker_reusable = False
+            raise
+
+    def _assert_split_worker_reusable(self) -> None:
+        if not self.split_worker_reusable:
+            raise RuntimeError(
+                "HiSparse split materialization worker is unsafe; retire it"
+            )
+
+    def _assert_can_activate_split_request(self, req: Req) -> None:
+        if not self.split_materialization_enabled:
+            return
+        self._assert_split_worker_reusable()
+        if self._split_active_request is not None:
+            raise RuntimeError(
+                "HiSparse split materialization admits one live request generation"
+            )
+        if self._split_pending is not None:
+            raise RuntimeError("HiSparse split materialization retained a stale plan")
+        if req.req_pool_idx is None:
+            raise RuntimeError("HiSparse split request has no native request slot")
+
+    def _activate_split_request(self, req: Req) -> None:
+        if not self.split_materialization_enabled:
+            return
+        self._split_generation += 1
+        self._split_active_request = _HiSparseRequestIdentity(
+            slot=int(req.req_pool_idx),
+            generation=self._split_generation,
+            object_id=id(req),
+        )
+        self._split_aborted_generation = None
+        self._split_step = 0
+        self._split_anchor_index = 0
+        self._split_pending = None
+        self._split_followers_seen = 0
+
     def destroy(self) -> None:
         # Drain in-flight transfers so the buffer is idle, then unregister it.
         # See HostKVCache.destroy for why the explicit unregister matters.
+        if self.split_materialization_enabled:
+            self._drain_split_materialization()
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
         if self.enable_prefetch:
@@ -439,6 +625,7 @@ class HiSparseCoordinator:
             )
 
     def alloc_device_buffer(self, req: Req) -> None:
+        self._assert_can_activate_split_request(req)
         if self.is_dsv4_hisparse:
             allocated_len = req.extend_range.end
             alloc_size = self.padded_buffer_size
@@ -484,6 +671,7 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+        self._activate_split_request(req)
 
     def _grow_device_buffers(
         self,
@@ -886,7 +1074,43 @@ class HiSparseCoordinator:
         else:
             self.request_finished(req)
 
+    def _prepare_split_request_release(self, req: Req) -> bool:
+        if not self.split_materialization_enabled:
+            return True
+        active = self._split_active_request
+        if active is None:
+            # Coordinator cleanup is idempotent after the request-owned native
+            # storage has already been returned.
+            return bool(
+                int(self.req_device_buffer_size[req.req_pool_idx])
+                or int(self.req_to_host_pool_allocated_len[req.req_pool_idx])
+            )
+        if active.slot != int(req.req_pool_idx) or active.object_id != id(req):
+            raise RuntimeError(
+                "stale request generation cannot release HiSparse split storage"
+            )
+        self._drain_split_materialization()
+        return True
+
+    def _finish_split_request_release(self, req: Req) -> None:
+        if not self.split_materialization_enabled:
+            return
+        active = self._split_active_request
+        if active is not None and (
+            active.slot != int(req.req_pool_idx) or active.object_id != id(req)
+        ):
+            raise RuntimeError(
+                "HiSparse split request identity changed during native release"
+            )
+        self._split_active_request = None
+        self._split_pending = None
+        self._split_followers_seen = 0
+        self._split_aborted_generation = None
+        self._split_anchor_index = 0
+
     def request_finished(self, req: Req):
+        if not self._prepare_split_request_release(req):
+            return
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
@@ -933,6 +1157,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._finish_split_request_release(req)
 
     def _run_swap_in_kernel(
         self,

@@ -320,9 +320,9 @@ struct SmemLayout {
 //
 // RecordMissPlan records this step's miss plan (miss_src/dst = host/device loc
 // per miss, miss_count per request) for shared-index skip layers to replay via
-// copy_cache_planned_kernel. SkipIO elides only the KV byte movement (timing
-// probe; output is garbage). Both are compile-time flags so the production
-// (false, false) instantiation stays byte-identical.
+// copy_cache_planned_kernel. PlanOnly is the supported placement-only path;
+// SkipIO remains the timing probe. Both suppress KV movement, but separate
+// flags keep product planning distinct from the debug probe.
 template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
@@ -330,6 +330,7 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
+    bool PlanOnly,
     bool SkipIO,
     typename SeqLensT,
     typename ReqPoolIndicesT>
@@ -359,6 +360,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int32_t* __restrict__ miss_count_out,
     int64_t plan_stride) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
+  static_assert(!PlanOnly || RecordMissPlan, "Plan-only placement requires miss-plan outputs.");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
@@ -373,6 +375,11 @@ __global__ void load_cache_to_device_buffer_kernel(
   if (bid >= num_real_reqs[0]) {
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       req_top_k_device_locs[i] = -1;
+    }
+    if constexpr (RecordMissPlan) {
+      if (tid == 0) {
+        miss_count_out[bid] = 0;
+      }
     }
     return;
   }
@@ -674,7 +681,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
-  if constexpr (!SkipIO) {
+  if constexpr (!PlanOnly && !SkipIO) {
     for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
       const int32_t miss_token = s_top_k_tokens[miss_idx];
       const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
@@ -695,6 +702,7 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
+    bool PlanOnly,
     bool SkipIO>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
@@ -784,6 +792,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
+            PlanOnly,
             SkipIO,
             int64_t,
             int64_t>,
@@ -798,6 +807,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
+            PlanOnly,
             SkipIO,
             int64_t,
             int32_t>,
@@ -812,6 +822,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
+            PlanOnly,
             SkipIO,
             int32_t,
             int64_t>,
@@ -826,6 +837,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
+            PlanOnly,
             SkipIO,
             int32_t,
             int32_t>,
