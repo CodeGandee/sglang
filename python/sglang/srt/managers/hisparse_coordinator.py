@@ -467,8 +467,12 @@ class HiSparseCoordinator:
         if not self.split_materialization_enabled:
             return
         try:
+            current_stream = device_module.current_stream()
+            if self.decode_producer_stream is not None:
+                current_stream.wait_stream(self.decode_producer_stream)
+            self.wait_for_pending_backup()
             self.prefetch_stream.synchronize()
-            device_module.current_stream().synchronize()
+            current_stream.synchronize()
         except BaseException:
             self._split_worker_reusable = False
             raise
@@ -1105,6 +1109,7 @@ class HiSparseCoordinator:
             raise RuntimeError(
                 "stale request generation cannot release HiSparse split storage"
             )
+        self._assert_split_worker_reusable()
         if self._split_step_request == identity:
             self._drain_split_materialization()
         return True

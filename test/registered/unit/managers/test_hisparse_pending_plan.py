@@ -16,13 +16,16 @@ from sglang.srt.managers.hisparse_coordinator import (
 class _FakeStream:
     def __init__(self) -> None:
         self.waited: list[object] = []
+        self.operations: list[str] = []
         self.synchronize_count = 0
         self.fail_synchronize = False
 
     def wait_stream(self, stream: object) -> None:
         self.waited.append(stream)
+        self.operations.append("wait-stream")
 
     def synchronize(self) -> None:
+        self.operations.append("synchronize")
         self.synchronize_count += 1
         if self.fail_synchronize:
             raise RuntimeError("injected fence failure")
@@ -101,6 +104,7 @@ def _coordinator() -> HiSparseCoordinator:
     coordinator._split_followers_seen = 0
     coordinator._split_materialization_enabled = True
     coordinator._has_pending_backup = False
+    coordinator.decode_producer_stream = None
     return coordinator
 
 
@@ -189,6 +193,8 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         coordinator = _coordinator()
         coordinator._split_pending = SimpleNamespace()
         fake_device = _FakeDeviceModule()
+        producer_stream = _FakeStream()
+        coordinator.decode_producer_stream = producer_stream
         with patch.object(hisparse_module, "device_module", fake_device):
             coordinator.abort_split_materialization(safe_to_reuse=True)
 
@@ -196,6 +202,10 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         self.assertEqual(coordinator._split_aborted_generation, 1)
         self.assertEqual(coordinator.prefetch_stream.synchronize_count, 1)
         self.assertEqual(fake_device.compute_stream.synchronize_count, 1)
+        self.assertEqual(fake_device.compute_stream.waited, [producer_stream])
+        self.assertEqual(
+            fake_device.compute_stream.operations, ["wait-stream", "synchronize"]
+        )
 
         coordinator._split_aborted_generation = None
         coordinator._split_pending = SimpleNamespace()
@@ -208,6 +218,12 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         self.assertFalse(coordinator.split_worker_reusable)
         with self.assertRaisesRegex(RuntimeError, "unsafe; retire it"):
             coordinator._assert_split_worker_reusable()
+        req = SimpleNamespace(req_pool_idx=7)
+        unsafe_identity = _HiSparseRequestIdentity(7, 1, id(req))
+        coordinator._split_requests = {7: unsafe_identity}
+        coordinator._split_step_request = unsafe_identity
+        with self.assertRaisesRegex(RuntimeError, "unsafe; retire it"):
+            coordinator._prepare_split_request_release(req)
 
     def test_allocated_requests_keep_independent_slot_generations(self) -> None:
         coordinator = _coordinator()
