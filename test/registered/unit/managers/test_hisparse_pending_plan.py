@@ -13,6 +13,12 @@ from sglang.srt.managers.hisparse_coordinator import (
     _HiSparseStagePlan,
 )
 
+_PREDICTIVE_ADMISSION_SCHEDULE = (
+    (None, (0, 1), "step-entry"),
+    (0, (2,), "after-layer-0-reader"),
+    (4, (6,), "after-layer-4-reader"),
+)
+
 
 class _FakeStream:
     def __init__(self) -> None:
@@ -206,6 +212,14 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         coordinator.enable_prefetch = True
         coordinator._overlap_enabled = False
         coordinator._enable_prediction_staging(0, predictive_overlap=True)
+        coordinator.enable_predictive_overlap(
+            stage_slot_count=2,
+            rows_per_lease=capacity,
+            urgent_priority=-1,
+            speculative_priority=0,
+            native_exact_role="prefetch_stream",
+            admission_schedule=_PREDICTIVE_ADMISSION_SCHEDULE,
+        )
 
         request = SimpleNamespace(req_pool_idx=0, rid="predictive-device")
         native_identity = _HiSparseRequestIdentity(0, 7, id(request))
@@ -377,6 +391,7 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         coordinator._staging_admitted_counts = {}
         coordinator._staging_admission_attempted = set()
         coordinator._staging_tag_sequence = 0
+        coordinator._predictive_admission_schedule = _PREDICTIVE_ADMISSION_SCHEDULE
         coordinator._staging_slot_stats = [
             {
                 "slot": slot,
@@ -534,6 +549,99 @@ class TestHiSparsePendingPlan(unittest.TestCase):
         self.assertEqual(admitted, [0, 1, 2])
         coordinator.admit_prediction_after_layer(4)
         self.assertEqual(admitted, [0, 1, 2, 6])
+        self.assertEqual(coordinator._staging_admission_phase(0), "step-entry")
+        self.assertEqual(
+            coordinator._staging_admission_phase(2), "after-layer-0-reader"
+        )
+        self.assertEqual(
+            coordinator._staging_admission_phase(6), "after-layer-4-reader"
+        )
+
+    def test_predictive_admission_rejects_invalid_or_conflicting_schedule(
+        self,
+    ) -> None:
+        invalid_schedules = (
+            ("mutable", list(_PREDICTIVE_ADMISSION_SCHEDULE), "nonempty tuple"),
+            (
+                "missing-anchor",
+                _PREDICTIVE_ADMISSION_SCHEDULE[:-1],
+                "does not cover",
+            ),
+            (
+                "unknown-anchor",
+                (
+                    (None, (0, 1), "entry"),
+                    (0, (2,), "middle"),
+                    (4, (5,), "late"),
+                ),
+                "not a native fresh anchor",
+            ),
+            (
+                "late-boundary",
+                (
+                    (None, (0, 1), "entry"),
+                    (2, (2,), "middle"),
+                    (4, (6,), "late"),
+                ),
+                "precede target consumption",
+            ),
+            (
+                "duplicate-target",
+                (
+                    (None, (0, 1), "entry"),
+                    (0, (2,), "middle"),
+                    (3, (2, 6), "late"),
+                ),
+                "target is duplicated",
+            ),
+            (
+                "duplicate-label",
+                (
+                    (None, (0, 1), "entry"),
+                    (0, (2,), "middle"),
+                    (4, (6,), "middle"),
+                ),
+                "phase label is duplicated",
+            ),
+        )
+        for label, schedule, message in invalid_schedules:
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex((RuntimeError, TypeError), message),
+            ):
+                coordinator, _request, _identity = self._bindable_staging_coordinator()
+                coordinator._overlap_enabled = True
+                coordinator._overlap_stream_priorities = {
+                    "urgent": -1,
+                    "speculative": 0,
+                }
+                coordinator._predictive_admission_schedule = ()
+                coordinator.enable_predictive_overlap(
+                    stage_slot_count=2,
+                    rows_per_lease=2,
+                    urgent_priority=-1,
+                    speculative_priority=0,
+                    native_exact_role="prefetch_stream",
+                    admission_schedule=schedule,
+                )
+
+        coordinator, _request, _identity = self._bindable_staging_coordinator()
+        coordinator._overlap_enabled = True
+        coordinator._overlap_stream_priorities = {"urgent": -1, "speculative": 0}
+        coordinator._predictive_admission_schedule = _PREDICTIVE_ADMISSION_SCHEDULE
+        with self.assertRaisesRegex(RuntimeError, "different predictive"):
+            coordinator.enable_predictive_overlap(
+                stage_slot_count=2,
+                rows_per_lease=2,
+                urgent_priority=-1,
+                speculative_priority=0,
+                native_exact_role="prefetch_stream",
+                admission_schedule=(
+                    (None, (0,), "entry"),
+                    (0, (1, 2), "middle"),
+                    (4, (6,), "late"),
+                ),
+            )
 
     def test_predictive_consumer_never_retries_a_missed_admission(self) -> None:
         coordinator, _request, identity = self._bindable_staging_coordinator()

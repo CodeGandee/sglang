@@ -36,6 +36,8 @@ _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
+_PredictiveAdmissionSchedule = tuple[tuple[int | None, tuple[int, ...], str], ...]
+
 
 def _nvtx_range(name: str, *, enabled: bool) -> AbstractContextManager[None]:
     """Return a CUDA timeline range without affecting CPU-only execution."""
@@ -624,6 +626,7 @@ class HiSparseCoordinator:
         self._staging_step_end_event = None
         self._overlap_timing_events: dict[str, object] = {}
         self._overlap_stream_priorities: dict[str, int] = {}
+        self._predictive_admission_schedule: _PredictiveAdmissionSchedule = ()
         self._staging_observation = {
             "schema": "sglang.hisparse.prediction-staging-observation.v1",
             "request_slot": -1,
@@ -933,6 +936,7 @@ class HiSparseCoordinator:
         urgent_priority: int,
         speculative_priority: int,
         native_exact_role: str,
+        admission_schedule: _PredictiveAdmissionSchedule,
     ) -> dict[str, int]:
         """Validate or activate the fixed M4.4 native overlap bundle.
 
@@ -950,8 +954,70 @@ class HiSparseCoordinator:
             raise RuntimeError("predictive overlap native-exact role is unsupported")
         if not self.prediction_staging_enabled:
             raise RuntimeError("predictive overlap requires prediction staging")
+        validated_schedule = self._validate_predictive_admission_schedule(
+            admission_schedule
+        )
+        installed_schedule = getattr(self, "_predictive_admission_schedule", ())
+        if installed_schedule and installed_schedule != validated_schedule:
+            raise RuntimeError("a different predictive admission schedule is bound")
         self._initialize_overlap_resources()
+        self._predictive_admission_schedule = validated_schedule
         return self.overlap_stream_priorities
+
+    def _validate_predictive_admission_schedule(
+        self, schedule: _PredictiveAdmissionSchedule
+    ) -> _PredictiveAdmissionSchedule:
+        """Validate immutable model-owned admission data against native topology."""
+        if not isinstance(schedule, tuple) or not schedule:
+            raise TypeError("predictive admission schedule must be a nonempty tuple")
+        available_anchors = set(self._split_anchor_layers)
+        layer_count = len(self._is_shared_index_layer)
+        seen_boundaries: set[int | None] = set()
+        seen_targets: set[int] = set()
+        seen_labels: set[str] = set()
+        for entry in schedule:
+            if not isinstance(entry, tuple) or len(entry) != 3:
+                raise TypeError("predictive admission schedule entry is malformed")
+            after_layer, target_anchors, phase_label = entry
+            if after_layer is not None and (
+                isinstance(after_layer, bool)
+                or not isinstance(after_layer, int)
+                or not 0 <= after_layer < layer_count
+            ):
+                raise RuntimeError(
+                    "predictive admission boundary is not a native layer"
+                )
+            if after_layer in seen_boundaries:
+                raise RuntimeError("predictive admission boundary is duplicated")
+            seen_boundaries.add(after_layer)
+            if not isinstance(target_anchors, tuple) or not target_anchors:
+                raise TypeError("predictive admission targets must be a nonempty tuple")
+            if not isinstance(phase_label, str) or not phase_label:
+                raise TypeError("predictive admission phase label is malformed")
+            if phase_label in seen_labels:
+                raise RuntimeError("predictive admission phase label is duplicated")
+            seen_labels.add(phase_label)
+            for anchor in target_anchors:
+                if isinstance(anchor, bool) or not isinstance(anchor, int):
+                    raise TypeError("predictive admission target must be an integer")
+                if anchor not in available_anchors:
+                    raise RuntimeError(
+                        "predictive admission target is not a native fresh anchor"
+                    )
+                if anchor in seen_targets:
+                    raise RuntimeError("predictive admission target is duplicated")
+                if after_layer is not None and after_layer >= anchor:
+                    raise RuntimeError(
+                        "predictive admission must precede target consumption"
+                    )
+                seen_targets.add(anchor)
+        if None not in seen_boundaries:
+            raise RuntimeError("predictive admission schedule has no step entry")
+        if seen_targets != available_anchors:
+            raise RuntimeError(
+                "predictive admission schedule does not cover native fresh anchors"
+            )
+        return schedule
 
     @property
     def overlap_resource_receipt(self) -> dict[str, object] | None:
@@ -967,6 +1033,7 @@ class HiSparseCoordinator:
             "speculative_stream": "speculative_stream",
             "stream_priorities": dict(self._overlap_stream_priorities),
             "ready_tags_device_resident": True,
+            "admission_schedule": self._predictive_admission_schedule,
         }
 
     def bind_prediction_staging(
@@ -1084,12 +1151,14 @@ class HiSparseCoordinator:
         # Prediction tensors are produced before the carrier traversal.  A
         # stream event captures that dependency once; ordinary decode never
         # queries a scalar readiness value on the host.
-        prediction_ready_event = getattr(self, "_prediction_ready_event", None)
-        if prediction_ready_event is not None:
+        if getattr(self, "_overlap_enabled", False):
+            prediction_ready_event = getattr(self, "_prediction_ready_event", None)
+            if prediction_ready_event is None:
+                raise RuntimeError("predictive admission dependency event is missing")
             self.wait_for_pending_backup()
             prediction_ready_event.record(device_module.current_stream())
-            self._stage_prediction_rows(0)
-            self._stage_prediction_rows(1)
+            for anchor in self._prediction_admission_targets(after_layer=None):
+                self._stage_prediction_rows(anchor)
 
     def clear_prediction_staging(self, identity: object, target_step: int) -> None:
         """Join one prediction step before releasing its bank binding."""
@@ -1557,9 +1626,20 @@ class HiSparseCoordinator:
         """Admit one future anchor after the layer's final attention reader."""
         if not getattr(self, "_overlap_enabled", False):
             return
-        anchor = {0: 2, 4: 6}.get(layer_id)
-        if anchor is not None:
+        for anchor in self._prediction_admission_targets(after_layer=layer_id):
             self._stage_prediction_rows(anchor)
+
+    def _prediction_admission_targets(
+        self, *, after_layer: int | None
+    ) -> tuple[int, ...]:
+        """Return model-bound targets for one native execution boundary."""
+        schedule = self._predictive_admission_schedule
+        if not schedule:
+            raise RuntimeError("predictive admission schedule is not bound")
+        for boundary, anchors, _phase in schedule:
+            if boundary == after_layer:
+                return anchors
+        return ()
 
     def _prediction_stage_for_anchor(
         self, layer_id: int
@@ -1582,16 +1662,14 @@ class HiSparseCoordinator:
         )
         return self._staging_active.get(layer_id), counts[0], counts[1]
 
-    @staticmethod
-    def _staging_admission_phase(layer_id: int) -> str:
-        """Return the fixed M4.4 layer-timed admission phase for one anchor."""
-        if layer_id in (0, 1):
-            return "step-entry"
-        if layer_id == 2:
-            return "after-layer-0-reader"
-        if layer_id == 6:
-            return "after-layer-4-reader"
-        return "unsupported"
+    def _staging_admission_phase(self, layer_id: int) -> str:
+        """Return the bound predictive label or the generic on-demand phase."""
+        if not getattr(self, "_overlap_enabled", False):
+            return "on-demand"
+        for _boundary, anchors, phase in self._predictive_admission_schedule:
+            if layer_id in anchors:
+                return phase
+        raise RuntimeError("predictive admission target has no bound phase label")
 
     def _next_stage_tag(
         self,
@@ -2095,6 +2173,18 @@ class HiSparseCoordinator:
 
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
+
+    @property
+    def staging_requests(self) -> tuple[Req, ...]:
+        """Return identity-deduplicated requests owned by prefill staging."""
+        requests: list[Req] = []
+        seen: set[int] = set()
+        for act in self.ack_staging_queue:
+            req_identity = id(act.req)
+            if req_identity not in seen:
+                requests.append(act.req)
+                seen.add(req_identity)
+        return tuple(requests)
 
     def collect_ready_reqs(self) -> List[Req]:
         ready_reqs: List[Req] = []

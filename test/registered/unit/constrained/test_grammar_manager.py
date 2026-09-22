@@ -26,6 +26,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
@@ -336,9 +337,7 @@ class TestAbortRequests(unittest.TestCase):
         req.grammar = future
         mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(rid="req-123")
 
         mgr.abort_requests(abort_req)
         future.cancel.assert_called_once()
@@ -350,9 +349,7 @@ class TestAbortRequests(unittest.TestCase):
         req.grammar = MagicMock(spec=Future)
         mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(rid="req-123")
 
         mgr.abort_requests(abort_req)
         req.set_finish_with_abort.assert_not_called()
@@ -366,9 +363,7 @@ class TestAbortRequests(unittest.TestCase):
             mgr.grammar_queue.append(req)
             reqs.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = True
-        abort_req.rid = ""
+        abort_req = AbortReq(abort_all=True)
 
         mgr.abort_requests(abort_req)
         for req in reqs:
@@ -377,9 +372,7 @@ class TestAbortRequests(unittest.TestCase):
     def test_abort_empty_queue(self):
         """Aborting on an empty queue should not raise."""
         mgr = self._make_mgr_with_queue()
-        abort_req = MagicMock()
-        abort_req.abort_all = True
-        abort_req.rid = ""
+        abort_req = AbortReq(abort_all=True)
         mgr.abort_requests(abort_req)  # Should not raise
 
     def test_abort_prefix_match(self):
@@ -389,12 +382,23 @@ class TestAbortRequests(unittest.TestCase):
         req.grammar = MagicMock(spec=Future)
         mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(rid="req-123")
 
         mgr.abort_requests(abort_req)
         req.set_finish_with_abort.assert_called_once()
+
+    def test_abort_exact_match_does_not_abort_prefix_related_request(self):
+        mgr = self._make_mgr_with_queue()
+        exact = _make_req(rid="req-123")
+        sibling = _make_req(rid="req-123-suffix")
+        exact.grammar = MagicMock(spec=Future)
+        sibling.grammar = MagicMock(spec=Future)
+        mgr.grammar_queue.extend((exact, sibling))
+
+        mgr.abort_requests(AbortReq(rid="req-123", exact_match=True))
+
+        exact.set_finish_with_abort.assert_called_once()
+        sibling.set_finish_with_abort.assert_not_called()
 
 
 class TestGetReadyGrammarRequests(unittest.TestCase):

@@ -2008,11 +2008,32 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # Match only the complete request ID. Public abort keeps prefix matching by
+    # default; internal disconnect cleanup opts into exact matching so one
+    # client cannot cancel a prefix-related request.
+    exact_match: bool = False
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+    def matches(self, rid: str) -> bool:
+        """Return whether this abort targets ``rid``.
+
+        Parameters
+        ----------
+        rid
+            Candidate request ID owned by a native queue or batch.
+
+        Returns
+        -------
+        bool
+            ``True`` when the request should be aborted.
+        """
+        return self.abort_all or (
+            rid == self.rid if self.exact_match else rid.startswith(self.rid)
+        )
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):

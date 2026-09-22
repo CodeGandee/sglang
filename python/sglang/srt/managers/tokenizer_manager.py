@@ -225,6 +225,12 @@ class ReqState:
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
+    # Native lifecycle state. A detached request keeps this small terminal
+    # record until the scheduler acknowledges completion or cancellation.
+    dispatched: bool = False
+    abort_dispatched: bool = False
+    detached: bool = False
+
     # For streaming output
     last_output_offset: int = 0
 
@@ -794,6 +800,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
+        request_states = self._get_req_states(obj)
         try:
             if self.server_args.language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -820,14 +827,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     async for response in self._handle_batch_request(obj, request):
                         yield response
         except BaseException:
-            # _init_req_state created a rid_to_state entry per (sub-)request up
-            # front. The normal remover is the scheduler-response path
-            # (_handle_batch_output), so a failure *before* a request reaches the
-            # scheduler -- e.g. input-length validation rejecting an over-context
-            # request -- would otherwise leak those entries forever. Drop any that
-            # are still pending; entries already removed on the normal completion
-            # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            # Reject undispatched requests immediately. Dispatched requests keep
+            # their exact state identity until the scheduler retires them; this
+            # lets generator closure dispatch cancellation before client-facing
+            # payloads are discarded.
+            self._cancel_or_discard_req_states(request_states)
             raise
 
     def _detect_input_format(
@@ -1627,6 +1631,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
             dispatched = True
+            if state := self.rid_to_state.get(tokenized_obj.rid):
+                state.dispatched = True
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
@@ -1659,6 +1665,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             self._dispatch_to_scheduler(batch_req)
             dispatched = True
+            for tokenized_obj in tokenized_objs:
+                if state := self.rid_to_state.get(tokenized_obj.rid):
+                    state.dispatched = True
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -1768,7 +1777,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
+                    self._abort_live_request(obj.rid, state)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
@@ -1849,7 +1858,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
+                    self._abort_live_request(obj.rid, state)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
@@ -2005,7 +2014,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, *, exact_match: bool = False
+    ):
+        """Dispatch a native request abort.
+
+        Parameters
+        ----------
+        rid
+            Request ID or request-ID prefix to abort.
+        abort_all
+            Abort every request when ``True``.
+        exact_match
+            Match the complete request ID instead of the default public prefix
+            behavior.
+        """
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
@@ -2013,10 +2036,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if (
             not abort_all
             and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
+            and not any(
+                state_rid == rid if exact_match else state_rid.startswith(rid)
+                for state_rid in self.rid_to_state
+            )
         ):
             return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(
+            rid=rid,
+            abort_all=abort_all,
+            exact_match=exact_match,
+        )
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
@@ -2179,10 +2209,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async def abort_request():
             await asyncio.sleep(2)
             if obj.is_single:
-                self.abort_request(obj.rid)
+                state = self.rid_to_state.get(obj.rid)
+                if state is not None and state.obj is obj:
+                    self._abort_live_request(obj.rid, state)
             else:
-                for rid in obj.rid:
-                    self.abort_request(rid)
+                for i, rid in enumerate(obj.rid):
+                    state = self.rid_to_state.get(rid)
+                    if state is not None and state.obj is obj[i]:
+                        self._abort_live_request(rid, state)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -2500,7 +2534,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if self.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
-            if out_dict is not None:
+            if out_dict is not None and not state.detached:
                 state.out_list.append(out_dict)
                 pending_notify[rid] = state
 
@@ -3225,7 +3259,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
-        if is_stream:
+        if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
             "text": state.get_text(),
@@ -3234,8 +3268,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         del self.rid_to_state[recv_obj.rid]
 
-        state.out_list.append(out)
-        state.event.set()
+        if not state.detached:
+            state.out_list.append(out)
+            state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self._dispatch_to_scheduler(ranks)
@@ -3432,6 +3467,45 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+
+    def _get_req_states(self, obj) -> dict[str, ReqState]:
+        """Capture the live state identities initialized for ``obj``."""
+        if not hasattr(obj, "is_single") or obj.is_single:
+            rids = [obj.rid]
+        else:
+            rids = obj.rid
+        return {
+            rid: state
+            for rid in rids
+            if (state := self.rid_to_state.get(rid)) is not None
+        }
+
+    def _abort_live_request(self, rid: str, state: ReqState) -> bool:
+        """Abort one still-current request state exactly once."""
+        if self.rid_to_state.get(rid) is not state or state.abort_dispatched:
+            return False
+        state.detached = True
+        state.out_list.clear()
+        self.abort_request(rid, exact_match=True)
+        state.abort_dispatched = True
+        return True
+
+    def _cancel_or_discard_req_states(
+        self, request_states: dict[str, ReqState]
+    ) -> None:
+        """Clean up a failed request according to its dispatch state."""
+        for rid, state in request_states.items():
+            if self.rid_to_state.get(rid) is not state:
+                continue
+            if not state.dispatched:
+                del self.rid_to_state[rid]
+                continue
+            try:
+                self._abort_live_request(rid, state)
+            except Exception:
+                # Preserve the terminal record so the delayed response cleanup or
+                # graceful shutdown can retry instead of losing a live request.
+                logger.exception("Failed to dispatch cancellation for rid=%s", rid)
 
     def _discard_pending_req_states(self, obj):
         """Drop rid_to_state entries created by _init_req_state for *obj*.

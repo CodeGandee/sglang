@@ -417,7 +417,9 @@ class DllmManager:
         self.waiting_queue = [req for req in self.waiting_queue if not req.finished()]
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
-    def pop_aborted_reqs(self, abort_all: bool, rid: str) -> List[Req]:
+    def pop_aborted_reqs(
+        self, abort_all: bool, rid: str, exact_match: bool = False
+    ) -> List[Req]:
         aborted_reqs: List[Req] = []
         seen: Set[int] = set()
 
@@ -425,7 +427,9 @@ class DllmManager:
             queue = getattr(self, queue_name)
             kept_queue = []
             for req in queue:
-                if abort_all or req.rid.startswith(rid):
+                if abort_all or (
+                    req.rid == rid if exact_match else req.rid.startswith(rid)
+                ):
                     req_id = id(req)
                     if req_id not in seen:
                         aborted_reqs.append(req)

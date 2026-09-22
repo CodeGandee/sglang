@@ -3175,7 +3175,12 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_parallel().pp_max_micro_batch_size - running_bs
+        active_reqs = running_bs
+        if self.enable_hisparse:
+            # Prefill staging owns an admitted native request even though that
+            # request is temporarily absent from the running decode batch.
+            active_reqs += len(self.hisparse_coordinator.staging_requests)
+        res = get_parallel().pp_max_micro_batch_size - active_reqs
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -4148,6 +4153,11 @@ class Scheduler(
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
 
+        # HiSparse prefill staging owns an active logical model request. Health
+        # generation must piggyback instead of admitting a second request.
+        if self.enable_hisparse:
+            idle &= not self.hisparse_coordinator.has_ongoing_staging()
+
         if (
             for_health_check
             and not self._engine_paused
@@ -4170,10 +4180,6 @@ class Scheduler(
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
-
-            # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
-                idle &= not self.hisparse_coordinator.has_ongoing_staging()
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -4495,14 +4501,28 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+            if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
-        # todo hisparse, release resources for abort requests in hisparse coordinator
+        # A request in HiSparse prefill staging is absent from the ordinary
+        # running batch. Retire its transfer and coordinator-owned storage
+        # before returning the native slot and notifying the frontend.
+        aborted_staged_req_ids: set[int] = set()
+        if self.enable_hisparse:
+            for req in self.hisparse_coordinator.staging_requests:
+                if not recv_req.matches(req.rid):
+                    continue
+                self.hisparse_coordinator.retract_req(req)
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
+                aborted_staged_req_ids.add(id(req))
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req.rid):
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -4511,6 +4531,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if id(req) in aborted_staged_req_ids:
+                continue
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4542,7 +4564,9 @@ class Scheduler(
 
         if self.dllm_config is not None:
             for req in self.dllm_manager.pop_aborted_reqs(
-                recv_req.abort_all, recv_req.rid
+                recv_req.abort_all,
+                recv_req.rid,
+                recv_req.exact_match,
             ):
                 if self.enable_hicache_storage:
                     self.tree_cache.release_aborted_request(req.rid)
@@ -4566,7 +4590,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
             for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.matches(req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if self.enable_hicache_storage:
                         self.tree_cache.release_aborted_request(req.rid)
@@ -4578,7 +4602,7 @@ class Scheduler(
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.matches(req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
@@ -4586,7 +4610,7 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
                     if self.ps.pp_size > 1:
@@ -4594,7 +4618,7 @@ class Scheduler(
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     receiver = decode_req.kv_receiver
                     receiver.abort()
@@ -4616,7 +4640,7 @@ class Scheduler(
             if self.disagg_decode_prealloc_queue.retracted_queue:
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                    if recv_req.matches(decode_req.rid):
                         retraction_discard(
                             decode_req,
                             self.tree_cache,
@@ -4637,9 +4661,9 @@ class Scheduler(
 
         inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
         for req in inflight_reqs:
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
+            if id(req) in aborted_staged_req_ids:
+                continue
+            if not req.finished() and recv_req.matches(req.rid):
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.

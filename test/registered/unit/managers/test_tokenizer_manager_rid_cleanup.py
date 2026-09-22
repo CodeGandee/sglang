@@ -14,7 +14,8 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
 
@@ -27,6 +28,8 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
+    msgpack_decode,
+    msgpack_encode,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -268,6 +271,31 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
 
+    def test_abort_preserves_cumulative_stream_output_ids(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "abort_cumulative_stream"
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        state.output_ids = [11, 12, 13]
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertEqual(state.out_list[0]["output_ids"], [11, 12, 13])
+
+    def test_abort_keeps_incremental_stream_terminal_delta(self):
+        tm = _make_tokenizer_manager(self)
+        tm.incremental_streaming_output = True
+        rid = "abort_incremental_stream"
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        state.output_ids = [11, 12, 13]
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertEqual(state.out_list[0]["output_ids"], [13])
+
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""
@@ -448,6 +476,9 @@ def _make_generate_obj(rid, is_single):
     obj.external_trace_header = None
     obj.bootstrap_room = None
     obj.max_thinking_tokens = None
+    obj.return_logprob = False
+    obj.lora_path = None
+    obj.log_metrics = False
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
@@ -611,6 +642,130 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
             asyncio.run(drive())
 
         self.assertFalse(tm.rid_to_state)
+
+
+class TestGenerateRequestCleanupAfterDispatch(CustomTestCase):
+    """A closed response generator must abort before releasing its identity."""
+
+    def test_stream_close_dispatches_exact_abort_and_retains_terminal_state(self):
+        tm = _make_tm_for_generate(self)
+        tm._dispatch_to_scheduler = Mock()
+        rid = "closed-stream"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.stream = True
+        obj.return_prompt_token_ids = False
+        tokenized_obj = SimpleNamespace(
+            input_ids=[1],
+            mm_inputs=None,
+            rid=rid,
+            time_stats=APIServerReqTimeStats(),
+            wrap_pickle_fields=Mock(),
+        )
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized_obj)
+        tm.cuda_vmm_feature_transport = MagicMock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch.return_value = []
+
+        async def drive():
+            generator = tm.generate_request(obj)
+            next_response = asyncio.create_task(generator.__anext__())
+            while rid not in tm.rid_to_state:
+                await asyncio.sleep(0)
+            state = tm.rid_to_state[rid]
+            state.out_list.append(
+                {
+                    "text": "x",
+                    "output_ids": [1],
+                    "meta_info": {"id": rid, "finish_reason": None},
+                }
+            )
+            state.event.set()
+            await next_response
+            await generator.aclose()
+            return state
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+            side_effect=lambda value: value,
+        ):
+            state = asyncio.run(drive())
+
+        self.assertIs(tm.rid_to_state[rid], state)
+        self.assertTrue(state.detached)
+        self.assertEqual(state.out_list, [])
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 2)
+        abort = tm._dispatch_to_scheduler.call_args_list[-1].args[0]
+        self.assertIsInstance(abort, AbortReq)
+        self.assertEqual(abort.rid, rid)
+        self.assertTrue(abort.exact_match)
+
+        tm._handle_abort_req(AbortReq(rid=rid))
+        self.assertNotIn(rid, tm.rid_to_state)
+        self.assertEqual(state.out_list, [])
+        self.assertFalse(state.event.is_set())
+
+    def test_delayed_abort_is_idempotent_and_does_not_target_reused_id(self):
+        tm = _make_tm_for_generate(self)
+        tm._dispatch_to_scheduler = Mock()
+        rid = "reused-stream-id"
+        old_obj = _make_generate_obj(rid, is_single=True)
+        old_state = _make_req_state(rid)
+        old_state.obj = old_obj
+        old_state.dispatched = True
+        tm.rid_to_state[rid] = old_state
+        background = tm.create_abort_task(old_obj)
+
+        async def run_background():
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+                new=AsyncMock(),
+            ):
+                await background()
+
+        asyncio.run(run_background())
+        asyncio.run(run_background())
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 1)
+
+        del tm.rid_to_state[rid]
+        new_obj = _make_generate_obj(rid, is_single=True)
+        new_state = _make_req_state(rid)
+        new_state.obj = new_obj
+        new_state.dispatched = True
+        tm.rid_to_state[rid] = new_state
+
+        asyncio.run(run_background())
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 1)
+        self.assertFalse(new_state.abort_dispatched)
+
+    def test_public_prefix_abort_retains_default_matching(self):
+        tm = _make_tm_for_generate(self)
+        tm._dispatch_to_scheduler = Mock()
+        tm.rid_to_state["request"] = _make_req_state("request")
+        tm.rid_to_state["request-child"] = _make_req_state("request-child")
+        tm.rid_to_state["unrelated"] = _make_req_state("unrelated")
+
+        tm.abort_request("request")
+
+        abort = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertFalse(abort.exact_match)
+        self.assertTrue(abort.matches("request"))
+        self.assertTrue(abort.matches("request-child"))
+        self.assertFalse(abort.matches("unrelated"))
+
+    def test_exact_abort_does_not_match_prefix_related_id(self):
+        abort = AbortReq(rid="request", exact_match=True)
+
+        self.assertTrue(abort.matches("request"))
+        self.assertFalse(abort.matches("request-child"))
+
+    def test_exact_abort_survives_native_ipc_round_trip(self):
+        abort = AbortReq(rid="request", exact_match=True)
+
+        decoded = msgpack_decode(msgpack_encode(abort))
+
+        self.assertIsInstance(decoded, AbortReq)
+        self.assertTrue(decoded.exact_match)
+        self.assertTrue(decoded.matches("request"))
+        self.assertFalse(decoded.matches("request-child"))
 
 
 if __name__ == "__main__":
