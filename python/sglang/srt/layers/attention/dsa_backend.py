@@ -258,6 +258,21 @@ class DSADecodeMetadataBank:
     The backend's normal graph state remains independent of this handle. A caller
     keeps the handle alive with its captured graph and activates it around the
     corresponding real or hint model body.
+
+    Parameters
+    ----------
+    owner : DeepseekSparseAttnBackend
+        Backend that allocated and may activate this bank.
+    graph_state : dict[str | int, object]
+        Native fixed-size graph tensors and the B1 metadata entry.
+    drop_wide_page_table : bool
+        Native page-table layout selected when the bank was allocated.
+    metadata : DSAMetadata
+        Writable B1 attention metadata retained by the captured lane.
+    use_mha : bool
+        Decode attention dispatch state selected during preparation.
+    dsa_prefill_impl : _DSA_IMPL_T
+        Native implementation state restored whenever the bank is activated.
     """
 
     owner: DeepseekSparseAttnBackend
