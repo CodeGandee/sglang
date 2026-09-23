@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -13,7 +15,6 @@ from typing import (
 )
 
 import torch
-
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel, get_spec
 
@@ -248,6 +249,33 @@ class DSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True, eq=False)
+class DSADecodeMetadataBank:
+    """One fixed B1 decode graph metadata allocation owned by a DSA backend.
+
+    The backend's normal graph state remains independent of this handle. A caller
+    keeps the handle alive with its captured graph and activates it around the
+    corresponding real or hint model body.
+    """
+
+    owner: DeepseekSparseAttnBackend
+    graph_state: dict[str | int, object]
+    drop_wide_page_table: bool
+    metadata: DSAMetadata
+    use_mha: bool
+    dsa_prefill_impl: _DSA_IMPL_T
+
+
+_MISSING_GRAPH_VIEW = object()
+_GRAPH_VIEW_FIELDS = (
+    "decode_cuda_graph_metadata",
+    "dsa_drop_wide_page_table",
+    "forward_metadata",
+    "use_mha",
+    "dsa_prefill_impl",
+)
 
 
 @torch.compile
@@ -1236,6 +1264,145 @@ class DeepseekSparseAttnBackend(
                 else None
             ),
         }
+
+    @contextmanager
+    def _preserve_decode_metadata_view(
+        self, bank: DSADecodeMetadataBank | None = None
+    ) -> Iterator[None]:
+        saved = {
+            name: getattr(self, name, _MISSING_GRAPH_VIEW)
+            for name in _GRAPH_VIEW_FIELDS
+        }
+        try:
+            if bank is not None:
+                if bank.owner is not self:
+                    raise ValueError(
+                        "DSA decode metadata bank belongs to another backend"
+                    )
+                self.decode_cuda_graph_metadata = bank.graph_state
+                self.dsa_drop_wide_page_table = bank.drop_wide_page_table
+                self.forward_metadata = bank.metadata
+                self.use_mha = bank.use_mha
+                self.dsa_prefill_impl = bank.dsa_prefill_impl
+            yield
+        finally:
+            for name, value in saved.items():
+                if value is _MISSING_GRAPH_VIEW:
+                    if hasattr(self, name):
+                        delattr(self, name)
+                else:
+                    setattr(self, name, value)
+
+    def _require_b1_decode_metadata_batch(self, forward_batch: ForwardBatch) -> None:
+        if (
+            forward_batch.forward_mode != ForwardMode.DECODE
+            or forward_batch.batch_size != 1
+            or forward_batch.spec_info is not None
+            or getattr(forward_batch, "can_run_tbo", False)
+            or getattr(forward_batch, "attn_cp_metadata", None) is not None
+            or getattr(forward_batch, "global_num_tokens_cpu", None) is not None
+            or forward_batch.seq_lens.shape != (1,)
+            or forward_batch.req_pool_indices.shape != (1,)
+        ):
+            raise ValueError("DSA metadata bank requires an unpadded B1 DECODE batch")
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if (
+            seq_lens_cpu is None
+            or seq_lens_cpu.shape != (1,)
+            or seq_lens_cpu.device.type != "cpu"
+        ):
+            raise ValueError("DSA metadata bank requires a B1 CPU sequence length")
+        seq_len = int(seq_lens_cpu[0])
+        if seq_len < 1 or seq_len > self.req_to_token.shape[1]:
+            raise ValueError("DSA metadata bank sequence exceeds request mapping")
+
+    def prepare_decode_metadata_bank(
+        self, forward_batch: ForwardBatch
+    ) -> DSADecodeMetadataBank:
+        """Allocate capture metadata for one B1 decode lane.
+
+        The caller owns stable batch inputs and keeps the returned bank alive
+        until its graph is destroyed. The ordinary backend graph view is restored
+        after preparation, including when native metadata construction fails.
+
+        Parameters
+        ----------
+        forward_batch : ForwardBatch
+            Persistent B1 decode inputs for this lane's graph capture.
+
+        Returns
+        -------
+        DSADecodeMetadataBank
+            Independent native graph state and metadata for the lane.
+        """
+        self._require_b1_decode_metadata_batch(forward_batch)
+        with self._preserve_decode_metadata_view():
+            self.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
+            graph_state = self.decode_cuda_graph_metadata
+            drop_wide_page_table = self.dsa_drop_wide_page_table
+            self.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            metadata = self.forward_metadata
+            if graph_state.get(1) is not metadata:
+                raise RuntimeError("DSA capture metadata did not bind the B1 bank")
+            return DSADecodeMetadataBank(
+                owner=self,
+                graph_state=graph_state,
+                drop_wide_page_table=drop_wide_page_table,
+                metadata=metadata,
+                use_mha=self.use_mha,
+                dsa_prefill_impl=self.dsa_prefill_impl,
+            )
+
+    def refresh_decode_metadata_bank(
+        self, bank: DSADecodeMetadataBank, forward_batch: ForwardBatch
+    ) -> DSAMetadata:
+        """Refresh a prepared lane bank using the native graph replay planner.
+
+        Parameters
+        ----------
+        bank : DSADecodeMetadataBank
+            The lane's bank created by this backend.
+        forward_batch : ForwardBatch
+            Current B1 decode values, bounded by the native request mapping.
+
+        Returns
+        -------
+        DSAMetadata
+            The same metadata object retained by the captured graph.
+        """
+        self._require_b1_decode_metadata_batch(forward_batch)
+        with self.activate_decode_metadata_bank(bank):
+            self.init_forward_metadata_out_graph(forward_batch, in_capture=False)
+            if (
+                self.decode_cuda_graph_metadata is not bank.graph_state
+                or self.dsa_drop_wide_page_table != bank.drop_wide_page_table
+                or self.forward_metadata is not bank.metadata
+                or bank.graph_state.get(1) is not bank.metadata
+            ):
+                raise RuntimeError("DSA replay replaced captured bank metadata")
+            return bank.metadata
+
+    @contextmanager
+    def activate_decode_metadata_bank(
+        self, bank: DSADecodeMetadataBank
+    ) -> Iterator[DSAMetadata]:
+        """Select a prepared lane during its captured model body.
+
+        Parameters
+        ----------
+        bank : DSADecodeMetadataBank
+            The lane's bank created by this backend.
+
+        Yields
+        ------
+        DSAMetadata
+            Active metadata for the lane. The previous backend view is restored
+            when the context exits, including on model-body failure.
+        """
+        if bank.graph_state.get(1) is not bank.metadata:
+            raise RuntimeError("DSA decode metadata bank lost its B1 metadata")
+        with self._preserve_decode_metadata_view(bank):
+            yield bank.metadata
 
     def _build_forward_metadata_cuda_graph(
         self,
