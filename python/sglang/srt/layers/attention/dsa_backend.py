@@ -436,10 +436,15 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
-        self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
+        self.use_fused_topk = should_use_dsa_fused_topk(
+            seed_dsa_topk_from_draft_extend, self.dsa_topk_backend
+        )
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
-                "Disabling fused DSA top-k for IndexShare under PD disaggregation."
+                f"Disabling fused DSA top-k: backend {self.dsa_topk_backend.value!r} "
+                "does not support fused transforms."
+                if not self.dsa_topk_backend.supports_fused_transform()
+                else "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
 
         self.device_capability = torch.cuda.get_device_capability()
@@ -762,10 +767,7 @@ class DeepseekSparseAttnBackend(
         metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
-        if (
-            self.dsa_topk_backend.is_sgl_kernel()
-            or self.dsa_topk_backend.is_flashinfer()
-        ):
+        if self.dsa_topk_backend.supports_fused_transform():
             return topk_indices
         raise RuntimeError(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."

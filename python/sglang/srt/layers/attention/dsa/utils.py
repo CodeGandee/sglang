@@ -5,6 +5,7 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -14,6 +15,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     process_model_config,
@@ -76,18 +78,32 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
 
 
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:
-    """Whether a PD seed should enter the allocator-local fused TopK domain."""
+    """Return whether a PD seed enters the allocator-local fused TopK domain.
+
+    Returns
+    -------
+    bool
+        Whether the configured backend and PD consumer use fused transforms.
+    """
     return (
         is_cuda()
         and envs.SGLANG_DSA_FUSE_TOPK.get()
+        and DSATopKBackend(
+            get_exec().kernel.dsa_topk_backend
+        ).supports_fused_transform()
         and get_disagg().disaggregation_mode == "decode"
         and not get_memory().enable_hisparse
         and not get_parallel().dcp_enabled
     )
 
 
-def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
-    """Select fused TopK for PD IndexShare.
+def should_use_dsa_fused_topk(
+    seed_dsa_topk_from_draft_extend: bool,
+    topk_backend: DSATopKBackend | None = None,
+) -> bool:
+    """Select supported fused TopK while preserving the PD IndexShare domain.
+
+    For backends supporting fused transforms with fusion requested:
 
     PD Prefill worker:
     - Target prefill: fused TopK enabled.
@@ -95,13 +111,29 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
     PD Decode worker:
     - Draft decode / target verify / draft extend: fused TopK enabled.
+
+    Parameters
+    ----------
+    seed_dsa_topk_from_draft_extend : bool
+        Whether this runner consumes an IndexShare seed from draft extend.
+    topk_backend : DSATopKBackend or None
+        Selected runner backend, or the configured backend when omitted.
+
+    Returns
+    -------
+    bool
+        Whether this runner produces and consumes already transformed indices.
     """
+    if not envs.SGLANG_DSA_FUSE_TOPK.get():
+        return False
+    if topk_backend is None:
+        topk_backend = DSATopKBackend(get_exec().kernel.dsa_topk_backend)
+    if not topk_backend.supports_fused_transform():
+        return False
     pd_index_share_seed = (
         get_disagg().disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )
-    return envs.SGLANG_DSA_FUSE_TOPK.get() and (
-        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots()
-    )
+    return not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots()
 
 
 def is_dsa_enable_prefill_cp():

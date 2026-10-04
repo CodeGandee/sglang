@@ -1820,7 +1820,7 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend uses unfused top-k selection and index transforms.",
             choices=DSA_TOPK_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),

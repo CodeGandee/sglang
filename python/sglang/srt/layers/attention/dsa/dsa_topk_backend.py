@@ -34,6 +34,17 @@ class DSATopKBackend(Enum):
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
 
+    def supports_fused_transform(self) -> bool:
+        """Return whether this backend can produce transformed attention indices.
+
+        Returns
+        -------
+        bool
+            Whether selection can also map request-local indices to the paged
+            or ragged attention domain.
+        """
+        return self.is_sgl_kernel() or self.is_flashinfer()
+
     def should_use_topk_v2(self) -> bool:
         return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
 
