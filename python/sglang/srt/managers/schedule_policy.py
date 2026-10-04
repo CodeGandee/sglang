@@ -31,7 +31,7 @@ import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -527,6 +527,8 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        future_requests: Optional[Tuple[Req, ...]] = None,
+        continuing_request: Optional[Req] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -559,7 +561,17 @@ class PrefillAdder:
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
 
-        if running_batch is not None:
+        self._future_requests = future_requests
+        self._reserved_future_ids = set()
+        if future_requests is not None:
+            for req in future_requests:
+                if req is continuing_request or id(req) in self._reserved_future_ids:
+                    continue
+                self._reserved_future_ids.add(id(req))
+                self.rem_total_token_offset += (
+                    self._get_running_request_total_token_offset(req)
+                )
+        elif running_batch is not None:
             # Estimate the offset in the remaining token space
             self.rem_total_token_offset += sum(
                 [
@@ -603,9 +615,7 @@ class PrefillAdder:
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
         if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
-                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
-            )
+            self.rem_mamba_slots = self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
 
@@ -1049,6 +1059,19 @@ class PrefillAdder:
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
+        # Final continuation already charged its output reservation above.
+        # A truncated continuation owns live KV across subsequent microbatches
+        # and must retain its future claim before other waiting admission.
+        if (
+            truncated
+            and getattr(self, "_future_requests", None) is not None
+            and id(req) not in self._reserved_future_ids
+        ):
+            self.rem_total_token_offset += self._get_running_request_total_token_offset(
+                req
+            )
+            self._reserved_future_ids.add(id(req))
+
         # Return if chunked prefill not finished
         return req if truncated else None
 
@@ -1347,9 +1370,9 @@ class PrefillAdder:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
+                assert truncation_align_size is None, (
+                    "truncation_align_size is not supported for dllm prefill"
+                )
 
                 if (
                     tile_stop := self._check_prefill_tile_budget(input_tokens)

@@ -108,6 +108,21 @@ class SchedulerPPMixin:
                             recv_reqs,
                             async_send=True,
                         )
+                early_output_result = None
+                growth_controller = getattr(self, "hisparse_growth_controller", None)
+                if growth_controller is not None:
+                    if get_parallel().pp_async_batch_depth != 0:
+                        raise RuntimeError(
+                            "live HiSparse growth requires PP async depth zero"
+                        )
+                    # PP0 must drain the previous native output before entering
+                    # blocking CPU control frames. Otherwise the last stage may
+                    # still be waiting for PP0's previous output receive.
+                    if self.ps.pp_rank == 0:
+                        early_output_result = self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id, next_mb_id
+                        )
+                    growth_controller.tick(self, mb_id)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -140,12 +155,17 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
                 if get_parallel().pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
+                    if early_output_result is not None:
+                        next_pp_outputs, next_batch_result, d2h_event = (
+                            early_output_result
                         )
-                    )
+                    else:
+                        next_pp_outputs, next_batch_result, d2h_event = (
+                            self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                                next_first_rank_mb_id,
+                                next_mb_id,
+                            )
+                        )
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
@@ -173,6 +193,30 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.on_idle()
+
+    def _pp_future_output_requests(
+        self: Scheduler, running_batch: Optional[ScheduleBatch] = None
+    ) -> Tuple[Req, ...]:
+        """Return every allocated unfinished request once across local PP state."""
+        batches = [
+            running_batch,
+            self.running_batch,
+            *getattr(self, "running_mbs", ()),
+            *getattr(self, "mbs", ()),
+            getattr(self, "cur_batch_for_debug", None),
+        ]
+        candidates = [
+            req for batch in batches if batch is not None for req in batch.reqs
+        ]
+        coordinator = getattr(self, "hisparse_coordinator", None)
+        candidates.extend(getattr(coordinator, "staging_requests", ()))
+        if self.chunked_req is not None:
+            candidates.append(self.chunked_req)
+        unique = {}
+        for req in candidates:
+            if not req.finished() and req.kv.kv_allocated_len > 0:
+                unique[id(req)] = req
+        return tuple(unique.values())
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):

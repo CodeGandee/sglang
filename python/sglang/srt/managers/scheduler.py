@@ -3301,6 +3301,12 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            future_requests=(
+                self._pp_future_output_requests(running_batch)
+                if self.ps.pp_size > 1
+                else None
+            ),
+            continuing_request=self.chunked_req,
         )
 
         if self.chunked_req is not None:

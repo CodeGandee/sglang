@@ -28,7 +28,10 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    PreparedPageGrowth,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
@@ -146,12 +149,31 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 pass
         self.clear()
 
+    def grow(self, new_size: int) -> None:
+        """Publish additional backed pages while preserving live allocations.
+
+        Parameters
+        ----------
+        new_size : int
+            Monotonic page-aligned backed capacity, excluding the padded page.
+        """
+        self.commit_grow(self.prepare_grow(new_size))
+
+    def prepare_grow(self, new_size: int) -> PreparedPageGrowth:
+        """Allocate additive free-page metadata before distributed readiness voting."""
+        return self._prepare_free_page_growth(new_size)
+
+    def commit_grow(self, prepared: PreparedPageGrowth) -> None:
+        """Publish an agreed preallocated page list without device allocation."""
+        self._publish_prepared_page_growth(prepared)
+        self.num_pages = prepared.new_size // self.page_size
+
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:
-            assert (
-                need_size % self.page_size == 0
-            ), "The allocation size should be page-aligned"
+            assert need_size % self.page_size == 0, (
+                "The allocation size should be page-aligned"
+            )
 
         num_pages = need_size // self.page_size
         if self.need_sort and num_pages > len(self.free_pages):

@@ -119,6 +119,50 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
 
+    def test_other_microbatch_future_claim_prevents_shared_pool_overbooking(self):
+        self.mock_token_allocator.available_size.return_value = 100
+        running = self.create_running_batch()
+        other = self.create_mock_req("other-mb", 0, 80, output_len=20)
+        native = self.create_adder(running)
+        guarded = self.create_adder(running, future_requests=(other, other))
+        self.assertEqual(guarded.rem_total_token_offset, 60)
+        self.assertEqual(guarded.rem_total_tokens, 40)
+        candidate = self._create_delayer_req(50)
+        self.assertEqual(
+            native.add_one_req(
+                candidate, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(
+            guarded.add_one_req(
+                self._create_delayer_req(50),
+                has_chunked_req=False,
+                truncation_align_size=None,
+            ),
+            AddReqResult.NO_TOKEN,
+        )
+        self.assertEqual(guarded.can_run_list, [])
+
+    def test_current_continuation_future_is_reserved_exactly_once(self):
+        self.mock_token_allocator.available_size.return_value = 1000
+        other = self.create_mock_req("other", 0, 20)
+        for length, truncated in ((200, True), (40, False)):
+            with self.subTest(truncated=truncated):
+                req = self._create_delayer_req(length)
+                adder = self.create_adder(
+                    self.create_running_batch([req]),
+                    future_requests=(req, other, req),
+                    continuing_request=req,
+                    rem_chunk_tokens=50,
+                )
+                self.assertEqual(adder.rem_total_token_offset, 20)
+                result = adder.add_chunked_req(req)
+                self.assertEqual(result is req, truncated)
+                self.assertEqual(
+                    adder.rem_total_token_offset, 20 + min(length, 50) + 8 + 1
+                )
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),

@@ -16,12 +16,35 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+@dataclass(frozen=True)
+class PreparedPageGrowth:
+    """Preallocated additive page publication for one serialized allocator.
+
+    Attributes
+    ----------
+    old_size, new_size : int
+        Capacity transition excluding the padded page.
+    previous_free, previous_release : torch.Tensor
+        Exact free-list identities used to refuse a stale prepared transition.
+    free_pages : torch.Tensor
+        Already allocated final page list; commit performs no device allocation.
+    """
+
+    old_size: int
+    new_size: int
+    previous_free: torch.Tensor
+    previous_release: torch.Tensor
+    free_pages: torch.Tensor
+    revision: int
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -46,6 +69,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._growth_revision = 0
 
     @property
     def size_full(self):
@@ -111,6 +135,64 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.page_size > 1:
             self.num_pages = config.max_total_num_tokens // self.page_size
         self.clear()
+
+    def _prepare_free_page_growth(self, new_size: int) -> PreparedPageGrowth:
+        """Append newly backed pages without resetting live allocation state.
+
+        Parameters
+        ----------
+        new_size : int
+            Page-aligned capacity whose physical backing the caller has prepared.
+
+        Notes
+        -----
+        Concrete simple allocators opt into this operation. Hybrid/logical
+        allocators must coordinate their own dependent buffers before publishing.
+        The scheduler must serialize this operation with allocation and freeing.
+        """
+        if new_size < self.size or new_size % self.page_size:
+            raise ValueError("growth requires monotonic page-aligned capacity")
+        if new_size == self.size:
+            return PreparedPageGrowth(
+                self.size,
+                new_size,
+                self.free_pages,
+                self.release_pages,
+                self.free_pages,
+                self._growth_revision,
+            )
+        old_pages = self.size // self.page_size
+        new_pages = new_size // self.page_size
+        added = torch.arange(
+            old_pages + 1,
+            new_pages + 1,
+            dtype=self.free_pages.dtype,
+            device=self.device,
+        )
+        # Allocate before publishing either the new size or page list. Deferred
+        # frees, active free groups and every live page retain their identities.
+        free_pages = torch.cat((self.free_pages, added))
+        return PreparedPageGrowth(
+            self.size,
+            new_size,
+            self.free_pages,
+            self.release_pages,
+            free_pages,
+            self._growth_revision,
+        )
+
+    def _publish_prepared_page_growth(self, prepared: PreparedPageGrowth) -> None:
+        """Publish preallocated free pages after all participants agree ready."""
+        if (
+            prepared.old_size != self.size
+            or prepared.previous_free is not self.free_pages
+            or prepared.previous_release is not self.release_pages
+            or prepared.revision != self._growth_revision
+        ):
+            raise ValueError("prepared allocator growth is stale")
+        self.free_pages = prepared.free_pages
+        self.size = prepared.new_size
+        self._growth_revision += 1
 
     @abc.abstractmethod
     def clear(self):

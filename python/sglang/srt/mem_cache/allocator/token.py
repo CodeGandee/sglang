@@ -19,7 +19,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    PreparedPageGrowth,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -38,6 +41,24 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
         self.clear()
+
+    def grow(self, new_size: int) -> None:
+        """Publish additional backed slots without changing existing ownership.
+
+        Parameters
+        ----------
+        new_size : int
+            Monotonic capacity whose physical backing the caller has prepared.
+        """
+        self.commit_grow(self.prepare_grow(new_size))
+
+    def prepare_grow(self, new_size: int) -> PreparedPageGrowth:
+        """Allocate additive slot metadata before distributed readiness voting."""
+        return self._prepare_free_page_growth(new_size)
+
+    def commit_grow(self, prepared: PreparedPageGrowth) -> None:
+        """Publish an agreed preallocated slot list without device allocation."""
+        self._publish_prepared_page_growth(prepared)
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.

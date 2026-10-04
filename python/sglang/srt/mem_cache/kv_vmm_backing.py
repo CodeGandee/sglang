@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING, List, Optional, Sequence
 
@@ -48,11 +49,16 @@ class KvVmmArena:
             self._range_backed = 0
             self._closed = False
 
-        self._stub = BumpArenaStub()
-        self._stub.set_extents([(self.base, self.reserved)])
-        self._stub.set_align(self.granularity)
-        # no_split so the caching allocator hands our bump pointers back verbatim.
-        self.pool = torch.cuda.MemPool(self._stub.allocator, no_split=True)
+        try:
+            self._stub = BumpArenaStub()
+            self._stub.set_extents([(self.base, self.reserved)])
+            self._stub.set_align(self.granularity)
+            # no_split so the caching allocator returns bump pointers verbatim.
+            self.pool = torch.cuda.MemPool(self._stub.allocator, no_split=True)
+        except BaseException:
+            self._allocation.close()
+            self._closed = True
+            raise
         logger.info(
             "KvVmmArena[%s] ready: device=%d reserved_va=%.1f GiB "
             "granularity=%d KiB handle_type=%s",
@@ -109,17 +115,40 @@ class KvVmmArena:
         if self._closed:
             return
         self._closed = True
-        try:
-            torch.cuda.synchronize()
-        except Exception as e:  # pragma: no cover
-            logger.warning("KvVmmArena.close synchronize failed: %s", e)
-        self._allocation.close()
+        with torch.cuda.device(self.device_id):
+            try:
+                torch.cuda.synchronize(self.device_id)
+            except Exception as e:  # pragma: no cover
+                logger.warning("KvVmmArena.close synchronize failed: %s", e)
+            self._allocation.close()
 
 
 # torch's caching allocator hands the pluggable allocator whole large-pool segments
 # (rounded up to >= ~20 MiB) per tensor, so reserve slack beyond the tight tensor sum.
 # VA is free until committed, so this costs only address space, not GPU memory.
 _PER_BUFFER_VA_SLACK = 32 << 20
+
+
+@dataclass(frozen=True)
+class KvVmmBufferState:
+    """Exact physical and usable accounting for one reserved buffer.
+
+    Attributes
+    ----------
+    name : str
+        Descriptor identity.
+    reserved_bytes : int
+        Granularity-rounded virtual tensor span.
+    committed_bytes : int
+        Physically mapped bytes, including incomplete multi-buffer growth.
+    usable_bytes : int
+        Rounded span for the last wholly successful capacity publication.
+    """
+
+    name: str
+    reserved_bytes: int
+    committed_bytes: int
+    usable_bytes: int
 
 
 class _BufferSpec:
@@ -164,57 +193,78 @@ class KvVmmBufferOwner:
         self.page_size = int(page_size)
         self._reserved_num_tokens = int(reserved_num_tokens)
         self._final_num_tokens: Optional[int] = None
+        self._usable_num_tokens = 0
         self._arena: Optional[KvVmmArena] = None
         self._specs: List[_BufferSpec] = []
         self.tensors: List[torch.Tensor] = []
-
-        itemsize = store_dtype.itemsize
-        with torch.cuda.device(self.device_id):
-            gran = get_device_granularity(self.device_id)
-            reserved_spans = [d.reserved_span_bytes(itemsize) for d in buffer_descs]
-            aligned = [align_up(s, gran) for s in reserved_spans]
-            reserve_bytes = sum(a + _PER_BUFFER_VA_SLACK for a in aligned) + gran
-            self._arena = KvVmmArena(self.device_id, reserve_bytes=reserve_bytes)
-
-            # NORMAL torch tensors through the arena MemPool; torch.empty never touches
-            # the unbacked tail.
-            with torch.cuda.use_mem_pool(self._arena.pool):
-                self.tensors = [
-                    torch.empty(d.shape, dtype=store_dtype, device=self.device)
-                    for d in buffer_descs
-                ]
-
-            specs: List[_BufferSpec] = []
-            for desc, tensor, reserved_span, aligned_reserved in zip(
-                buffer_descs, self.tensors, reserved_spans, aligned
+        if (
+            self.page_size <= 0
+            or self._reserved_num_tokens < self.page_size
+            or not buffer_descs
+            or len({desc.name for desc in buffer_descs}) != len(buffer_descs)
+        ):
+            raise ValueError("VMM owner needs positive capacity and unique buffers")
+        for desc in buffer_descs:
+            if desc.final_span_bytes(self._reserved_num_tokens, self.page_size) > (
+                desc.reserved_span_bytes(store_dtype.itemsize)
             ):
-                if prod(tensor.shape) * itemsize != reserved_span:
-                    raise RuntimeError(
-                        f"buffer {desc.name!r} tensor bytes "
-                        f"{prod(tensor.shape) * itemsize} != reserved span {reserved_span}"
-                    )
-                offset = tensor.data_ptr() - self._arena.base
-                if offset < 0 or offset % gran != 0:
-                    raise RuntimeError(
-                        f"buffer {desc.name!r} arena offset {offset} not "
-                        f"granularity-aligned ({gran})"
-                    )
-                if offset + aligned_reserved > self._arena.reserved:
-                    raise RuntimeError(
-                        f"buffer {desc.name!r} [{offset}, {offset + aligned_reserved}) "
-                        f"exceeds reservation {self._arena.reserved}"
-                    )
-                specs.append(_BufferSpec(desc, offset, reserved_span, aligned_reserved))
-            self._specs = specs
+                raise ValueError(
+                    f"buffer {desc.name!r} does not cover the final sink page"
+                )
 
-            # Back one page so slot 0 is resident before capture: capture routes every
-            # dummy KV write to slot 0 (out_cache_loc is zeros). finalize() backs the rest.
-            self.ensure_prefix(self.page_size)
+        try:
+            itemsize = store_dtype.itemsize
+            with torch.cuda.device(self.device_id):
+                gran = get_device_granularity(self.device_id)
+                reserved_spans = [d.reserved_span_bytes(itemsize) for d in buffer_descs]
+                aligned = [align_up(s, gran) for s in reserved_spans]
+                reserve_bytes = sum(a + _PER_BUFFER_VA_SLACK for a in aligned) + gran
+                self._arena = KvVmmArena(self.device_id, reserve_bytes=reserve_bytes)
 
-        for t in self.tensors:
-            assert (
-                t.is_cuda and t.device.index == self.device_id
-            ), f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+                # NORMAL torch tensors through the arena MemPool; torch.empty never touches
+                # the unbacked tail.
+                with torch.cuda.use_mem_pool(self._arena.pool):
+                    self.tensors = [
+                        torch.empty(d.shape, dtype=store_dtype, device=self.device)
+                        for d in buffer_descs
+                    ]
+
+                specs: List[_BufferSpec] = []
+                for desc, tensor, reserved_span, aligned_reserved in zip(
+                    buffer_descs, self.tensors, reserved_spans, aligned
+                ):
+                    if prod(tensor.shape) * itemsize != reserved_span:
+                        raise RuntimeError(
+                            f"buffer {desc.name!r} tensor bytes "
+                            f"{prod(tensor.shape) * itemsize} != reserved span {reserved_span}"
+                        )
+                    offset = tensor.data_ptr() - self._arena.base
+                    if offset < 0 or offset % gran != 0:
+                        raise RuntimeError(
+                            f"buffer {desc.name!r} arena offset {offset} not "
+                            f"granularity-aligned ({gran})"
+                        )
+                    if offset + aligned_reserved > self._arena.reserved:
+                        raise RuntimeError(
+                            f"buffer {desc.name!r} [{offset}, {offset + aligned_reserved}) "
+                            f"exceeds reservation {self._arena.reserved}"
+                        )
+                    specs.append(
+                        _BufferSpec(desc, offset, reserved_span, aligned_reserved)
+                    )
+                self._specs = specs
+
+                # Back one page so slot 0 is resident before capture: capture routes every
+                # dummy KV write to slot 0 (out_cache_loc is zeros). finalize() backs the rest.
+                self.ensure_prefix(self.page_size)
+
+            for t in self.tensors:
+                assert t.is_cuda and t.device.index == self.device_id, (
+                    f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+                )
+        except BaseException:
+            self.close()
+            raise
 
     # -- backing --------------------------------------------------------------
 
@@ -234,6 +284,8 @@ class KvVmmBufferOwner:
         span is a descriptor bug: raise before committing anything, never clamp."""
         if self._arena is None:
             raise RuntimeError("backing after close / before construction")
+        if len(span_bytes) != len(self._specs):
+            raise ValueError("a backing span is required for every buffer")
         for spec, span in zip(self._specs, span_bytes):
             self._check_span(spec, span)
         gran = self._arena.granularity
@@ -263,6 +315,60 @@ class KvVmmBufferOwner:
             [s.desc.final_span_bytes(final, self.page_size) for s in self._specs]
         )
         self._final_num_tokens = final
+        self._usable_num_tokens = final
+
+    def grow_prefix(self, num_tokens: int) -> None:
+        """Map a larger serving prefix without moving tensors or publishing early.
+
+        Parameters
+        ----------
+        num_tokens : int
+            Page-aligned usable capacity, excluding the padded sink page.
+
+        Notes
+        -----
+        A failed commit can leave physical mappings in earlier buffers. Those
+        bytes remain accounted and retryable, but usable capacity is unchanged.
+        Allocation/admission publication is the caller's subsequent operation.
+        """
+        if (
+            num_tokens < self._usable_num_tokens
+            or num_tokens > self._reserved_num_tokens
+            or num_tokens < self.page_size
+            or num_tokens % self.page_size
+        ):
+            raise ValueError("growth exceeds the monotonic page-aligned ceiling")
+        self._back_spans(
+            [s.desc.final_span_bytes(num_tokens, self.page_size) for s in self._specs]
+        )
+        self._usable_num_tokens = num_tokens
+        self._final_num_tokens = num_tokens
+
+    @property
+    def usable_num_tokens(self) -> int:
+        """Capacity whose complete descriptor vector has been backed."""
+        return self._usable_num_tokens
+
+    @property
+    def buffer_states(self) -> tuple[KvVmmBufferState, ...]:
+        """Return committed and usable byte spans, including partial failures."""
+        if self._arena is None:
+            return ()
+        gran = self._arena.granularity
+        return tuple(
+            KvVmmBufferState(
+                spec.desc.name,
+                spec.aligned_reserved,
+                spec.backed_to,
+                align_up(
+                    spec.desc.final_span_bytes(self._usable_num_tokens, self.page_size),
+                    gran,
+                )
+                if self._usable_num_tokens
+                else 0,
+            )
+            for spec in self._specs
+        )
 
     # -- accessors / teardown -------------------------------------------------
 
@@ -270,9 +376,20 @@ class KvVmmBufferOwner:
     def backed_bytes(self) -> int:
         return self._arena.backed_bytes if self._arena is not None else 0
 
+    @property
+    def reserved_virtual_bytes(self) -> int:
+        """Return complete arena VA bytes, including allocator segment slack."""
+        return self._arena.reserved if self._arena is not None else 0
+
+    @property
+    def granularity_bytes(self) -> int:
+        """Return the driver's physical mapping granularity in bytes."""
+        return self._arena.granularity if self._arena is not None else 0
+
     def close(self) -> None:
         self.tensors = []
         self._specs = []
         if self._arena is not None:
             self._arena.close()
             self._arena = None
+        self._usable_num_tokens = 0

@@ -25,7 +25,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         self._kvcache = kvcache
         self._size_full = size * host_to_device_ratio
-        self._size_hisparse = size
+        # The logical/indexer/mapping ceilings remain final-size. Only main
+        # device pages begin at the explicitly backed VMM prefix.
+        self._size_hisparse = kvcache.backed_device_tokens
         self.compress_ratio = 1
         self.dtype = dtype
         self.device = device
@@ -84,6 +86,37 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def publish_device_growth(self, num_tokens: int) -> None:
+        """Publish prepared pages after the scheduler's PP/TP growth agreement.
+
+        Parameters
+        ----------
+        num_tokens : int
+            Agreed backed device-slot capacity, excluding the padded page.
+
+        Notes
+        -----
+        This does not clear mappings or resize logical/indexer/host storage.
+        It must be serialized with worker-local admission and allocation.
+        """
+        if num_tokens > self._kvcache.backed_device_tokens:
+            raise ValueError("cannot publish unbacked HiSparse device pages")
+        self.hisparse_attn_allocator.grow(num_tokens)
+        self._size_hisparse = num_tokens
+
+    def prepare_device_growth(self, num_tokens: int):
+        """Prepare page metadata after local mapping, before readiness voting."""
+        if num_tokens > self._kvcache.backed_device_tokens:
+            raise ValueError("cannot prepare unbacked HiSparse device pages")
+        return self.hisparse_attn_allocator.prepare_grow(num_tokens)
+
+    def commit_device_growth(self, prepared) -> None:
+        """Publish the agreed prepared page list without allocating new metadata."""
+        if prepared.new_size > self._kvcache.backed_device_tokens:
+            raise ValueError("cannot publish unbacked HiSparse device pages")
+        self.hisparse_attn_allocator.commit_grow(prepared)
+        self._size_hisparse = prepared.new_size
 
     def alloc(self, need_size: int):
         if self.page_size != 1:
@@ -159,9 +192,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
+            assert extra_indices is not None, (
+                "Hisparse allocation failed in alloc_device_buffer"
+            )
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
@@ -219,9 +252,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             len(logical_indices),
             num_new_pages=num_new_pages,
         )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
+        assert hisparse_indices is not None, (
+            "Hisparse allocation failed in alloc_extend"
+        )
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
 
@@ -274,7 +307,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
@@ -467,9 +499,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
+            assert extra_indices is not None, (
+                "Hisparse allocation failed in alloc_device_buffer"
+            )
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
@@ -537,9 +569,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             hisparse_last_loc,
             len(compressed_logical_indices),
         )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
+        assert hisparse_indices is not None, (
+            "Hisparse allocation failed in alloc_extend"
+        )
 
         self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
             hisparse_indices.to(torch.int64)
