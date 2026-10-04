@@ -3,7 +3,6 @@
 import unittest
 
 import test_prefill_adder as _fixture_module
-
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.test.ci.ci_register import register_cpu_ci
 

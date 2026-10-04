@@ -1448,12 +1448,19 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len,
                     trunc_len,
-                    0,
+                    (
+                        self._get_running_request_total_token_offset(req)
+                        if self._future_requests is not None
+                        and id(req) not in self._reserved_future_ids
+                        else 0
+                    ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                     host_hit_len=req.host_hit_length,
                     storage_hit_len=req.storage_hit_length,
                 )
+                if self._future_requests is not None:
+                    self._reserved_future_ids.add(id(req))
 
         return self.budget_state()
 

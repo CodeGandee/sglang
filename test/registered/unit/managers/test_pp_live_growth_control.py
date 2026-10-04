@@ -15,6 +15,125 @@ class _StopLoop(Exception):
 
 
 class TestPPLiveGrowthControl(unittest.TestCase):
+    def test_active_output_tuple_is_consumed_once_after_current_batch_launch(self):
+        calls = []
+        old_target = SimpleNamespace(reqs=[SimpleNamespace(rid="A")])
+        new_current = SimpleNamespace(reqs=[SimpleNamespace(rid="B")])
+        output_proxy = object()
+        old_result = object()
+        launch_event = object()
+        input_proxy = object()
+
+        class CopyEvent:
+            def synchronize(self):
+                calls.append("d2h")
+
+        copy_event = CopyEvent()
+        outputs = (output_proxy, old_result, copy_event)
+        scheduler = SimpleNamespace(
+            ps=SimpleNamespace(pp_rank=0, pp_size=2),
+            pp_group=SimpleNamespace(is_last_rank=False),
+            pp_loop_size=2,
+            running_mbs=[None, None],
+            last_mbs=[None, old_target],
+            mbs=[None, old_target],
+            send_req_work=[],
+            send_proxy_work=[],
+            mb_metadata=[object(), object()],
+            last_rank_comm_queue=[],
+        )
+        scheduler.init_pp_loop_state = lambda: None
+        scheduler.process_input_requests = lambda reqs: calls.append("requests")
+        scheduler._pp_commit_comm_work = lambda work: None
+        scheduler._pp_send_pyobj_to_next_stage = lambda data, async_send=False: []
+
+        def receive():
+            if calls:
+                raise _StopLoop()
+            return []
+
+        scheduler.request_receiver = SimpleNamespace(recv_requests=receive)
+
+        def drain(next_first, next_mb):
+            calls.append("output")
+            self.assertEqual((next_first, next_mb), (0, 1))
+            self.assertIs(scheduler.mbs[next_mb], old_target)
+            return outputs
+
+        scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = drain
+        scheduler.hisparse_growth_controller = SimpleNamespace(
+            tick=lambda owner, mb: calls.append("growth")
+        )
+
+        def plan(**kwargs):
+            calls.append("plan")
+            return SimpleNamespace(running_batch=new_current, batch_to_run=new_current)
+
+        scheduler.get_next_batch_to_run = plan
+
+        def receive_proxy():
+            calls.append("proxy")
+            return input_proxy
+
+        scheduler._pp_recv_proxy_tensors = receive_proxy
+
+        def launch(mb, current, proxy, metadata, queued):
+            calls.append("launch")
+            self.assertEqual(mb, 0)
+            self.assertIs(current, new_current)
+            self.assertIs(proxy, input_proxy)
+            return (
+                SimpleNamespace(
+                    pp_hidden_states_proxy_tensors=SimpleNamespace(tensors={})
+                ),
+                launch_event,
+            )
+
+        scheduler._pp_launch_batch = launch
+
+        def process(batch, result):
+            calls.append("process")
+            self.assertIs(batch, old_target)
+            self.assertIs(result, old_result)
+
+        scheduler._pp_process_batch_result = process
+
+        def wait_launch(event):
+            calls.append("wait-launch")
+            self.assertIs(event, launch_event)
+
+        scheduler.device_module = SimpleNamespace(
+            current_stream=lambda: SimpleNamespace(wait_event=wait_launch)
+        )
+        scheduler._pp_send_dict_to_next_stage = lambda tensors, **kwargs: (
+            calls.append("send-proxy") or []
+        )
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=SimpleNamespace(pp_async_batch_depth=0),
+            ),
+            self.assertRaises(_StopLoop),
+        ):
+            SchedulerPPMixin.event_loop_pp(scheduler)
+        self.assertEqual(
+            calls,
+            [
+                "requests",
+                "output",
+                "growth",
+                "plan",
+                "proxy",
+                "launch",
+                "d2h",
+                "process",
+                "wait-launch",
+                "send-proxy",
+            ],
+        )
+        self.assertIs(scheduler.pp_outputs, output_proxy)
+        self.assertIs(scheduler.last_mbs[1], old_target)
+
     def test_rank_zero_drains_native_output_once_before_growth_control(self):
         calls = []
         outputs = (object(), object(), None)
@@ -54,12 +173,14 @@ class TestPPLiveGrowthControl(unittest.TestCase):
             return SimpleNamespace(running_batch=None, batch_to_run=None)
 
         scheduler.get_next_batch_to_run = plan
-        with patch(
-            "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
-            return_value=SimpleNamespace(pp_async_batch_depth=0),
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=SimpleNamespace(pp_async_batch_depth=0),
+            ),
+            self.assertRaises(_StopLoop),
         ):
-            with self.assertRaises(_StopLoop):
-                SchedulerPPMixin.event_loop_pp(scheduler)
+            SchedulerPPMixin.event_loop_pp(scheduler)
         self.assertEqual(calls, ["requests", "output", "growth", "plan"])
         self.assertIs(scheduler.pp_outputs, outputs[0])
 
