@@ -103,6 +103,74 @@ def _fuse_a_proj_weight_shape(
     return torch.stack((q_shape[0] + kv_shape[0], q_shape[1]))
 
 
+def _dequantize_packed_mla_kv_b(projection: nn.Module) -> torch.Tensor:
+    """Materialize raw symmetric W8/group BF16 KV-B before Marlin repacking."""
+    from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
+    from compressed_tensors.quantization import QuantizationArgs
+    from compressed_tensors.quantization.lifecycle.forward import dequantize
+
+    from sglang.srt.layers.parameter import PackedvLLMParameter
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+        CompressedTensorsWNA16,
+    )
+
+    scheme = getattr(projection, "scheme", None)
+    packed = projection.weight_packed
+    scale = getattr(projection, "weight_scale", None)
+    descriptor = getattr(projection, "weight_shape", None)
+    if (
+        not isinstance(scheme, CompressedTensorsWNA16)
+        or scheme.quant_type.size_bits != 8
+        or not scheme.symmetric
+        or scheme.has_g_idx
+        or scheme.strategy != "group"
+        or scheme.group_size <= 0
+        or not isinstance(packed, PackedvLLMParameter)
+        or packed.packed_dim != 1
+        or packed.packed_factor != 4
+        or packed.input_dim != 1
+        or packed.output_dim != 0
+    ):
+        raise ValueError(
+            "Packed MLA KV-B requires raw symmetric W8/group weights before Marlin repacking"
+        )
+    full_width, full_rows = scheme.kernel_config.full_weight_shape
+    width, rows = scheme.kernel_config.partition_weight_shape
+    if (
+        width != full_width
+        or width % 4
+        or width % scheme.group_size
+        or packed.dtype != torch.int32
+        or packed.shape != (rows, width // 4)
+        or not isinstance(scale, torch.Tensor)
+        or scale.dtype != torch.bfloat16
+        or scale.shape != (rows, width // scheme.group_size)
+        or scale.device != packed.device
+        or not isinstance(descriptor, torch.Tensor)
+        or descriptor.dtype != torch.int64
+        or descriptor.shape != (2,)
+        or not torch.equal(descriptor, descriptor.new_tensor([full_rows, full_width]))
+    ):
+        raise ValueError(
+            "Packed MLA KV-B tensor geometry or replicated shape descriptor is inconsistent"
+        )
+    # weight_shape remains global under column TP; loaded packed/scales rows are
+    # already local. Dependency unpacking returns signed values (byte minus 128).
+    unpacked = unpack_from_int32(packed, 8, torch.Size((rows, width)), packed_dim=1)
+    return dequantize(
+        unpacked,
+        scale,
+        args=QuantizationArgs(
+            num_bits=8,
+            type="int",
+            symmetric=True,
+            strategy="group",
+            group_size=scheme.group_size,
+        ),
+        dtype=torch.bfloat16,
+    )
+
+
 def _load_fused_indexer_wk(
     name: str,
     loaded_weight: torch.Tensor,
@@ -563,6 +631,11 @@ class DeepseekV2WeightLoaderMixin:
                     raise ValueError(
                         "AWQ dequantize function is not supported for the current device"
                     )
+            elif hasattr(self_attn.kv_b_proj, "weight_packed"):
+                w = _dequantize_packed_mla_kv_b(self_attn.kv_b_proj)
+                # Group scales are already applied to these dense absorb weights.
+                # Keep packed projection parameters untouched for native MHA.
+                self_attn.w_scale = 1.0
             else:
                 w = self_attn.kv_b_proj.weight
 
