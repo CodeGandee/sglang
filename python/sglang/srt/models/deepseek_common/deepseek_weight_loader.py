@@ -78,6 +78,31 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _fuse_a_proj_weight_shape(
+    q_shape: torch.Tensor, kv_shape: torch.Tensor
+) -> torch.Tensor:
+    """Merge compressed output/input descriptors along the output dimension."""
+    if (
+        q_shape.dtype != torch.int64
+        or kv_shape.dtype != torch.int64
+        or q_shape.shape != (2,)
+        or kv_shape.shape != (2,)
+        or q_shape.device != kv_shape.device
+    ):
+        raise ValueError(
+            "A-projection weight_shape must be colocated INT64 [2] descriptors"
+        )
+    if (
+        bool(torch.any(q_shape <= 0))
+        or bool(torch.any(kv_shape <= 0))
+        or not torch.equal(q_shape[1:], kv_shape[1:])
+    ):
+        raise ValueError(
+            "A-projection weight_shape requires positive dimensions and equal input widths"
+        )
+    return torch.stack((q_shape[0] + kv_shape[0], q_shape[1]))
+
+
 def _load_fused_indexer_wk(
     name: str,
     loaded_weight: torch.Tensor,
@@ -370,7 +395,16 @@ class DeepseekV2WeightLoaderMixin:
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
 
-                                if q_a_proj_weight.shape == torch.Size(
+                                if (
+                                    name.endswith(".weight_shape")
+                                    and self.quant_config is not None
+                                    and self.quant_config.get_name()
+                                    == "compressed_tensors"
+                                ):
+                                    fused_weight = _fuse_a_proj_weight_shape(
+                                        q_a_proj_weight, kv_a_proj_weight
+                                    )
+                                elif q_a_proj_weight.shape == torch.Size(
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
                                     fused_weight = q_a_proj_weight
