@@ -11,11 +11,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _fake_communicator():
+def _fake_communicator(*, is_pp_stage_end=False, is_last_layer=False):
     return types.SimpleNamespace(
         _speculative_algo=None,
         layer_scatter_modes=types.SimpleNamespace(mlp_mode=ScatterMode.TP_ATTN_FULL),
-        is_last_layer=False,
+        is_last_layer=is_last_layer,
+        is_pp_stage_end=is_pp_stage_end,
+        allow_reduce_scatter=True,
+        _communicate_summable_tensor_pair_fn=comm.CommunicateSummableTensorPairFn._trivial,
         _context=types.SimpleNamespace(tp_size=4),
     )
 
@@ -31,7 +34,9 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
     Qwen3-30B-A3B with --tp-size 4 --ep-size 2.
     """
 
-    def _should_fuse(self, *, moe_ep_size, moe_tp_size):
+    def _should_fuse(
+        self, *, moe_ep_size, moe_tp_size, is_pp_stage_end=False, is_last_layer=False
+    ):
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(8,))
         )
@@ -48,7 +53,10 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
             ),
         ):
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
-                _fake_communicator(), forward_batch
+                _fake_communicator(
+                    is_pp_stage_end=is_pp_stage_end, is_last_layer=is_last_layer
+                ),
+                forward_batch,
             )
 
     def test_hybrid_ep_tp_does_not_fuse(self):
@@ -59,6 +67,63 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
 
     def test_pure_ep_still_fuses(self):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
+
+    def test_pp_stage_end_does_not_defer_reduction(self):
+        self.assertFalse(
+            self._should_fuse(moe_ep_size=1, moe_tp_size=4, is_pp_stage_end=True)
+        )
+
+    def test_global_final_and_nextn_gate_remains_closed(self):
+        for stage_end in (False, True):
+            with self.subTest(stage_end=stage_end):
+                self.assertFalse(
+                    self._should_fuse(
+                        moe_ep_size=1,
+                        moe_tp_size=4,
+                        is_pp_stage_end=stage_end,
+                        is_last_layer=True,
+                    )
+                )
+
+    def test_stage_marker_preserves_input_scattered_reduce_scatter(self):
+        with (
+            patch.object(comm, "dsa_use_prefill_cp", return_value=False),
+            patch.object(comm, "mla_use_prefill_cp", return_value=False),
+            patch.object(
+                comm,
+                "get_attn_tp_context",
+                return_value=types.SimpleNamespace(input_scattered=True),
+            ),
+        ):
+            for stage_end in (False, True):
+                for global_final in (False, True):
+                    with self.subTest(stage_end=stage_end, global_final=global_final):
+                        self.assertEqual(
+                            LayerCommunicator.should_use_reduce_scatter(
+                                _fake_communicator(
+                                    is_pp_stage_end=stage_end,
+                                    is_last_layer=global_final,
+                                ),
+                                types.SimpleNamespace(),
+                            ),
+                            not global_final,
+                        )
+
+    def test_stage_marker_preserves_cp_reduce_scatter(self):
+        for cp_gate in ("dsa_use_prefill_cp", "mla_use_prefill_cp"):
+            with (
+                patch.object(comm, "dsa_use_prefill_cp", return_value=False),
+                patch.object(comm, "mla_use_prefill_cp", return_value=False),
+                patch.object(comm, cp_gate, return_value=True),
+            ):
+                for stage_end in (False, True):
+                    with self.subTest(cp_gate=cp_gate, stage_end=stage_end):
+                        self.assertTrue(
+                            LayerCommunicator.should_use_reduce_scatter(
+                                _fake_communicator(is_pp_stage_end=stage_end),
+                                types.SimpleNamespace(),
+                            )
+                        )
 
 
 if __name__ == "__main__":

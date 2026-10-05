@@ -2679,6 +2679,9 @@ class DeepseekV2Model(nn.Module):
             ),
         )
 
+        if self.start_layer < self.end_layer:
+            self.layers[self.end_layer - 1].layer_communicator.is_pp_stage_end = True
+
         local_layer_ids = list(range(self.start_layer, self.end_layer))
         self.next_full_attention_layer_id = dict(
             zip(local_layer_ids, local_layer_ids[1:])

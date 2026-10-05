@@ -464,6 +464,7 @@ class LayerCommunicator:
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
+        self.is_pp_stage_end = False
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
@@ -809,6 +810,10 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        # PP transfer partitions replicated activations and cannot carry deferred reductions.
+        if self.is_pp_stage_end:
+            return False
+
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
