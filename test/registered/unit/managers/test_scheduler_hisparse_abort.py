@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -15,6 +14,7 @@ from sglang.srt.managers.hisparse_coordinator import (  # noqa: E402
     HiSparseCoordinator,
 )
 from sglang.srt.managers.io_struct import AbortReq, ShutdownReq  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -52,6 +52,92 @@ def _scheduler_for_admission(*, hisparse: bool, staged_reqs: tuple[object, ...])
 
 
 class TestSchedulerHiSparseAbort(unittest.TestCase):
+    def test_coordinated_prefix_exact_and_all_abort_pending_owners_once(self):
+        for selection, expected in (
+            ("prefix", {"request", "request-child"}),
+            ("exact", {"request"}),
+            ("all", {"request", "request-child", "unrelated"}),
+        ):
+            with self.subTest(selection=selection):
+                requests = []
+                for rid, phase in (
+                    ("request", "backup-pending"),
+                    ("request-child", "prepared-uncommitted"),
+                    ("unrelated", "prepared-uncommitted"),
+                ):
+                    req = Req.__new__(Req)
+                    req.rid = rid
+                    req.finished_reason = None
+                    req.to_finish = None
+                    req.hisparse_staging = True
+                    requests.append((req, phase))
+                owner = _scheduler_for_abort(
+                    requests[0][0], duplicate_in_last_batch=False
+                )
+                owner.ps = SimpleNamespace(pp_size=2)
+                owner.running_mbs = [SimpleNamespace(reqs=[req for req, _ in requests])]
+                owner.mbs = [owner.running_mbs[0]]
+                # Prepared owners are deliberately absent from the backup queue.
+                owner.hisparse_coordinator.staging_requests = (requests[0][0],)
+                owner.hisparse_promotion_controller = SimpleNamespace(
+                    pending_requests=lambda owned=requests: tuple(
+                        req for req, _ in owned
+                    )
+                )
+                events = []
+                owner.hisparse_coordinator.retire_pending_promotion.side_effect = (
+                    lambda req, recorded=events: recorded.append(
+                        ("invalidate", req.rid)
+                    )
+                )
+                owner.hisparse_coordinator.retract_req.side_effect = (
+                    lambda req, recorded=events: recorded.append(
+                        ("retire-storage", req.rid)
+                    )
+                )
+                owner.ipc_channels.send_to_tokenizer.send_output.side_effect = (
+                    lambda abort, req, recorded=events: recorded.append(
+                        ("terminal", req.rid)
+                    )
+                )
+                with patch(
+                    "sglang.srt.managers.scheduler.release_kv_cache",
+                    side_effect=lambda req, *_args, recorded=events, **_kwargs: (
+                        recorded.append(("release-native", req.rid))
+                    ),
+                ):
+                    owner.abort_request(
+                        AbortReq(
+                            rid="request",
+                            exact_match=selection == "exact",
+                            abort_all=selection == "all",
+                        )
+                    )
+                expected_events = [
+                    (event, req.rid)
+                    for req, _ in requests
+                    if req.rid in expected
+                    for event in (
+                        "invalidate",
+                        "retire-storage",
+                        "release-native",
+                        "terminal",
+                    )
+                ]
+                self.assertEqual(events, expected_events)
+                for req, _ in requests:
+                    self.assertEqual(req.finished(), req.rid in expected)
+                    self.assertIsNone(req.to_finish)
+                    if req.rid in expected:
+                        self.assertEqual(req.finished_reason.to_json()["type"], "abort")
+                self.assertEqual(
+                    [
+                        call.args[0].rid
+                        for call in owner.ipc_channels.send_to_tokenizer.send_output.call_args_list
+                    ],
+                    [req.rid for req, _ in requests if req.rid in expected],
+                )
+
     def test_staging_only_abort_retracts_releases_and_notifies_once(self):
         req = MagicMock()
         req.rid = "staged"
@@ -149,6 +235,76 @@ class TestSchedulerHiSparseAbort(unittest.TestCase):
 
 
 class TestSchedulerHiSparseAdmission(unittest.TestCase):
+    def test_coordinated_pending_and_retiring_veto_full_idle_without_health_forward(
+        self,
+    ):
+        for phase, backup_present in (
+            ("backup-pending", True),
+            ("prepared-uncommitted", False),
+            ("retiring", False),
+        ):
+            with self.subTest(phase=phase):
+                owner = _scheduler_for_admission(hisparse=True, staged_reqs=())
+                empty = SimpleNamespace(reqs=[], is_empty=lambda: True)
+                owner.ps = SimpleNamespace(pp_size=2)
+                owner.running_batch = empty
+                owner.running_mbs = [empty, empty]
+                owner.mbs = [None, None]
+                owner.last_batch = None
+                owner.chunked_req = None
+                owner.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+                owner.enable_overlap = False
+                owner.waiting_queue = []
+                owner._engine_paused = False
+                owner.disaggregation_mode = DisaggregationMode.NULL
+                owner.enable_hierarchical_cache = False
+                owner.grammar_manager = MagicMock()
+                owner.grammar_manager.grammar_queue = []
+                owner.hisparse_coordinator.has_ongoing_staging.return_value = (
+                    backup_present
+                )
+                ownership = SimpleNamespace(closed=False)
+                owner.hisparse_promotion_controller = SimpleNamespace(
+                    has_ongoing_requests=lambda state=ownership: not state.closed
+                )
+                owner.maybe_send_health_check_signal = MagicMock()
+                owner.tree_cache = MagicMock()
+                owner.token_to_kv_pool_allocator = MagicMock()
+                owner.enable_unified_memory = False
+                owner.invariant_checker = MagicMock()
+                owner.metrics_reporter = MagicMock()
+                owner.metrics_reporter.is_stats_logging_rank = False
+                owner.kv_events_publisher = MagicMock()
+                owner.new_token_ratio_tracker = MagicMock()
+                owner.publish_load_snapshot = MagicMock()
+                owner.maybe_sleep_on_idle = MagicMock()
+                owner.draft_worker = None
+                # Actual PP ownership drain, full-idle, idle housekeeping and
+                # destructive flush methods run; no fake is_fully_idle callback.
+                self.assertTrue(owner._pp_microbatches_drained())
+                self.assertFalse(owner.is_fully_idle())
+                self.assertTrue(owner.is_fully_idle(for_health_check=True))
+                self.assertFalse(owner.flush_cache(empty_cache=False))
+                owner.on_idle()
+                owner.tree_cache.reset.assert_not_called()
+                owner.req_to_token_pool.clear.assert_not_called()
+                owner.token_to_kv_pool_allocator.clear.assert_not_called()
+                owner.new_token_ratio_tracker.reset.assert_not_called()
+                owner.publish_load_snapshot.assert_not_called()
+                # Independent completion flips both ownership witnesses. Health
+                # remains idle; only full resource-idle becomes eligible now.
+                ownership.closed = True
+                owner.hisparse_coordinator.has_ongoing_staging.return_value = False
+                self.assertTrue(owner.is_fully_idle())
+                self.assertTrue(owner.is_fully_idle(for_health_check=True))
+                owner.on_idle()
+                owner.new_token_ratio_tracker.reset.assert_called_once_with()
+                owner.publish_load_snapshot.assert_called_once_with(force=True)
+                self.assertTrue(owner.flush_cache(empty_cache=False))
+                owner.tree_cache.reset.assert_called_once_with()
+                owner.req_to_token_pool.clear.assert_called_once_with()
+                owner.token_to_kv_pool_allocator.clear.assert_called_once_with()
+
     def test_staged_request_consumes_b1_admission(self):
         scheduler = _scheduler_for_admission(hisparse=True, staged_reqs=(object(),))
 

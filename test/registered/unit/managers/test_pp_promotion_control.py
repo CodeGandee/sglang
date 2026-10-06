@@ -37,6 +37,82 @@ def _admission(rid):
 
 
 class TestPPPromotionNativeBoundary(unittest.TestCase):
+    def test_retiring_only_loop_polls_until_completion_then_runs_idle_once(self):
+        class StopLoop(Exception):
+            pass
+
+        calls = []
+        completion = SimpleNamespace(done=False)
+        retained = SimpleNamespace(owned=True)
+        owner = SimpleNamespace(
+            ps=SimpleNamespace(pp_rank=0, pp_size=2),
+            pp_group=SimpleNamespace(is_last_rank=False),
+            pp_loop_size=1,
+            running_mbs=[None],
+            last_mbs=[None],
+            mbs=[None],
+            send_req_work=[],
+            send_proxy_work=[],
+            init_pp_loop_state=lambda: None,
+            process_input_requests=lambda reqs: None,
+            _pp_commit_comm_work=lambda work: None,
+            _pp_send_pyobj_to_next_stage=lambda *args, **kwargs: [],
+            _pp_prune_finished_hisparse_history=lambda: None,
+            _pp_commit_send_output_work_and_preprocess_output_tensors=lambda *args: (
+                None,
+                None,
+                None,
+            ),
+            get_next_batch_to_run=lambda **kwargs: SimpleNamespace(
+                running_batch=None, batch_to_run=None
+            ),
+        )
+        visits = []
+
+        def receive():
+            if len(visits) == 3:
+                raise StopLoop()
+            if len(visits) == 2:
+                completion.done = True
+            visits.append(len(visits))
+            return []
+
+        def poll(scheduler, mb, *, visit_id):
+            self.assertIs(scheduler, owner)
+            self.assertEqual(mb, 0)
+            self.assertTrue(retained.owned)
+            calls.append(("poll", visit_id, completion.done))
+            if completion.done:
+                retained.owned = False
+                calls.append(("close", visit_id))
+
+        owner.request_receiver = SimpleNamespace(recv_requests=receive)
+        owner.hisparse_promotion_controller = SimpleNamespace(
+            tick=poll,
+            has_ongoing_requests=lambda: retained.owned,
+        )
+        owner.on_idle = lambda: calls.append(("idle", owner._hisparse_pp_visit_id))
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=SimpleNamespace(pp_async_batch_depth=0),
+            ),
+            self.assertRaises(StopLoop),
+        ):
+            SchedulerPPMixin.event_loop_pp(owner)
+        self.assertEqual(
+            calls,
+            [
+                ("poll", 0, False),
+                ("poll", 1, False),
+                ("poll", 2, True),
+                ("close", 2),
+                ("idle", 2),
+            ],
+        )
+        self.assertFalse(retained.owned)
+        self.assertEqual(owner.mbs, [None])
+
     def test_empty_output_drains_once_in_both_slots_before_controls(self):
         class StopLoop(Exception):
             pass
