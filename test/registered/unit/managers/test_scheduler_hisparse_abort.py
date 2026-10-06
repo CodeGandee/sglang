@@ -106,6 +106,29 @@ class TestSchedulerHiSparseAbort(unittest.TestCase):
         scheduler.hisparse_coordinator.retract_req.assert_called_once_with(target)
         release.assert_called_once()
 
+    def test_prepared_abort_uses_authoritative_pending_view_and_invalidates_first(self):
+        target = MagicMock(rid="prepared")
+        target.to_finish = None
+        sibling = MagicMock(rid="prepared-child")
+        owner = _scheduler_for_abort(target, duplicate_in_last_batch=True)
+        owner.hisparse_coordinator.staging_requests = ()
+        owner.hisparse_promotion_controller = SimpleNamespace(
+            pending_requests=lambda: (target, sibling)
+        )
+        calls = []
+        owner.hisparse_coordinator.retire_pending_promotion.side_effect = lambda req: (
+            calls.append(("invalidate", req))
+        )
+        owner.hisparse_coordinator.retract_req.side_effect = lambda req: calls.append(
+            ("retire-storage", req)
+        )
+        with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
+            owner.abort_request(AbortReq(rid="prepared", exact_match=True))
+        self.assertEqual(calls, [("invalidate", target), ("retire-storage", target)])
+        release.assert_called_once()
+        self.assertIsNone(target.to_finish)
+        self.assertEqual(owner.ipc_channels.send_to_tokenizer.send_output.call_count, 1)
+
     def test_queued_exact_abort_leaves_staging_owner_untouched(self):
         staged = MagicMock(rid="active")
         queued = MagicMock(rid="queued")
@@ -163,6 +186,17 @@ class TestSchedulerHiSparseAdmission(unittest.TestCase):
             return_value=SimpleNamespace(pp_max_micro_batch_size=1),
         ):
             self.assertEqual(scheduler.get_num_allocatable_reqs(running_bs=0), 1)
+
+    def test_prepared_pending_request_consumes_admission_after_queue_removal(self):
+        owner = _scheduler_for_admission(hisparse=True, staged_reqs=())
+        owner.hisparse_promotion_controller = SimpleNamespace(
+            pending_requests=lambda: (object(),)
+        )
+        with patch(
+            "sglang.srt.managers.scheduler.get_parallel",
+            return_value=SimpleNamespace(pp_max_micro_batch_size=1),
+        ):
+            self.assertEqual(owner.get_num_allocatable_reqs(running_bs=0), 0)
 
     def test_health_idle_check_counts_staging_as_active(self):
         scheduler = _scheduler_for_admission(hisparse=True, staged_reqs=(object(),))

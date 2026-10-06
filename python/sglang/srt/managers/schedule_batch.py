@@ -1196,6 +1196,8 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self.hisparse_activation_episode: Optional[int] = None
+        self.hisparse_prefill_origin_mb: Optional[int] = None
 
     @property
     def seqlen(self) -> int:
@@ -2319,9 +2321,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert (
-            len(self.out_cache_loc) == self.extend_num_tokens
-        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        assert len(self.out_cache_loc) == self.extend_num_tokens, (
+            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        )
 
         if self.extend_input_logprob_token_ids is not None:
             new_token_ids_parts = []

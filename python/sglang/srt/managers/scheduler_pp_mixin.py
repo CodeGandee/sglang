@@ -24,6 +24,10 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.io_struct import (
+    BatchTokenizedGenerateReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -110,19 +114,41 @@ class SchedulerPPMixin:
                         )
                 early_output_result = None
                 growth_controller = getattr(self, "hisparse_growth_controller", None)
-                if growth_controller is not None:
+                promotion_controller = getattr(
+                    self, "hisparse_promotion_controller", None
+                )
+                if growth_controller is not None or promotion_controller is not None:
                     if get_parallel().pp_async_batch_depth != 0:
                         raise RuntimeError(
-                            "live HiSparse growth requires PP async depth zero"
+                            "HiSparse PP control requires async depth zero"
                         )
-                    # PP0 must drain the previous native output before entering
-                    # blocking CPU control frames. Otherwise the last stage may
-                    # still be waiting for PP0's previous output receive.
-                    if self.ps.pp_rank == 0:
-                        early_output_result = self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id, next_mb_id
-                        )
-                    growth_controller.tick(self, mb_id)
+                    self._hisparse_control_ct = (
+                        getattr(self, "_hisparse_control_ct", 0) + 1
+                    )
+                    self._hisparse_control_active = True
+                    try:
+                        # PP0 must drain the previous native output before entering
+                        # blocking CPU control frames. Otherwise the last stage may
+                        # still be waiting for PP0's previous output receive.
+                        if self.ps.pp_rank == 0:
+                            early_output_result = self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                                next_first_rank_mb_id, next_mb_id
+                            )
+                        self._pp_commit_comm_work(self.send_req_work)
+                        if growth_controller is not None:
+                            growth_controller.tick(self, mb_id)
+                        if promotion_controller is not None:
+                            self._pp_prune_finished_hisparse_history()
+                            self._hisparse_pp_mb_id = mb_id
+                            self._hisparse_pp_visit_id = (
+                                getattr(self, "_hisparse_pp_visit_id", -1) + 1
+                            )
+                            promotion_controller.tick(
+                                self, mb_id, visit_id=self._hisparse_pp_visit_id
+                            )
+                    finally:
+                        self._hisparse_control_active = False
+                        self._hisparse_control_ct += 1
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -172,6 +198,7 @@ class SchedulerPPMixin:
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
+                            mb_id=next_mb_id,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
@@ -191,8 +218,48 @@ class SchedulerPPMixin:
                 self.pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
-            if server_is_idle:
+            if server_is_idle and (
+                promotion_controller is None
+                or not promotion_controller.has_ongoing_requests()
+            ):
                 self.on_idle()
+
+    def _pp_assign_hisparse_admissions(self: Scheduler, requests: list) -> None:
+        """Assign PP0 episodes before the actual native broadcast/forward path."""
+        if (
+            self.ps.pp_rank != 0
+            or getattr(self, "hisparse_promotion_controller", None) is None
+        ):
+            return
+        for message in requests:
+            admissions = (
+                message.batch
+                if isinstance(message, BatchTokenizedGenerateReqInput)
+                else (message,)
+            )
+            for admission in admissions:
+                if not isinstance(admission, TokenizedGenerateReqInput):
+                    continue
+                if admission.hisparse_activation_episode is not None:
+                    raise RuntimeError("PP ingress cannot supply a HiSparse episode")
+                self._hisparse_admission_episode = (
+                    getattr(self, "_hisparse_admission_episode", 0) + 1
+                )
+                admission.hisparse_activation_episode = self._hisparse_admission_episode
+
+    def _hisparse_pending_requests(self: Scheduler) -> Tuple[Req, ...]:
+        """Return exact backup and prepared owners from the selected runtime."""
+        promotion = getattr(self, "hisparse_promotion_controller", None)
+        if promotion is not None:
+            return promotion.pending_requests()
+        coordinator = getattr(self, "hisparse_coordinator", None)
+        return tuple(getattr(coordinator, "staging_requests", ()))
+
+    def _pp_promotion_target_space(self: Scheduler, mb_id: int) -> int:
+        """Return decode capacity without charging pending owners a second time."""
+        batch = self.running_mbs[mb_id]
+        live = {id(req) for req in batch.reqs if not req.finished()}
+        return max(0, get_parallel().pp_max_micro_batch_size - len(live))
 
     def _pp_future_output_requests(
         self: Scheduler, running_batch: Optional[ScheduleBatch] = None
@@ -208,8 +275,7 @@ class SchedulerPPMixin:
         candidates = [
             req for batch in batches if batch is not None for req in batch.reqs
         ]
-        coordinator = getattr(self, "hisparse_coordinator", None)
-        candidates.extend(getattr(coordinator, "staging_requests", ()))
+        candidates.extend(SchedulerPPMixin._hisparse_pending_requests(self))
         if self.chunked_req is not None:
             candidates.append(self.chunked_req)
         unique = {}
@@ -1213,9 +1279,31 @@ class SchedulerPPMixin:
         return output_result
 
     def _pp_process_batch_result(
-        self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
+        self: Scheduler,
+        batch: ScheduleBatch,
+        output_result: GenerationBatchResult,
+        *,
+        mb_id: Optional[int] = None,
     ):
+        if getattr(self, "hisparse_promotion_controller", None) is not None:
+            if mb_id is None:
+                raise RuntimeError("HiSparse PP result requires its explicit origin")
+            if batch.forward_mode.is_extend():
+                for req in batch.reqs:
+                    if req.hisparse_prefill_origin_mb is None:
+                        req.hisparse_prefill_origin_mb = mb_id
         self.process_batch_result(batch, output_result)
+        if getattr(self, "hisparse_promotion_controller", None) is not None:
+            self._pp_prune_finished_hisparse_history()
+
+    def _pp_prune_finished_hisparse_history(self: Scheduler) -> None:
+        """Prune finished-only histories after their outstanding output retires."""
+        outstanding = {id(batch) for batch in self.mbs if batch is not None}
+        for batch in self.last_mbs:
+            if batch is None or id(batch) in outstanding:
+                continue
+            if any(req.finished() for req in batch.reqs):
+                batch.filter_batch()
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,

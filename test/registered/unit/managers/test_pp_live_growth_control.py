@@ -65,6 +65,12 @@ class TestPPLiveGrowthControl(unittest.TestCase):
             tick=lambda owner, mb: calls.append("growth")
         )
 
+        scheduler.hisparse_promotion_controller = SimpleNamespace(
+            tick=lambda owner, mb, visit_id: calls.append("promotion"),
+            has_ongoing_requests=lambda: False,
+        )
+        scheduler._pp_prune_finished_hisparse_history = lambda: None
+
         def plan(**kwargs):
             calls.append("plan")
             return SimpleNamespace(running_batch=new_current, batch_to_run=new_current)
@@ -91,7 +97,7 @@ class TestPPLiveGrowthControl(unittest.TestCase):
 
         scheduler._pp_launch_batch = launch
 
-        def process(batch, result):
+        def process(batch, result, *, mb_id=None):
             calls.append("process")
             self.assertIs(batch, old_target)
             self.assertIs(result, old_result)
@@ -122,6 +128,7 @@ class TestPPLiveGrowthControl(unittest.TestCase):
                 "requests",
                 "output",
                 "growth",
+                "promotion",
                 "plan",
                 "proxy",
                 "launch",

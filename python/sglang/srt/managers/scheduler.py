@@ -410,6 +410,8 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
+        self._hisparse_control_active: bool = False
+        self._hisparse_control_ct: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.init_soft_watchdog(server_args)
 
@@ -2030,6 +2032,7 @@ class Scheduler(
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            prepare_pp_admissions=self._pp_assign_hisparse_admissions,
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -2123,19 +2126,31 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
-            waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
-                self.waiting_queue
+            waiting_queue_prefix_matched=lambda: (
+                self.policy.waiting_queue_prefix_matched(self.waiting_queue)
             ),
-            get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
+            get_recent_cache_hit_rate=lambda: (
+                self.metrics_reporter.recent_cache_hit_rate
+            ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
+            ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
@@ -2509,6 +2524,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        req.hisparse_activation_episode = recv_req.hisparse_activation_episode
+        req.hisparse_prefill_origin_mb = recv_req.hisparse_prefill_origin_mb
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
@@ -3078,7 +3095,15 @@ class Scheduler(
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
-            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            promotion = getattr(self, "hisparse_promotion_controller", None)
+            if promotion is None:
+                ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            else:
+                ready_reqs = promotion.consume(
+                    self._hisparse_pp_mb_id, self._hisparse_pp_visit_id
+                )
+                for req in ready_reqs:
+                    req.hisparse_staging = False
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
                 if running_batch.is_empty():
@@ -3179,7 +3204,7 @@ class Scheduler(
         if self.enable_hisparse:
             # Prefill staging owns an admitted native request even though that
             # request is temporarily absent from the running decode batch.
-            active_reqs += len(self.hisparse_coordinator.staging_requests)
+            active_reqs += len(self._hisparse_pending_requests())
         res = get_parallel().pp_max_micro_batch_size - active_reqs
         res = min(res, self.req_to_token_pool.available_size())
         return res
@@ -3344,9 +3369,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -4159,10 +4183,14 @@ class Scheduler(
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
 
-        # HiSparse prefill staging owns an active logical model request. Health
-        # generation must piggyback instead of admitting a second request.
+        # Pending storage vetoes destructive idle reset. In coordinated mode
+        # it cannot carry health replies without an actual model forward.
         if self.enable_hisparse:
-            idle &= not self.hisparse_coordinator.has_ongoing_staging()
+            promotion = getattr(self, "hisparse_promotion_controller", None)
+            if promotion is None or not for_health_check:
+                idle &= not self.hisparse_coordinator.has_ongoing_staging()
+            if promotion is not None and not for_health_check:
+                idle &= not promotion.has_ongoing_requests()
 
         if (
             for_health_check
@@ -4515,11 +4543,17 @@ class Scheduler(
         # before returning the native slot and notifying the frontend.
         aborted_staged_req_ids: set[int] = set()
         if self.enable_hisparse:
-            for req in self.hisparse_coordinator.staging_requests:
+            for req in self._hisparse_pending_requests():
                 if not recv_req.matches(req.rid):
                     continue
+                if getattr(self, "hisparse_promotion_controller", None) is not None:
+                    self.hisparse_coordinator.retire_pending_promotion(req)
                 self.hisparse_coordinator.retract_req(req)
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+                if getattr(self, "hisparse_promotion_controller", None) is not None:
+                    # No future forward exists for an uncommitted activation.
+                    # Mark its origin history terminal after safe retirement.
+                    req.finished_reason = FINISH_ABORT()
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(rid=req.rid), req
                 )

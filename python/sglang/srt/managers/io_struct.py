@@ -939,6 +939,10 @@ class GenerateReqInput:
 
 
 class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+    # Assigned by PP0 before native TP broadcast and stage forwarding.
+    hisparse_activation_episode: Optional[int] = None
+    hisparse_prefill_origin_mb: Optional[int] = None
+
     input_text: Optional[Union[str, List[Union[str, List[str]]]]]
     # The input token ids
     input_ids: Optional[array]  # Optional[array[int]]

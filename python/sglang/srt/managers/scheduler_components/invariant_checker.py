@@ -465,21 +465,31 @@ def create_scheduler_watchdog(
     def dump_info() -> str:
         if scheduler.is_initializing:
             return ""
+        if getattr(scheduler, "_hisparse_control_active", False):
+            # CPU control may be waiting on a failed peer. Reading GPU pool
+            # state here could block the terminating watchdog itself.
+            return (
+                "HiSparse CPU control stalled: "
+                f"visit={getattr(scheduler, '_hisparse_pp_visit_id', None)} "
+                f"microbatch={getattr(scheduler, '_hisparse_pp_mb_id', None)}"
+            )
         _, messages = scheduler.invariant_checker._check_all_pools(
             scheduler.pool_stats_observer.get_pool_stats(),
         )
-        return (
-            f"{scheduler.cur_batch_for_debug.batch_size()=}\n"
-            f"{scheduler.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
-        )
+        return f"batch={scheduler.cur_batch_for_debug!r}\n" + "\n".join(messages)
 
     return WatchdogRaw(
         debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
+        get_counter=lambda: (
+            scheduler.forward_ct + getattr(scheduler, "_hisparse_control_ct", 0)
+        ),
         is_active=lambda: (
-            scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
+            scheduler.is_initializing
+            or scheduler.cur_batch_for_debug is not None
+            or getattr(scheduler, "_hisparse_control_active", False)
         ),
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,
+        skip_stack_dump=lambda: getattr(scheduler, "_hisparse_control_active", False),
     )

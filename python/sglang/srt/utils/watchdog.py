@@ -26,9 +26,9 @@ class Watchdog:
         test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
-            assert (
-                test_stuck_time == 0
-            ), f"stuck tester can be enabled only if soft watchdog is enabled."
+            assert test_stuck_time == 0, (
+                f"stuck tester can be enabled only if soft watchdog is enabled."
+            )
             return _WatchdogNoop()
         return _WatchdogReal(
             debug_name=debug_name,
@@ -109,6 +109,7 @@ class WatchdogRaw:
         watchdog_timeout: float,
         soft: bool = False,
         dump_info: Optional[Callable[[], str]] = None,
+        skip_stack_dump: Optional[Callable[[], bool]] = None,
     ):
         self.debug_name = debug_name
         self.get_counter = get_counter
@@ -116,6 +117,7 @@ class WatchdogRaw:
         self.watchdog_timeout = watchdog_timeout
         self.soft = soft
         self.dump_info = dump_info
+        self.skip_stack_dump = skip_stack_dump
 
         self.parent_process = psutil.Process().parent()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
@@ -149,7 +151,8 @@ class WatchdogRaw:
         if self.dump_info is not None and (info_msg := self.dump_info()):
             logger.error(f"{self.debug_name} debug info:\n{info_msg}")
 
-        pyspy_dump_schedulers()
+        if self.skip_stack_dump is None or not self.skip_stack_dump():
+            pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
