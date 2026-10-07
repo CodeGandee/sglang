@@ -50,16 +50,36 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
-        self.full_to_hisparse_device_index_mapping = torch.cat(
-            [
-                torch.zeros(
-                    self._size_full + self.page_size,
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                torch.tensor([-1], dtype=torch.int64, device=self.device),
-            ]
-        )
+        self._mapping_mem_pool: torch.cuda.MemPool | None = None
+        if (
+            torch.device(self.device).type == "cuda"
+            and kvcache._live_growth_owner is not None
+        ):
+            # Keep this static mapping out of unrelated cached model segments.
+            # The allocator retains the pool for the mapping's entire lifetime;
+            # main KV backing remains owned by its independent VMM arena.
+            with torch.cuda.device(self.device):
+                self._mapping_mem_pool = torch.cuda.MemPool(use_on_oom=False)
+                with torch.cuda.use_mem_pool(
+                    self._mapping_mem_pool, device=self.device
+                ):
+                    self.full_to_hisparse_device_index_mapping = torch.zeros(
+                        self._size_full + self.page_size + 1,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    self.full_to_hisparse_device_index_mapping[-1:].fill_(-1)
+        else:
+            self.full_to_hisparse_device_index_mapping = torch.cat(
+                [
+                    torch.zeros(
+                        self._size_full + self.page_size,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    torch.tensor([-1], dtype=torch.int64, device=self.device),
+                ]
+            )
 
         self.free_pages = None
         self.release_pages = None

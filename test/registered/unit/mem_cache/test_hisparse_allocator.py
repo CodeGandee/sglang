@@ -1,19 +1,199 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import Any, Iterator, cast
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+@dataclass
+class _MappingPoolRoute:
+    active: object | None = None
+    allocations: list[tuple[str, object | None, int]] = field(default_factory=list)
+    devices: list[torch.device] = field(default_factory=list)
+    current_device: torch.device = field(default_factory=lambda: torch.device("cuda:7"))
+
+
+class TestHiSparseMappingOwnership(CustomTestCase):
+    @contextmanager
+    def _constructed(
+        self, device: str, *, vmm: bool, fail_mapping: bool = False
+    ) -> Iterator[
+        tuple[
+            HiSparseTokenToKVPoolAllocator, HiSparseDSATokenToKVPool, _MappingPoolRoute
+        ]
+    ]:
+        # Real native cache registration and paged allocators; only CUDA storage
+        # creation is routed onto CPU and the unavailable MemPool API is mocked.
+        cache = object.__new__(HiSparseDSATokenToKVPool)
+        cache.size = 65536
+        backing = SimpleNamespace(usable_num_tokens=128)
+        cache._live_growth_owner = cast(KvVmmBufferOwner, backing) if vmm else None
+        route = _MappingPoolRoute()
+        pool = object()
+        original = {
+            name: getattr(torch, name)
+            for name in ("zeros", "tensor", "arange", "cat", "empty")
+        }
+
+        def factory(name: str):
+            def allocate(*args: Any, **kwargs: Any) -> torch.Tensor:
+                if "device" in kwargs:
+                    kwargs["device"] = "cpu"
+                if fail_mapping and name == "zeros" and args[0] == 131137:
+                    raise RuntimeError("mapping allocation failed")
+                result = original[name](*args, **kwargs)
+                route.allocations.append((name, route.active, result.numel()))
+                return result
+
+            return allocate
+
+        @contextmanager
+        def on_device(device: torch.device) -> Iterator[None]:
+            previous = route.current_device
+            route.current_device = device
+            try:
+                yield
+            finally:
+                route.current_device = previous
+
+        def create(*, use_on_oom: bool) -> object:
+            self.assertFalse(use_on_oom)
+            self.assertEqual(route.current_device, torch.device(device))
+            return pool
+
+        @contextmanager
+        def use_pool(selected: object, *, device: torch.device) -> Iterator[None]:
+            self.assertIs(selected, pool)
+            route.devices.append(device)
+            previous = route.active
+            route.active = selected
+            try:
+                yield
+            finally:
+                route.active = previous
+
+        with (
+            patch.object(torch.cuda, "MemPool", side_effect=create) as create_pool,
+            patch.object(torch.cuda, "use_mem_pool", side_effect=use_pool),
+            patch.object(torch.cuda, "device", side_effect=on_device),
+            patch.object(torch, "zeros", side_effect=factory("zeros")),
+            patch.object(torch, "tensor", side_effect=factory("tensor")),
+            patch.object(torch, "arange", side_effect=factory("arange")),
+            patch.object(torch, "cat", side_effect=factory("cat")),
+            patch.object(torch, "empty", side_effect=factory("empty")),
+        ):
+            try:
+                allocator = HiSparseTokenToKVPoolAllocator(
+                    size=65536,
+                    page_size=64,
+                    dtype=torch.uint8,
+                    device=torch.device(device),
+                    kvcache=cache,
+                    need_sort=False,
+                )
+            except RuntimeError:
+                self.assertIsNone(route.active)
+                self.assertEqual(route.current_device, torch.device("cuda:7"))
+                self.assertFalse(
+                    hasattr(cache, "full_to_hisparse_device_index_mapping")
+                )
+                create_pool.assert_called_once_with(use_on_oom=False)
+                raise
+            admitted = torch.device(device).type == "cuda" and vmm
+            if admitted:
+                create_pool.assert_called_once_with(use_on_oom=False)
+                self.assertIs(allocator._mapping_mem_pool, pool)
+                self.assertEqual(route.devices, [torch.device(device)])
+                self.assertEqual(
+                    [row for row in route.allocations if row[1] is pool],
+                    [("zeros", pool, 131137)],
+                )
+            else:
+                create_pool.assert_not_called()
+                self.assertIsNone(getattr(allocator, "_mapping_mem_pool", None))
+                self.assertEqual(route.devices, [])
+                self.assertIn(("cat", None, 131137), route.allocations)
+            self.assertIsNone(route.active)
+            self.assertEqual(route.current_device, torch.device("cuda:7"))
+            yield allocator, cache, route
+
+    def test_mapping_owner_preserves_identity_sentinel_growth_and_request_isolation(
+        self,
+    ):
+        for device, vmm in (
+            ("cuda:2", True),
+            ("cuda:2", False),
+            ("cpu", True),
+            ("cpu", False),
+        ):
+            with (
+                self.subTest(device=device, vmm=vmm),
+                self._constructed(device, vmm=vmm) as (allocator, cache, route),
+            ):
+                mapping = allocator.full_to_hisparse_device_index_mapping
+                mapping_pool = getattr(allocator, "_mapping_mem_pool", None)
+                pointer = mapping.data_ptr()
+                self.assertEqual(mapping.shape, (131137,))
+                self.assertEqual(mapping.dtype, torch.int64)
+                self.assertEqual(mapping[-1].item(), -1)
+                self.assertEqual(torch.count_nonzero(mapping[:-1]).item(), 0)
+                self.assertEqual(
+                    cache.full_to_hisparse_device_index_mapping.data_ptr(), pointer
+                )
+                # Actual independent native pages stand in for two request owners.
+                first = allocator.logical_attn_allocator.alloc(64)
+                second = allocator.logical_attn_allocator.alloc(64)
+                first_device = allocator.hisparse_attn_allocator.alloc(64)
+                second_device = allocator.hisparse_attn_allocator.alloc(64)
+                assert first is not None and second is not None
+                assert first_device is not None and second_device is not None
+                mapping[first] = first_device
+                mapping[second] = second_device
+                allocator.free(first)
+                self.assertEqual(torch.count_nonzero(mapping[first]).item(), 0)
+                self.assertTrue(torch.equal(mapping[second], second_device))
+                if vmm:
+                    cast(Any, cache._live_growth_owner).usable_num_tokens = 256
+                    prepared = allocator.prepare_device_growth(256)
+                    self.assertTrue(torch.equal(mapping[second], second_device))
+                    allocator.commit_device_growth(prepared)
+                    self.assertEqual(allocator.hisparse_attn_allocator.size, 256)
+                    self.assertIsNone(route.active)
+                allocator.free(second)
+                self.assertEqual(torch.count_nonzero(mapping[:-1]).item(), 0)
+                allocator.clear()
+                self.assertIs(
+                    getattr(allocator, "_mapping_mem_pool", None), mapping_pool
+                )
+                self.assertIs(allocator.full_to_hisparse_device_index_mapping, mapping)
+                self.assertEqual(mapping.data_ptr(), pointer)
+                self.assertEqual(
+                    cache.full_to_hisparse_device_index_mapping.data_ptr(), pointer
+                )
+                self.assertEqual(mapping[-1].item(), -1)
+                self.assertEqual(torch.count_nonzero(mapping[:-1]).item(), 0)
+
+    def test_mapping_allocation_failure_restores_pool_route(self):
+        with self.assertRaisesRegex(RuntimeError, "mapping allocation failed"):
+            with self._constructed("cuda:2", vmm=True, fail_mapping=True):
+                self.fail("failed mapping must not produce a usable allocator")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
