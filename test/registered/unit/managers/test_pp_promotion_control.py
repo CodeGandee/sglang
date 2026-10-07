@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -299,6 +300,127 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
             owner.get_next_batch_to_run(batch, None)
         owner.hisparse_promotion_controller.consume.assert_called_once_with(1, 9)
         owner.hisparse_coordinator.collect_ready_reqs.assert_not_called()
+
+    def test_actual_promoted_batch_build_and_merge_preserve_native_request_lists(
+        self,
+    ) -> None:
+        """Exercise native construction and merging at the consume boundary."""
+        from sglang.srt.managers.scheduler import Scheduler
+
+        class PlanningObserved(Exception):
+            pass
+
+        def request(rid: str, slot: int, token: int) -> Req:
+            req = Req(
+                rid,
+                "",
+                array("q", [1, 2, 3]),
+                SamplingParams(max_new_tokens=8),
+            )
+            req.req_pool_idx = slot
+            req.output_ids.append(token)
+            return req
+
+        for coordinated, existing_peer in ((True, True), (True, False), (False, True)):
+            with self.subTest(coordinated=coordinated, existing_peer=existing_peer):
+                owner = Scheduler.__new__(Scheduler)
+                owner.device = "cpu"
+                owner.req_to_token_pool = SimpleNamespace(device="cpu")
+                owner.token_to_kv_pool_allocator = None
+                owner.tree_cache = None
+                owner.model_config = SimpleNamespace(
+                    is_encoder_decoder=False, vocab_size=32
+                )
+                owner.enable_overlap = False
+                owner.spec_algorithm = SpeculativeAlgorithm.NONE
+                owner.future_map = MagicMock()
+                setattr(owner, "enable_fpm", False)
+                owner.dllm_config = None
+                owner.chunked_req = None
+                owner.enable_hisparse = True
+                owner._hisparse_pp_mb_id = 1
+                owner._hisparse_pp_visit_id = 9
+                peer = request("B", 4, 20)
+                selected = [request("A", 9, 21), request("C", 12, 22)]
+                for req in selected:
+                    req.hisparse_staging = coordinated
+                committed = tuple(selected)
+                consume = MagicMock(return_value=committed)
+                collect = MagicMock(return_value=selected)
+                coordinator = SimpleNamespace(collect_ready_reqs=collect)
+                expected = ([peer] if existing_peer else []) + selected
+
+                def observe(running: ScheduleBatch) -> None:
+                    self.assertIsInstance(running.reqs, list)
+                    self.assertEqual(len(running.reqs), len(expected))
+                    for actual, original in zip(running.reqs, expected, strict=True):
+                        self.assertIs(actual, original)
+                    self.assertEqual(
+                        running.req_pool_indices.tolist(),
+                        [req.req_pool_idx for req in expected],
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            running.req_pool_indices, running.req_pool_indices_cpu
+                        )
+                    )
+                    self.assertEqual(running.seq_lens.tolist(), [3] * len(expected))
+                    self.assertEqual(running.seq_lens_cpu.tolist(), [3] * len(expected))
+                    self.assertEqual(
+                        running.orig_seq_lens.tolist(), [3] * len(expected)
+                    )
+                    self.assertIs(
+                        running.hisparse_coordinator, owner.hisparse_coordinator
+                    )
+                    self.assertTrue(all(not req.hisparse_staging for req in selected))
+                    raise PlanningObserved()
+
+                # Planner/build/init/merge bodies are real; configuration,
+                # sampling/relay and surrounding callbacks supply CPU fixtures.
+                with (
+                    patch.object(
+                        owner, "process_pending_chunked_abort", return_value=None
+                    ),
+                    patch.object(owner, "_abort_on_waiting_timeout", return_value=None),
+                    patch.object(owner, "_abort_on_running_timeout", return_value=None),
+                    patch.object(owner, "get_new_batch_prefill", side_effect=observe),
+                    patch.object(
+                        owner,
+                        "hisparse_promotion_controller",
+                        SimpleNamespace(consume=consume) if coordinated else None,
+                        create=True,
+                    ),
+                    patch.object(
+                        owner, "hisparse_coordinator", coordinator, create=True
+                    ),
+                    patch(
+                        "sglang.srt.managers.schedule_batch.get_spec",
+                        return_value=SimpleNamespace(speculative_algorithm=None),
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
+                        side_effect=lambda batch, vocab_size: MagicMock(),
+                    ),
+                ):
+                    running = (
+                        owner._build_hisparse_decode_batch([peer])
+                        if existing_peer
+                        else ScheduleBatch(reqs=[])
+                    )
+                    with self.assertRaises(PlanningObserved):
+                        owner.get_next_batch_to_run(running, None)
+                if coordinated:
+                    consume.assert_called_once_with(1, 9)
+                    collect.assert_not_called()
+                else:
+                    consume.assert_not_called()
+                    collect.assert_called_once_with()
+                self.assertEqual(committed, tuple(selected))
+                for actual, original in zip(committed, selected, strict=True):
+                    self.assertIs(actual, original)
+                indices, relay = owner.future_map.stash.call_args.args
+                self.assertEqual(indices.tolist(), [9, 12])
+                self.assertEqual(relay.bonus_tokens.tolist(), [21, 22])
 
     def test_first_stage_serializes_monotonic_episodes_with_batched_admissions(self):
         first = _admission("reuse")

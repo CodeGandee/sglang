@@ -3099,8 +3099,11 @@ class Scheduler(
             if promotion is None:
                 ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             else:
-                ready_reqs = promotion.consume(
-                    self._hisparse_pp_mb_id, self._hisparse_pp_visit_id
+                # The committed decision is immutable; native batches own lists.
+                ready_reqs = list(
+                    promotion.consume(
+                        self._hisparse_pp_mb_id, self._hisparse_pp_visit_id
+                    )
                 )
                 for req in ready_reqs:
                     req.hisparse_staging = False
