@@ -3,15 +3,21 @@
 import pickle
 import unittest
 from array import array
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_components import batch_result_processor
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -393,6 +399,206 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
         owner.mbs = []
         SchedulerPPMixin._pp_prune_finished_hisparse_history(owner)
         peer_history.filter_batch.assert_called_once_with()
+
+
+class TestPrefillStagingBatchNativeBoundary(unittest.TestCase):
+    @staticmethod
+    def _request(rid, *, finished=False, finish_now=False, retracted=False, chunks=0):
+        req = Req.__new__(Req)
+        req.rid = rid
+        req.output_ids = []
+        req.inflight_middle_chunks = chunks
+        req.is_retracted = retracted
+        req._fixture_finished = finished
+        req.finished = lambda: req._fixture_finished
+        req.update_finish_state = lambda: setattr(req, "_fixture_finished", finish_now)
+        req.time_stats = MagicMock()
+        req.return_sampling_mask = False
+        req.grammar = None
+        return req
+
+    @staticmethod
+    def _fixture(
+        reqs,
+        *,
+        selected=True,
+        pp_size=2,
+        disaggregation=DisaggregationMode.NULL,
+        fail_rid=None,
+        fail_finalize=False,
+    ):
+        operations = []
+        admitted = []
+        selections = []
+
+        def admit(req):
+            operations.append(("admit", req.rid))
+            if req.rid == fail_rid:
+                raise RuntimeError("actual admission fixture failed")
+            admitted.append(req)
+
+        def finalize(selected_reqs):
+            operations.append(("finalize", tuple(req.rid for req in selected_reqs)))
+            if fail_finalize:
+                raise RuntimeError("production staging finalization failed")
+            selections.append(selected_reqs)
+
+        coordinator = SimpleNamespace(
+            _pp_promotion_controller=object() if selected else None,
+            admit_request_into_staging=admit,
+            finalize_prefill_staging_batch=finalize,
+        )
+        processor = SimpleNamespace(
+            is_generation=True,
+            server_args=SimpleNamespace(pp_size=pp_size),
+            disaggregation_mode=disaggregation,
+            hisparse_coordinator=coordinator,
+            tree_cache=object(),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=lambda: operations.append(("begin",)),
+                free_group_end=lambda: operations.append(("end",)),
+            ),
+            move_logprobs_to_cpu=lambda **kwargs: None,
+            _validate_pp_skip_output_comm=lambda *args: None,
+            _get_prefill_hidden_capture_mode=lambda *args: None,
+            _maybe_update_reasoning_tokens=lambda *args: None,
+            _maybe_collect_routed_experts=lambda *args: None,
+            _maybe_collect_indexer_topk=lambda *args: None,
+            _maybe_collect_customized_info=lambda *args: None,
+            output_streamer=SimpleNamespace(
+                stream_output=lambda *args: operations.append(("stream", args[2]))
+            ),
+            metrics_reporter=SimpleNamespace(
+                report_prefill_stats=lambda **kwargs: None
+            ),
+        )
+        processor._finalize_hisparse_prefill_staging_batch = MethodType(
+            SchedulerBatchResultProcessor._finalize_hisparse_prefill_staging_batch,
+            processor,
+        )
+        batch = SimpleNamespace(
+            reqs=reqs,
+            decoding_reqs=[],
+            return_hidden_states=False,
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(hidden_states=None),
+            next_token_ids=torch.arange(10, 10 + len(reqs), dtype=torch.int64),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            can_run_cuda_graph=True,
+        )
+        return processor, batch, result, operations, admitted, selections
+
+    @staticmethod
+    def _process(processor, batch, result, *, hisparse=True):
+        with (
+            patch.object(
+                batch_result_processor,
+                "get_memory",
+                return_value=SimpleNamespace(enable_hisparse=hisparse),
+            ),
+            patch.object(batch_result_processor, "maybe_cache_unfinished_req"),
+            patch.object(batch_result_processor, "release_kv_cache"),
+        ):
+            SchedulerBatchResultProcessor.process_batch_result_prefill(
+                processor, batch, result
+            )
+
+    def test_only_successful_completed_prefills_finalize_in_native_order(self):
+        a, b = self._request("a"), self._request("b")
+        decoding = self._request("decoding")
+        chunked = self._request("chunked", chunks=1)
+        finished = self._request("finished", finished=True)
+        finish_now = self._request("finish-now", finish_now=True)
+        retracted = self._request("retracted", retracted=True)
+        processor, batch, result, operations, admitted, selections = self._fixture(
+            [a, decoding, chunked, finished, finish_now, retracted, b]
+        )
+        batch.decoding_reqs = [decoding]
+        self._process(processor, batch, result)
+        self.assertEqual(admitted, [a, b])
+        self.assertEqual(selections, [[a, b]])
+        self.assertEqual(
+            operations[:4],
+            [("begin",), ("admit", "a"), ("admit", "b"), ("finalize", ("a", "b"))],
+        )
+        self.assertEqual(operations[4:], [("end",), ("stream", chunked)])
+        self.assertEqual(chunked.inflight_middle_chunks, 0)
+        self.assertEqual(a.output_ids, [10])
+        self.assertEqual(b.output_ids, [16])
+        self.assertEqual(decoding.output_ids, [11])
+        self.assertEqual(retracted.output_ids, [])
+
+    def test_separate_results_do_not_merge_their_staged_lists(self):
+        lists = []
+        for rid in ("first", "second"):
+            req = self._request(rid)
+            processor, batch, result, _, _, selections = self._fixture([req])
+            self._process(processor, batch, result)
+            lists.append(selections[0])
+            self.assertEqual(selections, [[req]])
+        self.assertIsNot(lists[0], lists[1])
+
+    def test_admission_failure_propagates_without_finalizing_partial_selection(self):
+        a, b = self._request("a"), self._request("b")
+        processor, batch, result, operations, admitted, selections = self._fixture(
+            [a, b], fail_rid="b"
+        )
+        with self.assertRaisesRegex(RuntimeError, "actual admission"):
+            self._process(processor, batch, result)
+        self.assertEqual(admitted, [a])
+        self.assertEqual(selections, [])
+        self.assertEqual(operations, [("begin",), ("admit", "a"), ("admit", "b")])
+
+    def test_unselected_single_stage_and_disaggregation_do_not_finalize(self):
+        for kwargs in (
+            {"selected": False},
+            {"pp_size": 1},
+            {"disaggregation": DisaggregationMode.PREFILL},
+            {"disaggregation": DisaggregationMode.DECODE},
+        ):
+            with self.subTest(**kwargs):
+                req = self._request("ordinary")
+                processor, batch, result, _, admitted, selections = self._fixture(
+                    [req], **kwargs
+                )
+                self._process(processor, batch, result)
+                self.assertEqual(admitted, [req])
+                self.assertEqual(selections, [])
+                self.assertEqual(req.output_ids, [10])
+
+    def test_product_finalization_failure_propagates_without_wait_fallback(self):
+        req = self._request("a")
+        processor, batch, result, operations, admitted, selections = self._fixture(
+            [req], fail_finalize=True
+        )
+        with self.assertRaisesRegex(RuntimeError, "production staging finalization"):
+            self._process(processor, batch, result)
+        self.assertEqual(admitted, [req])
+        self.assertEqual(selections, [])
+        self.assertEqual(operations, [("begin",), ("admit", "a"), ("finalize", ("a",))])
+
+    def test_disabled_hisparse_does_not_stage_or_finalize(self):
+        req = self._request("ordinary")
+        processor, batch, result, _, admitted, selections = self._fixture([req])
+        self._process(processor, batch, result, hisparse=False)
+        self.assertEqual(admitted, [])
+        self.assertEqual(selections, [])
+        self.assertEqual(req.output_ids, [10])
+
+    def test_empty_completed_selection_is_explicit_without_fencing(self):
+        chunked = self._request("chunked", chunks=1)
+        processor, batch, result, _, admitted, selections = self._fixture([chunked])
+        self._process(processor, batch, result)
+        self.assertEqual(admitted, [])
+        self.assertEqual(selections, [[]])
 
 
 if __name__ == "__main__":

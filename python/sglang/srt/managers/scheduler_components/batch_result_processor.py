@@ -7,8 +7,10 @@ from typing import (
     Callable,
     List,
     Optional,
+    Protocol,
     Tuple,
     Union,
+    cast,
 )
 
 import torch
@@ -71,6 +73,10 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+class _HiSparsePrefillStagingFinalizer(Protocol):
+    def finalize_prefill_staging_batch(self, staged_reqs: list[Req]) -> None: ...
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -199,6 +205,14 @@ class SchedulerBatchResultProcessor:
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
+            coordinated_hisparse_pp = (
+                get_memory().enable_hisparse
+                and self.server_args.pp_size > 1
+                and self.disaggregation_mode == DisaggregationMode.NULL
+                and getattr(self.hisparse_coordinator, "_pp_promotion_controller", None)
+                is not None
+            )
+            staged_reqs: list[Req] | None = [] if coordinated_hisparse_pp else None
             if result.copy_done is not None:
                 result.copy_done.synchronize()
             if result.routed_experts_output is not None:
@@ -280,6 +294,8 @@ class SchedulerBatchResultProcessor:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
+                            if staged_reqs is not None:
+                                staged_reqs.append(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
@@ -324,6 +340,9 @@ class SchedulerBatchResultProcessor:
                         )
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+            if staged_reqs is not None:
+                self._finalize_hisparse_prefill_staging_batch(staged_reqs)
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -374,6 +393,26 @@ class SchedulerBatchResultProcessor:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _finalize_hisparse_prefill_staging_batch(self, staged_reqs: list[Req]) -> None:
+        """Finalize the successfully staged suffix from one ordinary PP result.
+
+        Parameters
+        ----------
+        staged_reqs : list of Req
+            Actual successful staging admissions in this result's native order.
+        """
+        if (
+            not get_memory().enable_hisparse
+            or self.server_args.pp_size <= 1
+            or self.disaggregation_mode != DisaggregationMode.NULL
+            or getattr(self.hisparse_coordinator, "_pp_promotion_controller", None)
+            is None
+        ):
+            raise RuntimeError("prefill staging finalization requires coordinated PP")
+        cast(
+            _HiSparsePrefillStagingFinalizer, self.hisparse_coordinator
+        ).finalize_prefill_staging_batch(staged_reqs)
 
     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
