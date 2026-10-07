@@ -135,17 +135,7 @@ class SchedulerPPMixin:
                                 next_first_rank_mb_id, next_mb_id
                             )
                         self._pp_commit_comm_work(self.send_req_work)
-                        if growth_controller is not None:
-                            growth_controller.tick(self, mb_id)
-                        if promotion_controller is not None:
-                            self._pp_prune_finished_hisparse_history()
-                            self._hisparse_pp_mb_id = mb_id
-                            self._hisparse_pp_visit_id = (
-                                getattr(self, "_hisparse_pp_visit_id", -1) + 1
-                            )
-                            promotion_controller.tick(
-                                self, mb_id, visit_id=self._hisparse_pp_visit_id
-                            )
+                        self._pp_tick_hisparse_controls(mb_id)
                     finally:
                         self._hisparse_control_active = False
                         self._hisparse_control_ct += 1
@@ -223,6 +213,28 @@ class SchedulerPPMixin:
                 or not promotion_controller.has_ongoing_requests()
             ):
                 self.on_idle()
+
+    def _pp_tick_hisparse_controls(self: Scheduler, mb_id: int) -> None:
+        """Run growth and promotion at one frozen, already-drained PP boundary."""
+        growth = getattr(self, "hisparse_growth_controller", None)
+        promotion = getattr(self, "hisparse_promotion_controller", None)
+        certificate = None
+        if promotion is not None:
+            self._hisparse_pp_mb_id = mb_id
+            self._hisparse_pp_visit_id = getattr(self, "_hisparse_pp_visit_id", -1) + 1
+            if growth is not None:
+                certificate = growth.tick(
+                    self, mb_id, promotion_visit=self._hisparse_pp_visit_id
+                )
+            self._pp_prune_finished_hisparse_history()
+            promotion.tick(
+                self,
+                mb_id,
+                visit_id=self._hisparse_pp_visit_id,
+                certificate=certificate,
+            )
+        elif growth is not None:
+            growth.tick(self, mb_id)
 
     def _pp_assign_hisparse_admissions(self: Scheduler, requests: list) -> None:
         """Assign PP0 episodes before the actual native broadcast/forward path."""

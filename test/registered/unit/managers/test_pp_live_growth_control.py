@@ -42,6 +42,9 @@ class TestPPLiveGrowthControl(unittest.TestCase):
             mb_metadata=[object(), object()],
             last_rank_comm_queue=[],
         )
+        scheduler._pp_tick_hisparse_controls = lambda mb: (
+            SchedulerPPMixin._pp_tick_hisparse_controls(scheduler, mb)
+        )
         scheduler.init_pp_loop_state = lambda: None
         scheduler.process_input_requests = lambda reqs: calls.append("requests")
         scheduler._pp_commit_comm_work = lambda work: None
@@ -62,11 +65,11 @@ class TestPPLiveGrowthControl(unittest.TestCase):
 
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = drain
         scheduler.hisparse_growth_controller = SimpleNamespace(
-            tick=lambda owner, mb: calls.append("growth")
+            tick=lambda owner, mb, **kwargs: calls.append("growth")
         )
 
         scheduler.hisparse_promotion_controller = SimpleNamespace(
-            tick=lambda owner, mb, visit_id: calls.append("promotion"),
+            tick=lambda owner, mb, visit_id, certificate: calls.append("promotion"),
             has_ongoing_requests=lambda: False,
         )
         scheduler._pp_prune_finished_hisparse_history = lambda: None
@@ -101,6 +104,9 @@ class TestPPLiveGrowthControl(unittest.TestCase):
             calls.append("process")
             self.assertIs(batch, old_target)
             self.assertIs(result, old_result)
+            # Prefill completion can create new pending ownership AFTER the
+            # immediate empty plan. No current-visit proof covers this result.
+            calls.append("late-registration")
 
         scheduler._pp_process_batch_result = process
 
@@ -134,12 +140,43 @@ class TestPPLiveGrowthControl(unittest.TestCase):
                 "launch",
                 "d2h",
                 "process",
+                "late-registration",
                 "wait-launch",
                 "send-proxy",
             ],
         )
         self.assertIs(scheduler.pp_outputs, output_proxy)
         self.assertIs(scheduler.last_mbs[1], old_target)
+
+    def test_next_boundary_reactivates_full_protocol_after_post_plan_registration(self):
+        pending = []
+        calls = []
+        proof = object()
+        owner = SimpleNamespace(_pp_prune_finished_hisparse_history=lambda: None)
+
+        def growth(scheduler, mb, *, promotion_visit):
+            calls.append(("growth", mb, promotion_visit, tuple(pending)))
+            return None if pending else proof
+
+        def promotion(scheduler, mb, *, visit_id, certificate):
+            calls.append(("promotion", mb, visit_id, certificate))
+
+        owner.hisparse_growth_controller = SimpleNamespace(tick=growth)
+        owner.hisparse_promotion_controller = SimpleNamespace(tick=promotion)
+        SchedulerPPMixin._pp_tick_hisparse_controls(owner, 0)
+        # This mutation models the actual later _pp_process_batch_result owner;
+        # the helper must obtain a NEW visit proof, never retain the old token.
+        pending.append("new-exact-owner")
+        SchedulerPPMixin._pp_tick_hisparse_controls(owner, 1)
+        self.assertEqual(
+            calls,
+            [
+                ("growth", 0, 0, ()),
+                ("promotion", 0, 0, proof),
+                ("growth", 1, 1, ("new-exact-owner",)),
+                ("promotion", 1, 1, None),
+            ],
+        )
 
     def test_rank_zero_drains_native_output_once_before_growth_control(self):
         calls = []
@@ -153,6 +190,9 @@ class TestPPLiveGrowthControl(unittest.TestCase):
         scheduler.mbs = [None, None]
         scheduler.send_req_work = []
         scheduler.send_proxy_work = []
+        scheduler._pp_tick_hisparse_controls = lambda mb: (
+            SchedulerPPMixin._pp_tick_hisparse_controls(scheduler, mb)
+        )
         scheduler.init_pp_loop_state = lambda: None
         scheduler.process_input_requests = lambda reqs: calls.append("requests")
         scheduler._pp_commit_comm_work = lambda work: None
@@ -172,7 +212,7 @@ class TestPPLiveGrowthControl(unittest.TestCase):
 
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = drain
         scheduler.hisparse_growth_controller = SimpleNamespace(
-            tick=lambda owner, mb: calls.append("growth")
+            tick=lambda owner, mb, **kwargs: calls.append("growth")
         )
 
         def plan(**kwargs):

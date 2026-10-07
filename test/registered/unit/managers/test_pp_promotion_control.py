@@ -67,6 +67,9 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
                 running_batch=None, batch_to_run=None
             ),
         )
+        owner._pp_tick_hisparse_controls = lambda mb: (
+            SchedulerPPMixin._pp_tick_hisparse_controls(owner, mb)
+        )
         visits = []
 
         def receive():
@@ -77,7 +80,7 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
             visits.append(len(visits))
             return []
 
-        def poll(scheduler, mb, *, visit_id):
+        def poll(scheduler, mb, *, visit_id, certificate):
             self.assertIs(scheduler, owner)
             self.assertEqual(mb, 0)
             self.assertTrue(retained.owned)
@@ -119,6 +122,7 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
 
         calls = []
         outputs = [(object(), None, None), (object(), None, None)]
+        certificates = (object(), object())
         owner = SimpleNamespace(
             ps=SimpleNamespace(pp_rank=0, pp_size=2),
             pp_group=SimpleNamespace(is_last_rank=False),
@@ -134,6 +138,9 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
             _pp_send_pyobj_to_next_stage=lambda *args, **kwargs: [],
             _pp_prune_finished_hisparse_history=lambda: None,
         )
+        owner._pp_tick_hisparse_controls = lambda mb: (
+            SchedulerPPMixin._pp_tick_hisparse_controls(owner, mb)
+        )
         visits = []
 
         def receive():
@@ -148,13 +155,27 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
                 calls.append(("drain", first, next_mb)) or outputs[first]
             )
         )
-        owner.hisparse_growth_controller = SimpleNamespace(
-            tick=lambda scheduler, mb: calls.append(("growth", mb))
-        )
+
+        def grow(scheduler, mb, *, promotion_visit):
+            self.assertIs(scheduler, owner)
+            self.assertEqual(
+                (owner._hisparse_pp_mb_id, owner._hisparse_pp_visit_id),
+                (mb, promotion_visit),
+            )
+            self.assertEqual(promotion_visit, mb)
+            self.assertTrue(owner._hisparse_control_active)
+            calls.append(("growth", mb))
+            return certificates[mb]
+
+        def promote(scheduler, mb, *, visit_id, certificate):
+            self.assertIs(scheduler, owner)
+            self.assertIs(certificate, certificates[mb])
+            self.assertTrue(owner._hisparse_control_active)
+            calls.append(("promotion", mb, visit_id))
+
+        owner.hisparse_growth_controller = SimpleNamespace(tick=grow)
         owner.hisparse_promotion_controller = SimpleNamespace(
-            tick=lambda scheduler, mb, visit_id: calls.append(
-                ("promotion", mb, visit_id)
-            ),
+            tick=promote,
             has_ongoing_requests=lambda: False,
         )
         owner.get_next_batch_to_run = lambda **kwargs: (
