@@ -59,9 +59,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # The allocator retains the pool for the mapping's entire lifetime;
             # main KV backing remains owned by its independent VMM arena.
             with torch.cuda.device(self.device):
+                mapping_device = torch.cuda.current_device()
                 self._mapping_mem_pool = torch.cuda.MemPool(use_on_oom=False)
                 with torch.cuda.use_mem_pool(
-                    self._mapping_mem_pool, device=self.device
+                    self._mapping_mem_pool, device=mapping_device
                 ):
                     self.full_to_hisparse_device_index_mapping = torch.zeros(
                         self._size_full + self.page_size + 1,

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
+import torch.cuda.memory as cuda_memory
 
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -26,27 +27,33 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _MappingPoolRoute:
     active: object | None = None
     allocations: list[tuple[str, object | None, int]] = field(default_factory=list)
-    devices: list[torch.device] = field(default_factory=list)
-    current_device: torch.device = field(default_factory=lambda: torch.device("cuda:7"))
+    devices: list[int] = field(default_factory=list)
+    releases: list[int] = field(default_factory=list)
+    current_device: int = 7
 
 
 class TestHiSparseMappingOwnership(CustomTestCase):
     @contextmanager
     def _constructed(
-        self, device: str, *, vmm: bool, fail_mapping: bool = False
+        self, device: str | torch.device, *, vmm: bool, fail_mapping: bool = False
     ) -> Iterator[
         tuple[
             HiSparseTokenToKVPoolAllocator, HiSparseDSATokenToKVPool, _MappingPoolRoute
         ]
     ]:
         # Real native cache registration and paged allocators; only CUDA storage
-        # creation is routed onto CPU and the unavailable MemPool API is mocked.
+        # creation is routed onto CPU. Torch's real device and use_mem_pool
+        # contexts validate device arguments; only unavailable GPU calls are mocked.
         cache = object.__new__(HiSparseDSATokenToKVPool)
         cache.size = 65536
         backing = SimpleNamespace(usable_num_tokens=128)
         cache._live_growth_owner = cast(KvVmmBufferOwner, backing) if vmm else None
         route = _MappingPoolRoute()
-        pool = object()
+        pool = SimpleNamespace(id=(1, 17))
+        requested_device = torch.device(device)
+        expected_device = (
+            requested_device.index if requested_device.index is not None else 7
+        )
         original = {
             name: getattr(torch, name)
             for name in ("zeros", "tensor", "arange", "cat", "empty")
@@ -64,35 +71,51 @@ class TestHiSparseMappingOwnership(CustomTestCase):
 
             return allocate
 
-        @contextmanager
-        def on_device(device: torch.device) -> Iterator[None]:
+        def exchange_device(index: int) -> int:
             previous = route.current_device
-            route.current_device = device
-            try:
-                yield
-            finally:
-                route.current_device = previous
+            route.current_device = index
+            return previous
 
         def create(*, use_on_oom: bool) -> object:
             self.assertFalse(use_on_oom)
-            self.assertEqual(route.current_device, torch.device(device))
+            self.assertEqual(route.current_device, expected_device)
             return pool
 
-        @contextmanager
-        def use_pool(selected: object, *, device: torch.device) -> Iterator[None]:
-            self.assertIs(selected, pool)
-            route.devices.append(device)
-            previous = route.active
-            route.active = selected
-            try:
-                yield
-            finally:
-                route.active = previous
+        def begin(index: int, pool_id: tuple[int, int]) -> None:
+            self.assertEqual(index, expected_device)
+            self.assertEqual(index, route.current_device)
+            self.assertEqual(pool_id, pool.id)
+            self.assertIsNone(route.active)
+            route.devices.append(index)
+            route.active = pool
+
+        def end(index: int, pool_id: tuple[int, int]) -> None:
+            self.assertEqual(index, expected_device)
+            self.assertEqual(pool_id, pool.id)
+            self.assertIs(route.active, pool)
+            route.active = None
+
+        def release(index: int, pool_id: tuple[int, int]) -> None:
+            self.assertEqual(index, expected_device)
+            self.assertEqual(pool_id, pool.id)
+            self.assertIsNone(route.active)
+            route.releases.append(index)
 
         with (
             patch.object(torch.cuda, "MemPool", side_effect=create) as create_pool,
-            patch.object(torch.cuda, "use_mem_pool", side_effect=use_pool),
-            patch.object(torch.cuda, "device", side_effect=on_device),
+            patch.object(
+                torch.cuda, "current_device", side_effect=lambda: route.current_device
+            ),
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "_exchange_device", side_effect=exchange_device),
+            patch.object(
+                torch.cuda, "_maybe_exchange_device", side_effect=exchange_device
+            ),
+            patch.object(
+                cuda_memory, "_cuda_beginAllocateCurrentThreadToPool", side_effect=begin
+            ),
+            patch.object(cuda_memory, "_cuda_endAllocateToPool", side_effect=end),
+            patch.object(cuda_memory, "_cuda_releasePool", side_effect=release),
             patch.object(torch, "zeros", side_effect=factory("zeros")),
             patch.object(torch, "tensor", side_effect=factory("tensor")),
             patch.object(torch, "arange", side_effect=factory("arange")),
@@ -104,13 +127,14 @@ class TestHiSparseMappingOwnership(CustomTestCase):
                     size=65536,
                     page_size=64,
                     dtype=torch.uint8,
-                    device=torch.device(device),
+                    device=cast(torch.device, device),
                     kvcache=cache,
                     need_sort=False,
                 )
             except RuntimeError:
                 self.assertIsNone(route.active)
-                self.assertEqual(route.current_device, torch.device("cuda:7"))
+                self.assertEqual(route.current_device, 7)
+                self.assertEqual(route.releases, [expected_device])
                 self.assertFalse(
                     hasattr(cache, "full_to_hisparse_device_index_mapping")
                 )
@@ -120,7 +144,8 @@ class TestHiSparseMappingOwnership(CustomTestCase):
             if admitted:
                 create_pool.assert_called_once_with(use_on_oom=False)
                 self.assertIs(allocator._mapping_mem_pool, pool)
-                self.assertEqual(route.devices, [torch.device(device)])
+                self.assertEqual(route.devices, [expected_device])
+                self.assertEqual(route.releases, [expected_device])
                 self.assertEqual(
                     [row for row in route.allocations if row[1] is pool],
                     [("zeros", pool, 131137)],
@@ -131,14 +156,19 @@ class TestHiSparseMappingOwnership(CustomTestCase):
                 self.assertEqual(route.devices, [])
                 self.assertIn(("cat", None, 131137), route.allocations)
             self.assertIsNone(route.active)
-            self.assertEqual(route.current_device, torch.device("cuda:7"))
+            self.assertEqual(route.current_device, 7)
             yield allocator, cache, route
 
     def test_mapping_owner_preserves_identity_sentinel_growth_and_request_isolation(
         self,
     ):
         for device, vmm in (
+            ("cuda", True),
+            (torch.device("cuda"), True),
             ("cuda:2", True),
+            (torch.device("cuda:2"), True),
+            ("cuda", False),
+            (torch.device("cuda"), False),
             ("cuda:2", False),
             ("cpu", True),
             ("cpu", False),
@@ -191,9 +221,13 @@ class TestHiSparseMappingOwnership(CustomTestCase):
                 self.assertEqual(torch.count_nonzero(mapping[:-1]).item(), 0)
 
     def test_mapping_allocation_failure_restores_pool_route(self):
-        with self.assertRaisesRegex(RuntimeError, "mapping allocation failed"):
-            with self._constructed("cuda:2", vmm=True, fail_mapping=True):
-                self.fail("failed mapping must not produce a usable allocator")
+        for device in ("cuda", torch.device("cuda"), "cuda:2"):
+            with (
+                self.subTest(device=device),
+                self.assertRaisesRegex(RuntimeError, "mapping allocation failed"),
+            ):
+                with self._constructed(device, vmm=True, fail_mapping=True):
+                    self.fail("failed mapping must not produce a usable allocator")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
