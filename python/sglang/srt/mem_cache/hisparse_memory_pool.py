@@ -4,8 +4,8 @@ import logging
 from typing import Optional
 
 import torch
-
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, KvBufferDesc
 from sglang.srt.utils import is_cuda, is_hip
@@ -57,6 +57,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             )
         self._live_growth_initial_tokens = live_growth_initial_tokens
         self._live_growth_owner: Optional[KvVmmBufferOwner] = None
+        self._index_metadata_mem_pool: Optional[torch.cuda.MemPool] = None
         try:
             super().__init__(
                 size=size,
@@ -111,6 +112,36 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         # reserved, unbacked tail as the fixed-pool torch.zeros path does.
         for buffer in self.kv_buffer:
             buffer[: self.page_size].zero_()
+
+    @property
+    def index_metadata_mem_pool(self) -> Optional[torch.cuda.MemPool]:
+        """Return the retained pool for static index and device-slot metadata.
+
+        Returns
+        -------
+        torch.cuda.MemPool or None
+            Standard CUDA pool owned by ordinary VMM-backed HiSparse caches.
+            Conventional caches keep their existing allocation path.
+
+        Notes
+        -----
+        The coordinator retains this owner while its two per-layer slot tensors
+        remain live. Main KV backing and dynamic preparation use other owners.
+        """
+        return self._index_metadata_mem_pool
+
+    def _create_index_key_cache(self) -> IndexKeyCache:
+        if self._live_growth_owner is None:
+            return super()._create_index_key_cache()
+        # Keep the final static index buffers out of unrelated model segments.
+        # Do not repurpose the external custom allocator rejected by main VMM.
+        with torch.cuda.device(self.device):
+            device_id = torch.cuda.current_device()
+            self._index_metadata_mem_pool = torch.cuda.MemPool(use_on_oom=False)
+            with torch.cuda.use_mem_pool(
+                self._index_metadata_mem_pool, device=device_id
+            ):
+                return super()._create_index_key_cache()
 
     @property
     def backed_device_tokens(self) -> int:

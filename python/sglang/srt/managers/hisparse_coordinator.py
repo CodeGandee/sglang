@@ -290,18 +290,38 @@ class HiSparseCoordinator:
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
-        self.req_device_buffer_tokens = torch.full(
-            (layer_num, max_num_req_slots, self.padded_buffer_size),
-            -1,
-            dtype=torch.int32,
-            device=device,
+        self._device_slot_mem_pool: Optional[torch.cuda.MemPool] = (
+            self.mem_pool_device.index_metadata_mem_pool
+            if isinstance(self.mem_pool_device, HiSparseDSATokenToKVPool)
+            else None
         )
-        self.req_device_buffer_token_locs = torch.full(
-            (layer_num, max_num_req_slots, self.padded_buffer_size),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        )
+        # These final slot tensors otherwise keep index-containing model
+        # segments selected. Retain their shared static owner independently of
+        # index-buffer clear; other coordinator allocations keep their paths.
+        with (
+            torch.cuda.device(device)
+            if self._device_slot_mem_pool is not None
+            else nullcontext()
+        ):
+            with (
+                torch.cuda.use_mem_pool(
+                    self._device_slot_mem_pool, device=torch.cuda.current_device()
+                )
+                if self._device_slot_mem_pool is not None
+                else nullcontext()
+            ):
+                self.req_device_buffer_tokens = torch.full(
+                    (layer_num, max_num_req_slots, self.padded_buffer_size),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.req_device_buffer_token_locs = torch.full(
+                    (layer_num, max_num_req_slots, self.padded_buffer_size),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
         self._lru_init = torch.arange(
             self.device_buffer_size, dtype=torch.int16, device=device
         )

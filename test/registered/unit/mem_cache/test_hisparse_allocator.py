@@ -1,15 +1,17 @@
+import gc
 import unittest
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Iterator, cast
+from typing import Any, Callable, Iterator, cast
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 import torch.cuda.memory as cuda_memory
-
+from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
@@ -29,6 +31,9 @@ class _MappingPoolRoute:
     allocations: list[tuple[str, object | None, int]] = field(default_factory=list)
     devices: list[int] = field(default_factory=list)
     releases: list[int] = field(default_factory=list)
+    partial_static_tensors: list[weakref.ReferenceType[torch.Tensor]] = field(
+        default_factory=list
+    )
     current_device: int = 7
 
 
@@ -228,6 +233,340 @@ class TestHiSparseMappingOwnership(CustomTestCase):
             ):
                 with self._constructed(device, vmm=True, fail_mapping=True):
                     self.fail("failed mapping must not produce a usable allocator")
+
+
+@dataclass
+class _StaticTestMemPool:
+    id: tuple[int, int]
+
+
+class TestHiSparseStaticMetadataOwnership(CustomTestCase):
+    """Exercise native constructors and real Torch pool/device contexts on CPU."""
+
+    @contextmanager
+    def _environment(
+        self,
+        device: str,
+        *,
+        vmm: bool = True,
+        custom: bool = False,
+        fail_index: bool = False,
+        fail_slots: bool = False,
+    ) -> Iterator[
+        tuple[
+            Callable[[], HiSparseDSATokenToKVPool],
+            Callable[[HiSparseDSATokenToKVPool], HiSparseCoordinator],
+            _MappingPoolRoute,
+            list[Any],
+        ]
+    ]:
+        route = _MappingPoolRoute()
+        expected_device = torch.device(device).index
+        expected_device = 7 if expected_device is None else expected_device
+        original = {
+            name: getattr(torch, name)
+            for name in ("zeros", "tensor", "arange", "cat", "empty", "full")
+        }
+        backings: list[Any] = []
+        pool_count = 0
+
+        class Backing:
+            def __init__(self, **kwargs: Any) -> None:
+                self.closed = False
+                self.usable_num_tokens = 0
+                self.backed_bytes = 0
+                self.growth_routes: list[object | None] = []
+                self.tensors = [
+                    original["zeros"](desc.shape, dtype=kwargs["store_dtype"])
+                    for desc in kwargs["buffer_descs"]
+                ]
+                # Actual native VMM construction happens before index pool routing.
+                self.creation_route = route.active
+                backings.append(self)
+
+            def grow_prefix(self, capacity: int) -> None:
+                self.growth_routes.append(route.active)
+                self.usable_num_tokens = capacity
+                self.backed_bytes = (capacity + 64) * 576 * 2 * 2
+
+            def close(self) -> None:
+                self.closed = True
+
+        def factory(name: str) -> Callable[..., torch.Tensor]:
+            matching_calls = 0
+
+            def allocate(*args: Any, **kwargs: Any) -> torch.Tensor:
+                nonlocal matching_calls
+                shape = args[0] if args else ()
+                is_index = name == "zeros" and shape == (17, 8448)
+                is_slot = name == "full" and shape == (2, 3, 128)
+                if is_index or is_slot:
+                    matching_calls += 1
+                    if matching_calls == 2:
+                        if fail_index and is_index:
+                            raise RuntimeError("index allocation failed")
+                        if fail_slots and is_slot:
+                            raise RuntimeError("slot allocation failed")
+                if "device" in kwargs:
+                    kwargs["device"] = "cpu"
+                result = original[name](*args, **kwargs)
+                if is_index or is_slot:
+                    route.partial_static_tensors.append(weakref.ref(result))
+                route.allocations.append((name, route.active, result.numel()))
+                return result
+
+            return allocate
+
+        def exchange(index: int) -> int:
+            previous = route.current_device
+            route.current_device = index
+            return previous
+
+        def create(*, use_on_oom: bool) -> _StaticTestMemPool:
+            nonlocal pool_count
+            self.assertFalse(use_on_oom)
+            self.assertEqual(route.current_device, expected_device)
+            pool_count += 1
+            return _StaticTestMemPool((1, pool_count))
+
+        def begin(index: int, pool_id: tuple[int, int]) -> None:
+            self.assertIsNone(route.active)
+            self.assertEqual(index, expected_device)
+            self.assertEqual(route.current_device, expected_device)
+            route.active = pool_id
+            route.devices.append(index)
+
+        def end(index: int, pool_id: tuple[int, int]) -> None:
+            self.assertEqual(index, expected_device)
+            self.assertEqual(route.active, pool_id)
+            route.active = None
+
+        def release(index: int, pool_id: tuple[int, int]) -> None:
+            self.assertEqual(index, expected_device)
+            self.assertIsNone(route.active)
+            route.releases.append(index)
+
+        def make_cache() -> HiSparseDSATokenToKVPool:
+            return HiSparseDSATokenToKVPool(
+                size=512,
+                page_size=64,
+                kv_lora_rank=512,
+                dtype=torch.bfloat16,
+                qk_rope_head_dim=64,
+                layer_num=2,
+                device=device,
+                index_head_dim=128,
+                enable_memory_saver=False,
+                kv_cache_dim=576,
+                host_to_device_ratio=2,
+                live_growth_initial_tokens=128 if vmm else None,
+            )
+
+        def make_coordinator(cache: HiSparseDSATokenToKVPool) -> HiSparseCoordinator:
+            allocator = HiSparseTokenToKVPoolAllocator(
+                size=512,
+                page_size=64,
+                dtype=torch.bfloat16,
+                device=cast(torch.device, device),
+                kvcache=cache,
+                need_sort=False,
+            )
+            req_pool = SimpleNamespace(
+                req_to_token=original["zeros"]((3, 512), dtype=torch.int32),
+                max_context_len=512,
+            )
+            return HiSparseCoordinator(
+                req_to_token_pool=cast(Any, req_pool),
+                token_to_kv_pool_allocator=allocator,
+                top_k=64,
+                device_buffer_size=64,
+                device=device,
+                tp_group=None,
+            )
+
+        with (
+            patch.object(torch.cuda, "MemPool", side_effect=create),
+            patch.object(
+                torch.cuda, "current_device", side_effect=lambda: route.current_device
+            ),
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "_exchange_device", side_effect=exchange),
+            patch.object(torch.cuda, "_maybe_exchange_device", side_effect=exchange),
+            patch.object(
+                cuda_memory, "_cuda_beginAllocateCurrentThreadToPool", side_effect=begin
+            ),
+            patch.object(cuda_memory, "_cuda_endAllocateToPool", side_effect=end),
+            patch.object(cuda_memory, "_cuda_releasePool", side_effect=release),
+            patch(
+                "sglang.srt.mem_cache.hisparse_memory_pool.KvVmmBufferOwner", Backing
+            ),
+            patch(
+                "sglang.srt.mem_cache.memory_pool.maybe_init_custom_mem_pool",
+                return_value=(custom, object() if custom else None, None),
+            ),
+            patch(
+                "sglang.srt.managers.hisparse_coordinator.MLATokenToKVPoolHost",
+                return_value=SimpleNamespace(token_stride_size=1152),
+            ),
+            patch(
+                "sglang.srt.managers.hisparse_coordinator.device_module",
+                SimpleNamespace(Stream=lambda: object(), Event=lambda: object()),
+            ),
+            patch.object(torch.distributed, "get_world_size", return_value=1),
+            patch.object(torch, "zeros", side_effect=factory("zeros")),
+            patch.object(torch, "tensor", side_effect=factory("tensor")),
+            patch.object(torch, "arange", side_effect=factory("arange")),
+            patch.object(torch, "cat", side_effect=factory("cat")),
+            patch.object(torch, "empty", side_effect=factory("empty")),
+            patch.object(torch, "full", side_effect=factory("full")),
+        ):
+            yield make_cache, make_coordinator, route, backings
+            self.assertIsNone(route.active)
+            self.assertEqual(route.current_device, 7)
+
+    def test_index_and_only_two_slot_buffers_share_retained_pool(self):
+        for device in ("cuda", "cuda:2"):
+            with (
+                self.subTest(device=device),
+                self._environment(device) as (
+                    make_cache,
+                    make_coordinator,
+                    route,
+                    backings,
+                ),
+            ):
+                cache = make_cache()
+                pool = cache.index_metadata_mem_pool
+                self.assertIsNotNone(pool)
+                self.assertIsNone(backings[0].creation_route)
+                coordinator = make_coordinator(cache)
+                self.assertIs(coordinator._device_slot_mem_pool, pool)
+                self.assertIsNot(
+                    coordinator.token_to_kv_pool_allocator._mapping_mem_pool, pool
+                )
+                assert pool is not None
+                self.assertEqual(
+                    [row for row in route.allocations if row[1] == pool.id],
+                    [("zeros", pool.id, 17 * 8448)] * 2
+                    + [("full", pool.id, 2 * 3 * 128)] * 2,
+                )
+                self.assertEqual(
+                    [buffer.shape for buffer in cache.index_k_with_scale_buffer],
+                    [(17, 8448)] * 2,
+                )
+                self.assertTrue(
+                    all(
+                        buffer.dtype == torch.uint8
+                        for buffer in cache.index_k_with_scale_buffer
+                    )
+                )
+                for tensor in (
+                    coordinator.req_device_buffer_tokens,
+                    coordinator.req_device_buffer_token_locs,
+                ):
+                    self.assertEqual(tensor.shape, (2, 3, 128))
+                    self.assertEqual(tensor.dtype, torch.int32)
+                    self.assertTrue(torch.all(tensor == -1).item())
+                pointers = [x.data_ptr() for x in cache.index_k_with_scale_buffer]
+                cache.index_k_with_scale_buffer[0][0, 0] = 91
+                cache.prepare_device_growth(256)
+                self.assertTrue(
+                    all(value is None for value in backings[0].growth_routes)
+                )
+                self.assertEqual(
+                    [x.data_ptr() for x in cache.index_k_with_scale_buffer], pointers
+                )
+                self.assertEqual(cache.index_k_with_scale_buffer[0][0, 0].item(), 91)
+                self.assertIs(cache.index_metadata_mem_pool, pool)
+                cache._clear_buffers()
+                self.assertTrue(backings[0].closed)
+                self.assertIs(coordinator._device_slot_mem_pool, pool)
+                self.assertEqual(
+                    coordinator.req_device_buffer_tokens[0, 0, 0].item(), -1
+                )
+
+    def test_conventional_cache_and_coordinator_do_not_create_private_index_pool(self):
+        with self._environment("cuda", vmm=False) as (
+            make_cache,
+            make_coordinator,
+            route,
+            backings,
+        ):
+            cache = make_cache()
+            coordinator = make_coordinator(cache)
+            self.assertIsNone(cache.index_metadata_mem_pool)
+            self.assertIsNone(coordinator._device_slot_mem_pool)
+            self.assertEqual(route.devices, [])
+            self.assertEqual(backings, [])
+            self.assertTrue(all(row[1] is None for row in route.allocations))
+
+    def test_index_failure_closes_main_backing_and_restores_device(self):
+        for device in ("cuda", "cuda:2"):
+            with (
+                self.subTest(device=device),
+                self._environment(device, fail_index=True) as (
+                    make_cache,
+                    _,
+                    route,
+                    backings,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "index allocation failed"):
+                    make_cache()
+                self.assertTrue(backings[0].closed)
+                self.assertIsNone(route.active)
+                self.assertEqual(route.current_device, 7)
+                self.assertEqual(len(route.releases), 1)
+                gc.collect()
+                self.assertEqual(len(route.partial_static_tensors), 1)
+                self.assertIsNone(route.partial_static_tensors[0]())
+
+    def test_slot_failure_restores_device_without_closing_borrowed_cache(self):
+        with self._environment("cuda:2", fail_slots=True) as (
+            make_cache,
+            make_coordinator,
+            route,
+            backings,
+        ):
+            cache = make_cache()
+            with self.assertRaisesRegex(RuntimeError, "slot allocation failed"):
+                make_coordinator(cache)
+            self.assertFalse(backings[0].closed)
+            self.assertIsNone(route.active)
+            self.assertEqual(route.current_device, 7)
+            self.assertEqual(len(route.releases), 3)
+            gc.collect()
+            self.assertEqual(len(route.partial_static_tensors), 3)
+            self.assertIsNone(route.partial_static_tensors[-1]())
+            cache._clear_buffers()
+            self.assertTrue(backings[0].closed)
+
+    def test_external_custom_pool_rejected_before_main_or_index_allocation(self):
+        with self._environment("cuda", custom=True) as (make_cache, _, route, backings):
+            with self.assertRaisesRegex(
+                ValueError, "cannot share a custom memory pool"
+            ):
+                make_cache()
+            self.assertEqual(route.devices, [])
+            self.assertEqual(backings, [])
+
+    def test_graph_bound_coordinator_retains_pool_after_cache_clear(self):
+        with self._environment("cuda") as (make_cache, make_coordinator, _, backings):
+            cache = make_cache()
+            coordinator = make_coordinator(cache)
+            pool_reference = weakref.ref(cache.index_metadata_mem_pool)
+            graph_bound_owner = coordinator
+            cache._clear_buffers()
+            self.assertTrue(backings[0].closed)
+            del cache, coordinator
+            gc.collect()
+            self.assertIsNotNone(pool_reference())
+            self.assertEqual(
+                graph_bound_owner.req_device_buffer_tokens[0, 0, 0].item(), -1
+            )
+        del graph_bound_owner
+        gc.collect()
+        self.assertIsNone(pool_reference())
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
