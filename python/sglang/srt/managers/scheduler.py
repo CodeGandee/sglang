@@ -3057,6 +3057,12 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        # PP1 owns ordinary last_batch/result_queue history. Its growth boundary
+        # precedes every admission plan without inventing PP microbatch state or
+        # consuming an outstanding overlap result.
+        growth = getattr(self, "hisparse_growth_controller", None)
+        if self.ps.pp_size == 1 and growth is not None:
+            growth.tick(self, 0)
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:

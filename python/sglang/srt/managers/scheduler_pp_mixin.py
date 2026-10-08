@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import GroupCoordinator, P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -66,6 +66,28 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+
+
+@dataclass
+class PPOutputRelay:
+    """Retain a control-boundary output send until its ordinary native owner.
+
+    Parameters
+    ----------
+    mb_id : int
+        Unchanged native target slot for the relay.
+    output : PPProxyTensors or None
+        Original output operand, retained by identity until adoption.
+    work : list of P2PWork
+        Original send handles, including their tensor-buffer lifetimes.
+    consumed : bool
+        Whether the ordinary output helper has adopted the handles once.
+    """
+
+    mb_id: int
+    output: PPProxyTensors | None
+    work: list[P2PWork]
+    consumed: bool = False
 
 
 class SchedulerPPMixin:
@@ -127,18 +149,21 @@ class SchedulerPPMixin:
                     )
                     self._hisparse_control_active = True
                     try:
-                        # PP0 must drain the previous native output before entering
-                        # blocking CPU control frames. Otherwise the last stage may
-                        # still be waiting for PP0's previous output receive.
-                        if self.ps.pp_rank == 0:
-                            early_output_result = self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                                next_first_rank_mb_id, next_mb_id
-                            )
+                        # Intermediate outputs must be posted before waiting on
+                        # this visit's requests. PP0 also accepts pending last-
+                        # stage sends whose ordinary result slot is not yet due.
+                        early_output_result = self._pp_prepare_hisparse_control_outputs(
+                            mb_id,
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                            visit_id=self._pp_control_visit_id,
+                        )
                         self._pp_commit_comm_work(self.send_req_work)
                         self._pp_tick_hisparse_controls(mb_id)
                     finally:
                         self._hisparse_control_active = False
                         self._hisparse_control_ct += 1
+                        self._pp_control_visit_id += 1
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -236,6 +261,80 @@ class SchedulerPPMixin:
         elif growth is not None:
             growth.tick(self, mb_id)
 
+    def _pp_prepare_hisparse_control_outputs(
+        self: Scheduler,
+        mb_id: int,
+        next_first_rank_mb_id: int,
+        next_mb_id: int,
+        *,
+        visit_id: int,
+    ) -> Optional[
+        Tuple[
+            Optional[PPProxyTensors],
+            Optional[GenerationBatchResult],
+            Optional[torch.Event],
+        ]
+    ]:
+        """Advance native output dependencies before a blocking control visit.
+
+        Parameters
+        ----------
+        mb_id : int
+            Current loop slot, supplied by the native loop.
+        next_first_rank_mb_id : int
+            Native outgoing output target, unchanged by early posting.
+        next_mb_id : int
+            Native slot whose result can be prepared on this visit.
+        visit_id : int
+            Explicit control visit since loop initialization; startup agreement
+            and watchdog counters do not determine this value.
+
+        Returns
+        -------
+        tuple or None
+            PP0's normally prepared result and event. Early accepted output
+            frames remain in the typed inbox until their ordinary target slot.
+            Intermediate sends remain owned until the ordinary helper adopts
+            them; newly posted sends are not waited before a matching receive.
+        """
+        if self.pp_loop_size != self.ps.pp_size:
+            raise RuntimeError("HiSparse PP control requires async depth zero")
+        if self.pp_group.is_first_rank:
+            if visit_id:
+                previous = self.mbs[(mb_id - 1) % self.pp_loop_size]
+                if (
+                    previous is not None
+                    and not previous.forward_mode.is_prebuilt()
+                    and not _pp_can_skip_output_comm(previous)
+                ):
+                    self._pp_control_outputs_expected += 1
+            result = self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                next_first_rank_mb_id, next_mb_id
+            )
+            while self._pp_network_outputs_received < self._pp_control_outputs_expected:
+                tensors = self._pp_receive_tensor_dict(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                )
+                if tensors.get("__msg_type__", "default") != "output":
+                    raise RuntimeError("PP0 control received a non-output frame")
+                self._pp_tensor_dict_inbox["output"].append(tensors)
+                if len(self._pp_tensor_dict_inbox["output"]) > self.pp_loop_size:
+                    raise RuntimeError("PP control output inbox exceeded native slots")
+            return result
+        if not self.pp_group.is_last_rank:
+            relay = self._pp_control_output_relay
+            if relay is not None and not relay.consumed:
+                raise RuntimeError("unconsumed PP output relay at next control visit")
+            self._pp_commit_comm_work(self.send_output_work)
+            operand = self.pp_outputs
+            work = self._pp_post_output_to_next_stage(
+                next_first_rank_mb_id, self.mbs, self.last_rank_comm_queue, operand
+            )
+            self._pp_control_output_relay = PPOutputRelay(
+                next_first_rank_mb_id, operand, work
+            )
+        return None
+
     def _pp_assign_hisparse_admissions(self: Scheduler, requests: list) -> None:
         """Assign PP0 episodes before the actual native broadcast/forward path."""
         if (
@@ -276,21 +375,40 @@ class SchedulerPPMixin:
     def _pp_future_output_requests(
         self: Scheduler, running_batch: Optional[ScheduleBatch] = None
     ) -> Tuple[Req, ...]:
-        """Return every allocated unfinished request once across local PP state."""
+        """Return allocated unfinished ownership across ordinary and PP history.
+
+        Parameters
+        ----------
+        running_batch : ScheduleBatch or None
+            Current planning view, if distinct from the scheduler alias.
+
+        Returns
+        -------
+        tuple of Req
+            Original requests deduplicated by identity across current/last
+            batches, unconsumed ordinary results, staging and PP slots. Reading
+            history neither consumes results nor synchronizes their events.
+        """
         batches = [
             running_batch,
             self.running_batch,
+            self.last_batch,
             *getattr(self, "running_mbs", ()),
             *getattr(self, "mbs", ()),
+            *getattr(self, "last_mbs", ()),
             getattr(self, "cur_batch_for_debug", None),
         ]
+        # Ordinary overlap results retain genuine unfinished ownership even
+        # after the scheduler's running/last aliases have moved on. Reading
+        # this queue neither waits on nor consumes any result or event.
+        batches.extend(batch for batch, _ in getattr(self, "result_queue", ()))
         candidates = [
             req for batch in batches if batch is not None for req in batch.reqs
         ]
         candidates.extend(SchedulerPPMixin._hisparse_pending_requests(self))
         if self.chunked_req is not None:
             candidates.append(self.chunked_req)
-        unique = {}
+        unique: dict[int, Req] = {}
         for req in candidates:
             if not req.finished() and req.kv.kv_allocated_len > 0:
                 unique[id(req)] = req
@@ -703,6 +821,10 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        self._pp_control_visit_id: int = 0
+        self._pp_control_outputs_expected: int = 0
+        self._pp_network_outputs_received: int = 0
+        self._pp_control_output_relay: Optional[PPOutputRelay] = None
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1191,9 +1313,7 @@ class SchedulerPPMixin:
                 return inbox_queue.popleft()
 
         while True:
-            tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
+            tensor_dict = self._pp_receive_tensor_dict(all_gather_group)
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 if received_kind == "default":
@@ -1207,6 +1327,27 @@ class SchedulerPPMixin:
                     f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
+
+    def _pp_receive_tensor_dict(
+        self: Scheduler, all_gather_group: GroupCoordinator | None = None
+    ) -> dict[str, torch.Tensor]:
+        """Receive one native frame and count network outputs before buffering.
+
+        Parameters
+        ----------
+        all_gather_group : GroupCoordinator or None
+            Existing attention TP gather group, unchanged from native receive.
+
+        Returns
+        -------
+        dict
+            Original frame and tensor identities. Typed-inbox consumption does
+            not increment this network counter a second time.
+        """
+        tensors = self.pp_group.recv_tensor_dict(all_gather_group=all_gather_group)
+        if tensors.get("__msg_type__", "default") == "output":
+            self._pp_network_outputs_received += 1
+        return tensors
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
@@ -1318,6 +1459,55 @@ class SchedulerPPMixin:
                 batch.filter_batch()
 
     def _pp_send_output_to_next_stage(
+        self: Scheduler,
+        next_first_rank_mb_id: int,
+        mbs: List[ScheduleBatch],
+        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
+        pp_outputs: PPProxyTensors | None,
+    ) -> List[P2PWork]:
+        """Adopt an early relay once, or post the ordinary native output.
+
+        Parameters
+        ----------
+        next_first_rank_mb_id : int
+            Native output target slot.
+        mbs : list of ScheduleBatch
+            Original loop slots, retained without replacement.
+        last_rank_comm_queue : deque
+            Original last-stage event/output queue.
+        pp_outputs : PPProxyTensors or None
+            Original outgoing operand, unchanged after the control boundary.
+
+        Returns
+        -------
+        list of P2PWork
+            Original native send handles. Their ordinary owner waits and
+            releases buffers at the next native completion boundary.
+        """
+        relay = self._pp_control_output_relay
+        if (
+            not self.pp_group.is_first_rank
+            and not self.pp_group.is_last_rank
+            and relay is not None
+        ):
+            if relay.consumed:
+                raise RuntimeError("PP output relay consumed more than once")
+            if (
+                relay.mb_id != next_first_rank_mb_id
+                or relay.output is not pp_outputs
+                or mbs is not self.mbs
+                or last_rank_comm_queue is not self.last_rank_comm_queue
+            ):
+                raise RuntimeError(
+                    "PP output relay ownership changed before consumption"
+                )
+            relay.consumed = True
+            return relay.work
+        return self._pp_post_output_to_next_stage(
+            next_first_rank_mb_id, mbs, last_rank_comm_queue, pp_outputs
+        )
+
+    def _pp_post_output_to_next_stage(
         self: Scheduler,
         next_first_rank_mb_id: int,
         mbs: List[ScheduleBatch],
