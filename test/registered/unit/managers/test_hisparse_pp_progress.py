@@ -327,10 +327,17 @@ def _progress_worker(
             def get_next_batch_to_run(self, **kwargs: object) -> object:
                 if pending is not None:
                     pending.coordinator.collect_ready_reqs()
+                rows.append(("planner", self.visit))
                 batch = None
                 if self.visit < populated_visits:
                     batch = SimpleNamespace(
-                        reqs=[],
+                        reqs=(
+                            [pending.peer, pending.target]
+                            if pending is not None and self.visit == 0
+                            else [pending.peer]
+                            if pending is not None
+                            else []
+                        ),
                         return_logprob=False,
                         forward_mode=ForwardMode.DECODE,
                         req_pool_indices=torch.tensor([self.visit]),
@@ -454,7 +461,9 @@ def _progress_worker(
             raise AssertionError("early output work was never adopted")
         due_poll = rows.index(("poll", pp_size - 1))
         first_consume = rows.index(("consume", 0))
-        if (first_consume < due_poll) != (controls and pp_rank == 0):
+        if first_consume < due_poll or first_consume < rows.index(
+            ("planner", pp_size - 1)
+        ):
             raise AssertionError(
                 "output processing crossed the wrong native ingress boundary"
             )
@@ -462,9 +471,14 @@ def _progress_worker(
             pending.assert_released()
             polls = [serial for kind, serial in rows if kind == "pending-abort-poll"]
             aborts = [serial for kind, serial in rows if kind == "pending-abort"]
-            if polls != [pp_size - 1] or aborts != polls:
+            if polls != [pp_size] or aborts != polls:
                 raise AssertionError(
-                    "native pending abort missed its due-result visit poll"
+                    "native pending abort missed the next sole ingress poll"
+                )
+            staged = [serial for kind, serial in rows if kind == "pending-stage"]
+            if staged != [pp_size - 1] or polls[0] != staged[0] + 1:
+                raise AssertionError(
+                    "native staging/planning eligibility changed visit"
                 )
             if list(pending.peer.output_ids) != list(range(populated_visits)):
                 raise AssertionError("active peer did not retain every model step")
