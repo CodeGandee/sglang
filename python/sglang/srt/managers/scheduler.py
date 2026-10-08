@@ -4559,10 +4559,10 @@ class Scheduler(
                     self.hisparse_coordinator.retire_pending_promotion(req)
                 self.hisparse_coordinator.retract_req(req)
                 release_kv_cache(req, self.tree_cache, is_insert=False)
-                if getattr(self, "hisparse_promotion_controller", None) is not None:
-                    # No future forward exists for an uncommitted activation.
-                    # Mark its origin history terminal after safe retirement.
-                    req.finished_reason = FINISH_ABORT()
+                # No future forward exists for a retired staging owner under
+                # either handoff policy. Mark retained batch history terminal
+                # only after its transfer, storage and native KV are released.
+                req.finished_reason = FINISH_ABORT()
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(rid=req.rid), req
                 )

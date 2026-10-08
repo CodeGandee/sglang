@@ -153,10 +153,17 @@ class _PendingOwners:
         return values
 
     def release_cached(self, req: Req, **kwargs: object) -> None:
+        if req.finished():
+            raise AssertionError("terminal history mark preceded native KV release")
         self.pool.free(req)
         req.kv = None
 
     def assert_released(self) -> None:
+        if (
+            not self.target.finished()
+            or self.target.finished_reason.to_json()["type"] != "abort"
+        ):
+            raise AssertionError("retired wait staging owner remained unfinished")
         if self.target.req_pool_idx is not None or self.target.kv is not None:
             raise AssertionError("native pending request slot was not released")
         if int(self.pool.req_generation[self.slot]) != self.generation:
@@ -312,6 +319,10 @@ def _progress_worker(
                     for message in requests:
                         scheduler_native.Scheduler.abort_request(self, message)
                         rows.append(("pending-abort", self.visit))
+                        if self._pp_future_output_requests() != (pending.peer,):
+                            raise AssertionError(
+                                "native growth history retained a freed owner or lost its peer"
+                            )
 
             def control(self, owner: object, mb: int) -> None:
                 if owner is not self or mb != self.visit % pp_size:
@@ -319,6 +330,11 @@ def _progress_worker(
                         "native control lost explicit microbatch identity"
                     )
                 rows.append(("control", self.visit))
+                if pending is not None and pending.target.finished():
+                    if self._pp_future_output_requests() != (pending.peer,):
+                        raise AssertionError(
+                            "native control history changed after abort"
+                        )
                 dist.barrier()
                 # The genuine growth controller can flush requests a second
                 # time; generic completion must neither re-post nor consume output.
@@ -482,6 +498,42 @@ def _progress_worker(
                 )
             if list(pending.peer.output_ids) != list(range(populated_visits)):
                 raise AssertionError("active peer did not retain every model step")
+            replacement = Req(
+                "replacement",
+                "",
+                array("q", [11, 12, 13, 14]),
+                SamplingParams(max_new_tokens=16),
+            )
+            pending.pool.alloc([replacement])
+            replacement.kv = ReqKvInfo(kv_allocated_len=4, swa_evicted_seqlen=0)
+            replacement.kv_committed_len = 4
+            replacement.extend_range = SimpleNamespace(end=4)
+            if (
+                replacement.req_pool_idx != pending.slot
+                or int(pending.pool.req_generation[pending.slot])
+                != pending.generation + 1
+            ):
+                raise AssertionError("safe native request-slot reuse lost generation")
+            with patch.object(
+                staging_native,
+                "device_module",
+                SimpleNamespace(Event=_Event, stream=lambda stream: nullcontext()),
+            ):
+                pending.coordinator.admit_request_into_staging(replacement)
+                scheduler_native.Scheduler.abort_request(
+                    owner, AbortReq(rid=pending.target.rid, exact_match=True)
+                )
+            if (
+                pending.coordinator.staging_requests != (replacement,)
+                or replacement.finished()
+                or pending.aborted != [pending.target]
+            ):
+                raise AssertionError("old abort retired a replacement generation")
+            if (
+                pending.peer.req_pool_idx != pending.peer_slot
+                or pending.peer.to_finish is not None
+            ):
+                raise AssertionError("generation reuse affected the active peer")
         if torch.cuda.is_initialized():
             raise AssertionError("CPU progress initialized CUDA")
         (Path(directory) / f"rank-{rank}.pass").write_text(str(len(rows)))
