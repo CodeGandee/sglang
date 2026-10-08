@@ -124,6 +124,37 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                early_output_result = None
+                early_result_processed = False
+                growth_controller = getattr(self, "hisparse_growth_controller", None)
+                promotion_controller = getattr(
+                    self, "hisparse_promotion_controller", None
+                )
+                has_hisparse_control = (
+                    growth_controller is not None or promotion_controller is not None
+                )
+                if has_hisparse_control and get_parallel().pp_async_batch_depth != 0:
+                    raise RuntimeError("HiSparse PP control requires async depth zero")
+                if has_hisparse_control and self.pp_group.is_first_rank:
+                    # PP0 polls tokenizer ingress without a preceding PP receive.
+                    # Complete only the due result here so its staging owner is
+                    # visible to an already queued abort before ready consumption.
+                    # Newer output draining must follow request forwarding: those
+                    # relays can depend on downstream receiving this visit's frame.
+                    early_output_result = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id, next_mb_id
+                        )
+                    )
+                    if self.mbs[next_mb_id] is not None:
+                        _, due_result, due_event = early_output_result
+                        due_event.synchronize()
+                        with torch.profiler.record_function("process_batch_result"):
+                            self._pp_process_batch_result(
+                                self.mbs[next_mb_id], due_result, mb_id=next_mb_id
+                            )
+                        self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                        early_result_processed = True
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
@@ -134,16 +165,7 @@ class SchedulerPPMixin:
                             recv_reqs,
                             async_send=True,
                         )
-                early_output_result = None
-                growth_controller = getattr(self, "hisparse_growth_controller", None)
-                promotion_controller = getattr(
-                    self, "hisparse_promotion_controller", None
-                )
-                if growth_controller is not None or promotion_controller is not None:
-                    if get_parallel().pp_async_batch_depth != 0:
-                        raise RuntimeError(
-                            "HiSparse PP control requires async depth zero"
-                        )
+                if has_hisparse_control:
                     self._hisparse_control_ct = (
                         getattr(self, "_hisparse_control_ct", 0) + 1
                     )
@@ -157,6 +179,7 @@ class SchedulerPPMixin:
                             next_first_rank_mb_id,
                             next_mb_id,
                             visit_id=self._pp_control_visit_id,
+                            prepared_output_result=early_output_result,
                         )
                         self._pp_commit_comm_work(self.send_req_work)
                         self._pp_tick_hisparse_controls(mb_id)
@@ -207,7 +230,7 @@ class SchedulerPPMixin:
                                 next_mb_id,
                             )
                         )
-                if self.mbs[next_mb_id] is not None:
+                if self.mbs[next_mb_id] is not None and not early_result_processed:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
@@ -268,6 +291,13 @@ class SchedulerPPMixin:
         next_mb_id: int,
         *,
         visit_id: int,
+        prepared_output_result: Optional[
+            Tuple[
+                Optional[PPProxyTensors],
+                Optional[GenerationBatchResult],
+                Optional[torch.Event],
+            ]
+        ] = None,
     ) -> Optional[
         Tuple[
             Optional[PPProxyTensors],
@@ -288,6 +318,9 @@ class SchedulerPPMixin:
         visit_id : int
             Explicit control visit since loop initialization; startup agreement
             and watchdog counters do not determine this value.
+        prepared_output_result : tuple or None
+            PP0's exact due-slot result prepared before tokenizer ingress. Reuse
+            its tensors and event without repeating receive or preprocessing.
 
         Returns
         -------
@@ -308,9 +341,11 @@ class SchedulerPPMixin:
                     and not _pp_can_skip_output_comm(previous)
                 ):
                     self._pp_control_outputs_expected += 1
-            result = self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                next_first_rank_mb_id, next_mb_id
-            )
+            result = prepared_output_result
+            if result is None:
+                result = self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                    next_first_rank_mb_id, next_mb_id
+                )
             while self._pp_network_outputs_received < self._pp_control_outputs_expected:
                 tensors = self._pp_receive_tensor_dict(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
