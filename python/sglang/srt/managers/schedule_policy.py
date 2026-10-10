@@ -1127,6 +1127,20 @@ class PrefillAdder:
             cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
                 cand_extend_input_len
             )
+            # HiSparse: decode growth allocates logical (host-backed) indices
+            # only — alloc_decode touches no device pages — so the growth
+            # simulation must budget against the logical pool. cur_rem_tokens is
+            # device-bound for hisparse and would park any ignore_eos request
+            # whose remaining generation exceeds the device pool forever.
+            logical_allocator = getattr(
+                self.token_to_kv_pool_allocator, "logical_attn_allocator", None
+            )
+            if logical_allocator is not None:
+                cur_rem_tokens = (
+                    logical_allocator.available_size()
+                    - self.cur_rem_token_offset
+                    - self.ceil_paged_tokens(cand_extend_input_len)
+                )
             tokens_freed = 0
             for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
                 # tokens_left gives a reservative calculation as the last token is not stored

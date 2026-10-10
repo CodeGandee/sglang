@@ -70,6 +70,9 @@ class TestPrefillAdder(CustomTestCase):
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
+        # Default to a non-hisparse allocator: the hisparse ignore_eos growth
+        # simulation keys off the presence of logical_attn_allocator.
+        allocator.logical_attn_allocator = None
         return allocator
 
     def create_running_batch(self, reqs=None) -> MagicMock:
@@ -376,6 +379,51 @@ class TestPrefillAdder(CustomTestCase):
             adder.rem_total_token_offset, 250
         )  # 50 + 75 + 100 + 125 + 125 - 100 - 125 = 250
         self.assertEqual(running_batch.release_req.call_count, 2)
+
+    def test_ignore_eos_hisparse_growth_budgeted_by_logical_pool(self):
+        """HiSparse: decode growth is host-backed (alloc_decode allocates no
+        device pages), so the ignore_eos growth simulation must budget against
+        the logical pool. A request whose remaining generation exceeds the
+        device pool but fits the logical pool must be admitted — otherwise it
+        parks in the waiting queue forever (plan-9 incident on a800-1679)."""
+        self.mock_token_allocator.available_size.return_value = 140_000
+        logical = MagicMock()
+        logical.available_size.return_value = 1_200_000
+        self.mock_token_allocator.logical_attn_allocator = logical
+
+        adder = self.create_adder(
+            self.create_running_batch([]),
+            rem_chunk_tokens=8192,
+        )
+        req = self.create_mock_req("grow", priority=0, max_new_tokens=245_760)
+        req.full_untruncated_fill_ids = list(range(16_384))
+        req.origin_input_ids = list(range(16_384))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = True
+
+        result = adder.add_one_req_ignore_eos(req)
+
+        self.assertNotEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(len(adder.can_run_list), 1)
+
+    def test_ignore_eos_without_hisparse_stays_device_bound(self):
+        """Same request against a plain (non-hisparse) allocator must still be
+        deferred: the device pool cannot hold the simulated growth."""
+        self.mock_token_allocator.available_size.return_value = 140_000
+
+        adder = self.create_adder(
+            self.create_running_batch([]),
+            rem_chunk_tokens=8192,
+        )
+        req = self.create_mock_req("grow", priority=0, max_new_tokens=245_760)
+        req.full_untruncated_fill_ids = list(range(16_384))
+        req.origin_input_ids = list(range(16_384))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = True
+
+        result = adder.add_one_req_ignore_eos(req)
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
 
     def test_mixed_chunk_prefill_budgets(self):
         self.mock_token_allocator.available_size.return_value = 1000
