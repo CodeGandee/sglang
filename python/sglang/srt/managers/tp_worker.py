@@ -83,6 +83,21 @@ class DFlashTargetForwardHook(Protocol):
     ) -> AbstractContextManager[None]: ...
 
 
+class HiSparseCapacityHook(Protocol):
+    """Explicit ordinary request-capacity boundary supplied by the cache owner."""
+
+    frame: tuple[tuple[str, int, str], ...]
+
+    def forward_scope(
+        self,
+        batch: Optional[ScheduleBatch],
+        forward_batch: ForwardBatch,
+        proxy: Optional[PPProxyTensors],
+    ) -> AbstractContextManager[None]: ...
+
+    def retire_request(self, request: object) -> None: ...
+
+
 class BaseTpWorker(ABC):
     @abstractmethod
     def forward_batch_generation(self, forward_batch: ForwardBatch):
@@ -342,6 +357,7 @@ class TpModelWorker(BaseTpWorker):
         # Draft worker: the attention backend the algorithm resolved for it.
         self.draft_attention_backend = draft_attention_backend
         self.dflash_target_hook: Optional[DFlashTargetForwardHook] = None
+        self.hisparse_capacity_hook: Optional[HiSparseCapacityHook] = None
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -427,6 +443,10 @@ class TpModelWorker(BaseTpWorker):
             - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
+        coordinator = self.model_runner.hisparse_coordinator
+        capacity_factory = getattr(coordinator, "create_capacity_hook", None)
+        if not self.enable_spec and capacity_factory is not None:
+            self.hisparse_capacity_hook = capacity_factory(self)
 
     def init_attention_backends(self):
         """Initialize attention backends for all model runners."""
@@ -535,6 +555,11 @@ class TpModelWorker(BaseTpWorker):
     def register_hisparse_coordinator(self, coordinator):
         self.model_runner.hisparse_coordinator = coordinator
 
+    def prepare_for_kv_cache_release(self, request):
+        """Drop ordinary refusal metadata before native request-slot release."""
+        if self.hisparse_capacity_hook is not None:
+            self.hisparse_capacity_hook.retire_request(request)
+
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
@@ -624,10 +649,17 @@ class TpModelWorker(BaseTpWorker):
             if dflash_hook is not None
             else nullcontext()
         )
-        with scope:
+        capacity_hook = getattr(self, "hisparse_capacity_hook", None)
+        capacity_scope = (
+            capacity_hook.forward_scope(batch, forward_batch, pp_proxy_tensors)
+            if capacity_hook is not None
+            else nullcontext()
+        )
+        with scope, capacity_scope:
             out = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
+        capacity_errors = capacity_hook.frame if capacity_hook is not None else ()
 
         if self.pp_group.is_last_rank:
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
@@ -637,6 +669,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                request_capacity_errors=capacity_errors,
             )
 
             if is_verify:
@@ -691,10 +724,13 @@ class TpModelWorker(BaseTpWorker):
             return batch_result
         else:
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if capacity_hook is not None:
+                pp_proxy_tensors.tensors["hisparse_capacity_errors"] = capacity_errors
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                request_capacity_errors=capacity_errors,
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):

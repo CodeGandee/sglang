@@ -494,7 +494,7 @@ class TestDFlashConnectedLifecycle(TestCase):
         self.assertEqual(order, ["target", "draft", "draft-plan"])
         self.assertIs(worker._capacity_coordinator, coordinator)
         self.assertEqual(
-            coordinator._dflash_capacity_agreement, worker.agree_capacity_refusals
+            coordinator._capacity_agreement, worker.agree_capacity_refusals
         )
         self.assertIs(worker.target_binding._coordinator, coordinator)
 

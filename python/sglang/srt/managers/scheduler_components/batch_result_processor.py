@@ -727,7 +727,9 @@ class SchedulerBatchResultProcessor:
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
             capacity_failed = any(
-                rid == req.rid and epoch == req.dflash_request_epoch
+                rid == req.rid
+                and epoch
+                == (req.dflash_request_epoch or req.hisparse_activation_episode)
                 for rid, epoch, _ in getattr(result, "request_capacity_errors", ())
             )
             if req.is_retracted or req.finished() or capacity_failed:
@@ -909,7 +911,9 @@ class SchedulerBatchResultProcessor:
                 (
                     detail
                     for rid, epoch, detail in getattr(result, "request_capacity_errors", ())
-                    if rid == req.rid and epoch == req.dflash_request_epoch
+                    if rid == req.rid
+                    and epoch
+                    == (req.dflash_request_epoch or req.hisparse_activation_episode)
                 ),
                 None,
             )

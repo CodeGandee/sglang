@@ -1269,6 +1269,8 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        if result.request_capacity_errors:
+            tensor_dict["hisparse_capacity_errors"] = result.request_capacity_errors
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1431,6 +1433,13 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        capacity_errors = pp_outputs.tensors.get("hisparse_capacity_errors", ())
+        if capacity_errors:
+            from predkv_extensions.sglang.hisparse.capacity import (
+                validate_capacity_frame,
+            )
+
+            capacity_errors = validate_capacity_frame(capacity_errors, batch.reqs)
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
@@ -1445,6 +1454,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            request_capacity_errors=capacity_errors,
         )
         return output_result
 
