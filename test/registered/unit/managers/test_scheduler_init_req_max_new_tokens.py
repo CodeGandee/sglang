@@ -50,12 +50,20 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_req_len: int = 128,
         max_total_num_tokens: int = 1024,
         page_size: int = 1,
+        enable_hisparse: bool = False,
+        context_len: int = 1 << 20,
+        hisparse_size_full: int = 8192,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
+        scheduler.enable_hisparse = enable_hisparse
+        scheduler.model_config = SimpleNamespace(context_len=context_len)
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            size_full=hisparse_size_full
+        )
         return scheduler
 
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
@@ -150,6 +158,47 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             req = self._new_req(max_new_tokens=64, min_new_tokens=32)
             self.assertEqual(self._init_and_check(scheduler, req), 16)
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
+
+    def test_hisparse_total_length_budgeted_by_host_pool(self):
+        # HiSparse: the device pool (max_req_len / max_total_num_tokens) must
+        # not bound total request length — only the host-backed logical pool
+        # (size_full) and the model context length do.
+        scheduler = self._new_scheduler(
+            max_req_len=128,
+            max_total_num_tokens=128,
+            enable_hisparse=True,
+            context_len=1 << 20,
+            hisparse_size_full=1024,
+        )
+        req = self._new_req(max_new_tokens=1 << 20, input_len=8)
+        scheduler.init_req_max_new_tokens(req)
+        # total_len_budget = min(context_len - 1, size_full - 1) = 1023;
+        # page term binds: 1023 - paged(8) - page(1) - 1.
+        self.assertEqual(req.sampling_params.max_new_tokens, 1023 - 8 - 1 - 1)
+
+    def test_hisparse_context_len_can_bind_below_host_pool(self):
+        scheduler = self._new_scheduler(
+            max_req_len=128,
+            max_total_num_tokens=128,
+            enable_hisparse=True,
+            context_len=300,
+            hisparse_size_full=1 << 20,
+        )
+        req = self._new_req(max_new_tokens=1 << 20, input_len=8)
+        scheduler.init_req_max_new_tokens(req)
+        # total_len_budget = min(300 - 1, size_full - 1) = 299.
+        self.assertEqual(req.sampling_params.max_new_tokens, 299 - 8 - 1 - 1)
+
+    def test_hisparse_never_exceeds_request(self):
+        scheduler = self._new_scheduler(
+            max_req_len=128,
+            max_total_num_tokens=128,
+            enable_hisparse=True,
+            hisparse_size_full=1 << 20,
+        )
+        req = self._new_req(max_new_tokens=64, input_len=8)
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 64)
 
     def test_admission_rules_sweep(self):
         for page_size in (1, 4, 16):

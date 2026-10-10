@@ -2198,16 +2198,30 @@ class Scheduler(
         # smaller than max_total_num_tokens. Otherwise a request can be accepted
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
+        if self.enable_hisparse:
+            # HiSparse: only the prefill input must be device-resident (that
+            # half is gated by max_req_input_len); decode growth is backed by
+            # the host pool and consumes no device pages (alloc_decode is
+            # logical-only), so the total-length budget is the host-backed
+            # logical pool, not the device pool behind max_req_len /
+            # max_total_num_tokens.
+            total_len_budget = min(
+                self.model_config.context_len - 1,
+                self.token_to_kv_pool_allocator.size_full
+                * get_parallel().attn_dcp_size
+                - 1,
+            )
+            pool_budget = total_len_budget
+        else:
+            total_len_budget = self.max_req_len
+            pool_budget = self.max_total_num_tokens * get_parallel().attn_dcp_size
         paged_input_len = -(-input_len // self.page_size) * self.page_size
         req.sampling_params.max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
-                - paged_input_len
-                - self.page_size
-                - 1,
+                total_len_budget - input_len - 1,
+                pool_budget - paged_input_len - self.page_size - 1,
             ),
         )
         # Clipping above can push max_new_tokens below min_new_tokens, which
