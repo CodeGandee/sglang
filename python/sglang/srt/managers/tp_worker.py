@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from contextlib import AbstractContextManager, nullcontext
+from typing import TYPE_CHECKING, List, Optional, Protocol, Tuple
 
 import torch
 
@@ -69,6 +70,17 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
+
+
+class DFlashTargetForwardHook(Protocol):
+    """Optional explicit boundary around one target forward."""
+
+    def forward_scope(
+        self,
+        batch: Optional[ScheduleBatch],
+        forward_batch: ForwardBatch,
+        is_verify: bool,
+    ) -> AbstractContextManager[None]: ...
 
 
 class BaseTpWorker(ABC):
@@ -329,6 +341,7 @@ class TpModelWorker(BaseTpWorker):
         self.context_length = context_length
         # Draft worker: the attention backend the algorithm resolved for it.
         self.draft_attention_backend = draft_attention_backend
+        self.dflash_target_hook: Optional[DFlashTargetForwardHook] = None
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -605,11 +618,18 @@ class TpModelWorker(BaseTpWorker):
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
-        if self.pp_group.is_last_rank:
+        dflash_hook = getattr(self, "dflash_target_hook", None)
+        scope = (
+            dflash_hook.forward_scope(batch, forward_batch, is_verify)
+            if dflash_hook is not None
+            else nullcontext()
+        )
+        with scope:
             out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
+
+        if self.pp_group.is_last_rank:
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -670,10 +690,6 @@ class TpModelWorker(BaseTpWorker):
 
             return batch_result
         else:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,

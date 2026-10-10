@@ -2117,6 +2117,14 @@ class ServerArgs:
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
         NS("spec"),
     ] = None
+    speculative_dflash_implementation: A[
+        Literal["ours", "original"],
+        Arg(
+            help="DFLASH worker implementation. The maintained extension is the default; select original explicitly for comparison.",
+            choices=["ours", "original"],
+        ),
+        NS("spec"),
+    ] = "ours"
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

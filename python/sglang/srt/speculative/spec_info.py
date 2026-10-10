@@ -261,9 +261,16 @@ class SpeculativeAlgorithm(Enum):
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.
-            from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+            if (
+                getattr(server_args, "speculative_dflash_implementation", "ours")
+                == "original"
+            ):
+                from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
-            return DFlashWorkerV2
+                return DFlashWorkerV2
+            from predkv_extensions.dflash2.worker import DFlashWorker
+
+            return DFlashWorker
 
         if self.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (

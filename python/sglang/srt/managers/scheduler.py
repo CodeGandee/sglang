@@ -3845,8 +3845,16 @@ class Scheduler(
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
+                spec_kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if batch.spec_algorithm.is_dflash()
+                    and self.server_args.speculative_dflash_implementation == "ours"
+                    else {}
+                )
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **spec_kwargs
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3858,11 +3866,28 @@ class Scheduler(
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
+                dflash_pp = (
+                    batch.spec_algorithm.is_dflash()
+                    and self.server_args.speculative_dflash_implementation == "ours"
+                    and self.ps.pp_size > 1
                 )
+                if dflash_pp:
+                    if not batch_result.has_sampled_token_ids and (
+                        self.pp_group.is_last_rank
+                        or batch_result.pp_hidden_states_proxy_tensors is None
+                    ):
+                        raise RuntimeError(
+                            "DFlash2 PP result omitted sampled IDs or stage proxy"
+                        )
+                    # The output ring owns the device tensor until its native
+                    # receive/copy boundary. Copying here would send CPU token
+                    # blocks into PP/TP device transport.
+                else:
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

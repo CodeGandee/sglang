@@ -287,10 +287,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_probs_buf = None
         self._logged_first_verify = False
 
+        draft_args, draft_ps = self.draft_build_inputs(server_args, ps)
         bundle = build_draft_tp_worker(
-            server_args=server_args,
+            server_args=draft_args,
             gpu_id=gpu_id,
-            ps=replace(ps, pp_rank=0),
+            ps=draft_ps,
             nccl_port=nccl_port,
             target_model_config=target_worker.model_runner.model_config,
             algo_label="DFLASH",
@@ -399,6 +400,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+    def draft_build_inputs(self, server_args: ServerArgs, ps: ParallelState):
+        """Return draft-only construction inputs; subclasses may isolate target policy."""
+        return server_args, replace(ps, pp_rank=0)
 
     @property
     def draft_worker(self):

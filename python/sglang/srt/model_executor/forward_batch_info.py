@@ -472,6 +472,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Shared request identities for a DFlash verify block. These are metadata
+    # only; each PP worker resolves its own req-pool slots and generations.
+    dflash_episodes: Optional[tuple[tuple[str, int], ...]] = None
+    dflash_round_ids: Optional[tuple[int, ...]] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA

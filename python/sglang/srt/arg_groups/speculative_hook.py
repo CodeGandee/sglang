@@ -147,6 +147,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
 
+    if server_args.speculative_dflash_implementation not in ("ours", "original"):
+        raise ValueError("DFLASH implementation must be 'ours' or 'original'.")
+
     if not (server_args.device.startswith("cuda") or server_args.device == "npu"):
         raise ValueError(
             "DFLASH speculative decoding only supports CUDA and NPU devices."
@@ -157,10 +160,23 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "Currently DFLASH speculative decoding does not support dp attention."
         )
 
-    if server_args.pp_size != 1:
+    if (
+        server_args.pp_size != 1
+        and server_args.speculative_dflash_implementation == "original"
+    ):
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "The original DFLASH worker only supports pp_size == 1."
         )
+
+    if server_args.pp_size > 1 and server_args.pp_async_batch_depth != 0:
+        raise ValueError(
+            "DFLASH PP uses wait-based handoff; set --pp-async-batch-depth 0."
+        )
+
+    logger.info(
+        "DFLASH implementation: %s",
+        server_args.speculative_dflash_implementation,
+    )
 
     if server_args.speculative_draft_model_path is None:
         raise ValueError(

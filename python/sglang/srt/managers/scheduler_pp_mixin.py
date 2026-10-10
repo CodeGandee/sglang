@@ -1270,6 +1270,10 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+        spec_worker = getattr(self, "draft_worker", None)
+        publish = getattr(spec_worker, "publish_pp_result", None)
+        if publish is not None:
+            publish(tensor_dict, result, batch)
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1402,6 +1406,13 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+
+        spec_worker = getattr(self, "draft_worker", None)
+        rebind = getattr(spec_worker, "rebind_pp_result", None)
+        if rebind is not None:
+            rebound = rebind(self, batch, mb_metadata, pp_outputs)
+            if rebound is not None:
+                return rebound
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1649,6 +1660,9 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+                    # The DFlash proposal hook may enqueue packing after the
+                    # first record. Extend the same native readiness event.
+                    event.record(self.device_module.current_stream())
         return result, event
 
     def get_rids(

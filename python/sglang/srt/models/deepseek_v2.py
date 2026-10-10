@@ -3186,16 +3186,42 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 self.model.layers_to_capture = list(layer_ids)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if not self.pp_group.is_last_rank:
-            return
-
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
+        self.model.layers_to_capture = [
+            layer_id + 1
+            for layer_id in layer_ids
+            if self.model.start_layer <= layer_id + 1 < self.model.end_layer
+        ]
+        # Intermediate stages relay their copied snapshots through the DFlash
+        # worker. Only the final stage returns a packed auxiliary tensor to its
+        # local logits processor.
+        self.capture_aux_hidden_states = self.pp_group.is_last_rank and bool(
+            self.model.layers_to_capture
+        )
 
-        self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+    def create_dflash_target_binding(
+        self,
+        *,
+        feature_ids: List[int],
+        mask_token_id: int,
+        block_size: int,
+        coordinator,
+        checkpoint_dir,
+    ):
+        """Build this model family's binding for the maintained DFlash worker."""
+        from predkv_extensions.glm.dflash2 import GLMTargetBinding
+
+        return GLMTargetBinding(
+            model=self,
+            feature_ids=feature_ids,
+            mask_token_id=mask_token_id,
+            block_size=block_size,
+            coordinator=coordinator,
+            checkpoint_dir=checkpoint_dir,
+        )
 
     def prepare_context_parallel_metadata_for_dcp(
         self,

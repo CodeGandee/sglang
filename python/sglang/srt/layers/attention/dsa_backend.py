@@ -2147,6 +2147,48 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        grouped_owner = self.hisparse_coordinator
+        verify_round = (
+            getattr(getattr(grouped_owner, "_target_kv", None), "_round", None)
+            if grouped_owner is not None
+            else None
+        )
+        if (
+            verify_round is not None
+            and getattr(grouped_owner, "_group_attention", None) is not None
+            and dsa_impl == "flashmla_kv"
+        ):
+            if topk_indices is None:
+                raise RuntimeError("GLM grouped target verify lacks logical selection")
+            batch_size = len(verify_round.owners)
+            query_count = verify_round.block_size
+            selected_group = self._pad_topk_indices(
+                topk_indices, q_nope.shape[0]
+            ).reshape(batch_size, query_count, -1)
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            producer_locs = torch.stack(
+                [owner.scratch[:query_count] for owner in verify_round.owners]
+            )
+            limits = verify_round.committed[:, None] + torch.arange(
+                1, query_count + 1, device=selected_group.device
+            )[None, :]
+            return grouped_owner.attend_group(
+                self,
+                DSAAttnBackend._forward_flashmla_kv,
+                q_all,
+                kv_cache,
+                layer.v_head_dim,
+                layer.scaling,
+                layer,
+                metadata,
+                selected_group,
+                layer.layer_id,
+                producer_locs,
+                verify_round.committed,
+                limits,
+            )
+
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
@@ -2438,6 +2480,37 @@ class DeepseekSparseAttnBackend(
         # Align topk_indices with q dimensions
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
+        grouped_owner = self.hisparse_coordinator
+        if (
+            grouped_owner is not None
+            and getattr(grouped_owner, "_group_attention", None) is not None
+            and self.dsa_decode_impl == "flashmla_kv"
+        ):
+            if topk_indices is None:
+                raise RuntimeError("GLM grouped decode lacks logical selection")
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            batch_size = forward_batch.batch_size
+            producer_locs = grouped_owner.mem_pool_device.full_to_hisparse_device_index_mapping[
+                forward_batch.out_cache_loc.long()
+            ].reshape(batch_size, 1)
+            committed = forward_batch.seq_lens - 1
+            return grouped_owner.attend_group(
+                self,
+                DSAAttnBackend._forward_flashmla_kv,
+                q_all,
+                kv_cache,
+                layer.v_head_dim,
+                layer.scaling,
+                layer,
+                metadata,
+                topk_indices.reshape(batch_size, 1, -1),
+                layer.layer_id,
+                producer_locs,
+                committed,
+                forward_batch.seq_lens[:, None],
+            )
 
         if self.hisparse_coordinator is not None:
             page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(

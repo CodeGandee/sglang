@@ -1,12 +1,22 @@
 """Aux hidden states captured for Eagle3/DFlash draft models."""
 
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 
 # Two representations coexist: models migrated to AuxHiddenStatePacker pass one
 # packed [tokens, K * hidden] tensor, the rest still pass a list of K tensors.
 AuxHiddenStates = Union[torch.Tensor, List[torch.Tensor]]
+
+_aux_append_observer: Optional[Callable[["AuxHiddenStatePacker"], None]] = None
+
+
+def set_aux_append_observer(
+    observer: Optional[Callable[["AuxHiddenStatePacker"], None]],
+) -> None:
+    """Install an explicit post-copy observer for one active DFlash target binding."""
+    global _aux_append_observer
+    _aux_append_observer = observer
 
 
 class AuxHiddenStatePacker:
@@ -36,6 +46,8 @@ class AuxHiddenStatePacker:
         start = self._idx * self._feature_size
         self._buffer[..., start : start + self._feature_size].copy_(hidden)
         self._idx += 1
+        if _aux_append_observer is not None:
+            _aux_append_observer(self)
 
     def __len__(self) -> int:
         return self._idx

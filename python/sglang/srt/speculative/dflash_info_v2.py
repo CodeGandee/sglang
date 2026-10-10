@@ -57,6 +57,16 @@ class DFlashDraftInputV2(SpecInput):
 
     verify_token_budget: Optional[int] = None
 
+    # Maintained PP route. Tensor rows and shared identities travel together;
+    # local req-pool slots are deliberately not serialized between stages.
+    pp_draft_tokens: Optional[torch.Tensor] = None
+    pp_episode_keys: Optional[tuple[tuple[str, int], ...]] = None
+    pp_prefix_lens: Optional[torch.Tensor] = None
+    pp_round_ids: Optional[tuple[int, ...]] = None
+    pp_force_fallback: Optional[tuple[bool, ...]] = None
+    pp_selector_candidate_ids: Optional[torch.Tensor] = None
+    pp_selector_q_rows: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
         # Spec v2 draft state itself does not change token accounting.
@@ -224,6 +234,26 @@ class DFlashDraftInputV2(SpecInput):
         new_indices: torch.Tensor,
         new_indices_cpu: Optional[List[int]] = None,
     ):
+        if self.pp_episode_keys is not None:
+            rows = (
+                new_indices_cpu
+                if new_indices_cpu is not None
+                else new_indices.to("cpu").tolist()
+            )
+            self.pp_episode_keys = tuple(self.pp_episode_keys[i] for i in rows)
+            if self.pp_round_ids is not None:
+                self.pp_round_ids = tuple(self.pp_round_ids[i] for i in rows)
+            if self.pp_force_fallback is not None:
+                self.pp_force_fallback = tuple(self.pp_force_fallback[i] for i in rows)
+            for name in (
+                "pp_draft_tokens",
+                "pp_prefix_lens",
+                "pp_selector_candidate_ids",
+                "pp_selector_q_rows",
+            ):
+                value = getattr(self, name)
+                if value is not None:
+                    setattr(self, name, value[new_indices])
         if self.nxt_kv_lens_cpu is not None:
             if new_indices_cpu is not None:
                 self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices_cpu]
@@ -242,6 +272,26 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = self.hidden_states[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInputV2"):
+        if self.pp_episode_keys is not None or spec_info.pp_episode_keys is not None:
+            if self.pp_episode_keys is None or spec_info.pp_episode_keys is None:
+                raise ValueError("DFlash2 PP merge mixed identified and unidentified rows")
+            self.pp_episode_keys += spec_info.pp_episode_keys
+            for name in ("pp_round_ids", "pp_force_fallback"):
+                left, right = getattr(self, name), getattr(spec_info, name)
+                if left is None or right is None:
+                    raise ValueError(f"DFlash2 PP merge omitted {name}")
+                setattr(self, name, left + right)
+            for name in (
+                "pp_draft_tokens",
+                "pp_prefix_lens",
+                "pp_selector_candidate_ids",
+                "pp_selector_q_rows",
+            ):
+                left, right = getattr(self, name), getattr(spec_info, name)
+                if (left is None) != (right is None):
+                    raise ValueError(f"DFlash2 PP merge omitted {name}")
+                if left is not None:
+                    setattr(self, name, torch.cat((left, right), dim=0))
         if self.nxt_kv_lens_cpu is not None:
             assert spec_info.nxt_kv_lens_cpu is not None
             self.nxt_kv_lens_cpu = torch.cat(
