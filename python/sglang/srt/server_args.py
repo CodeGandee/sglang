@@ -9226,8 +9226,19 @@ class ServerArgs:
 
         if self.pp_size > 1:
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+                and (
+                    self.speculative_algorithm is None
+                    or (
+                        self.speculative_algorithm == "DFLASH"
+                        and self.speculative_dflash_implementation == "ours"
+                        and self.pp_async_batch_depth == 0
+                    )
+                )
+            ), (
+                "Pipeline parallelism requires overlap scheduling disabled and "
+                "ordinary decoding or maintained DFLASH with pp_async_batch_depth=0"
+            )
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "
