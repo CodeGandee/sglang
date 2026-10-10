@@ -447,6 +447,7 @@ class TestDFlashConnectedLifecycle(TestCase):
     def test_native_target_pool_order_binds_late_created_coordinator(self):
         from predkv_extensions.glm.dflash2 import GLMTargetBinding
         from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
         worker, batch, _, _ = self._worker_batch()
         worker.server_args = SimpleNamespace(enable_hisparse=True)
@@ -462,11 +463,16 @@ class TestDFlashConnectedLifecycle(TestCase):
             request_finished=lambda *a: None,
         )
         worker._capacity_coordinator = None
+        worker.draft_model_runner = SimpleNamespace(
+            max_total_num_tokens=128, token_to_kv_pool=SimpleNamespace(size=128)
+        )
+        allocator = SimpleNamespace(size_full=128)
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
-                hisparse_coordinator=None, memory_pool_config=object()
+                hisparse_coordinator=None,
+                memory_pool_config=MemoryPoolConfig(64, max_running_requests=2),
             ),
-            get_memory_pool=lambda: (object(), object()),
+            get_memory_pool=lambda: (object(), allocator),
         )
         order = []
 
