@@ -351,6 +351,7 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
                 )
                 owner.enable_overlap = False
                 owner.spec_algorithm = SpeculativeAlgorithm.NONE
+                owner.model_worker = SimpleNamespace()
                 owner.future_map = MagicMock()
                 setattr(owner, "enable_fpm", False)
                 owner.dllm_config = None

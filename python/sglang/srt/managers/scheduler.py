@@ -3056,7 +3056,9 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
-        # todo hisparse, maybe other info to contain for the new batch
+        prepare_draft = getattr(self.model_worker, "prepare_hisparse_decode_batch", None)
+        if callable(prepare_draft):
+            prepare_draft(batch)
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
