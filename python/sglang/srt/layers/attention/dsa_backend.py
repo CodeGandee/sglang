@@ -2175,7 +2175,7 @@ class DeepseekSparseAttnBackend(
             )[None, :]
             return grouped_owner.attend_group(
                 self,
-                DSAAttnBackend._forward_flashmla_kv,
+                DeepseekSparseAttnBackend._forward_flashmla_kv,
                 q_all,
                 kv_cache,
                 layer.v_head_dim,
@@ -2498,7 +2498,7 @@ class DeepseekSparseAttnBackend(
             committed = forward_batch.seq_lens - 1
             return grouped_owner.attend_group(
                 self,
-                DSAAttnBackend._forward_flashmla_kv,
+                DeepseekSparseAttnBackend._forward_flashmla_kv,
                 q_all,
                 kv_cache,
                 layer.v_head_dim,
