@@ -355,7 +355,10 @@ class SchedulerPPMixin:
                         getattr(self, "_dflash_admission_epoch", 0) + 1
                     )
                     admission.dflash_request_epoch = self._dflash_admission_epoch
-                if getattr(self, "hisparse_promotion_controller", None) is None:
+                if (
+                    getattr(self, "hisparse_coordinator", None) is None
+                    and getattr(self, "hisparse_promotion_controller", None) is None
+                ):
                     continue
                 if admission.hisparse_activation_episode is not None:
                     raise RuntimeError("PP ingress cannot supply a HiSparse episode")

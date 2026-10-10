@@ -55,6 +55,7 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
             ps=SimpleNamespace(pp_rank=0, pp_size=2),
             pp_group=SimpleNamespace(is_last_rank=False),
             pp_loop_size=1,
+            _pp_control_visit_id=0,
             running_mbs=[None],
             last_mbs=[None],
             mbs=[None],
@@ -76,6 +77,15 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
         )
         owner._pp_tick_hisparse_controls = lambda mb: (
             SchedulerPPMixin._pp_tick_hisparse_controls(owner, mb)
+        )
+        # This one-slot fixture isolates retirement polling. Supply the drained
+        # output boundary while the native loop and control tick remain real.
+        owner._pp_prepare_hisparse_control_outputs = (
+            lambda mb, first, next_mb, *, visit_id: (
+                owner._pp_commit_send_output_work_and_preprocess_output_tensors(
+                    first, next_mb
+                )
+            )
         )
         visits = []
 
@@ -132,8 +142,11 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
         certificates = (object(), object())
         owner = SimpleNamespace(
             ps=SimpleNamespace(pp_rank=0, pp_size=2),
-            pp_group=SimpleNamespace(is_last_rank=False),
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=False),
             pp_loop_size=2,
+            _pp_control_visit_id=0,
+            _pp_control_outputs_expected=0,
+            _pp_network_outputs_received=0,
             running_mbs=[None, None],
             last_mbs=[None, None],
             mbs=[None, None],
@@ -147,6 +160,9 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
         )
         owner._pp_tick_hisparse_controls = lambda mb: (
             SchedulerPPMixin._pp_tick_hisparse_controls(owner, mb)
+        )
+        owner._pp_prepare_hisparse_control_outputs = MethodType(
+            SchedulerPPMixin._pp_prepare_hisparse_control_outputs, owner
         )
         visits = []
 
@@ -271,6 +287,7 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
             pass
 
         owner = Scheduler.__new__(Scheduler)
+        owner.ps = SimpleNamespace(pp_rank=0, pp_size=2)
         owner.process_pending_chunked_abort = lambda: None
         owner.enable_fpm = False
         owner._abort_on_waiting_timeout = lambda: None
@@ -324,6 +341,7 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
         for coordinated, existing_peer in ((True, True), (True, False), (False, True)):
             with self.subTest(coordinated=coordinated, existing_peer=existing_peer):
                 owner = Scheduler.__new__(Scheduler)
+                owner.ps = SimpleNamespace(pp_rank=0, pp_size=2)
                 owner.device = "cpu"
                 owner.req_to_token_pool = SimpleNamespace(device="cpu")
                 owner.token_to_kv_pool_allocator = None
@@ -426,7 +444,9 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
         first = _admission("reuse")
         second = _admission("peer")
         owner = SimpleNamespace(
-            ps=SimpleNamespace(pp_rank=0), hisparse_promotion_controller=object()
+            ps=SimpleNamespace(pp_rank=0),
+            hisparse_promotion_controller=object(),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
         )
         messages = [first, BatchTokenizedGenerateReqInput(batch=[second])]
         SchedulerPPMixin._pp_assign_hisparse_admissions(owner, messages)
@@ -446,9 +466,31 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
 
     def test_unselected_ingress_leaves_episode_absent(self):
         req = _admission("ordinary")
-        owner = SimpleNamespace(ps=SimpleNamespace(pp_rank=0))
+        owner = SimpleNamespace(
+            ps=SimpleNamespace(pp_rank=0), spec_algorithm=SpeculativeAlgorithm.NONE
+        )
         SchedulerPPMixin._pp_assign_hisparse_admissions(owner, [req])
         self.assertIsNone(req.hisparse_activation_episode)
+
+    def test_wait_ingress_assigns_episode_without_promotion_controller(self):
+        owner = SimpleNamespace(
+            ps=SimpleNamespace(pp_rank=0),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            hisparse_coordinator=object(),
+            hisparse_promotion_controller=None,
+        )
+        first, peer = _admission("reuse"), _admission("peer")
+        messages = [first, BatchTokenizedGenerateReqInput(batch=[peer])]
+        SchedulerPPMixin._pp_assign_hisparse_admissions(owner, messages)
+        delivered = pickle.loads(pickle.dumps(messages))
+        self.assertEqual(delivered[0].hisparse_activation_episode, 1)
+        self.assertEqual(delivered[1][0].hisparse_activation_episode, 2)
+        replacement = _admission("reuse")
+        SchedulerPPMixin._pp_assign_hisparse_admissions(owner, [replacement])
+        self.assertEqual(replacement.hisparse_activation_episode, 3)
+        self.assertIsNone(replacement.dflash_request_epoch)
+        with self.assertRaisesRegex(RuntimeError, "ingress"):
+            SchedulerPPMixin._pp_assign_hisparse_admissions(owner, [first])
 
     def test_result_origin_is_explicit_before_staging_without_mutating_rows(self):
         request = SimpleNamespace(hisparse_prefill_origin_mb=None)
@@ -476,6 +518,7 @@ class TestPPPromotionNativeBoundary(unittest.TestCase):
         )
         owner = SimpleNamespace(
             running_batch=SimpleNamespace(reqs=[pending]),
+            last_batch=None,
             running_mbs=[],
             mbs=[],
             chunked_req=None,
@@ -572,6 +615,7 @@ class TestPrefillStagingBatchNativeBoundary(unittest.TestCase):
         )
         processor = SimpleNamespace(
             is_generation=True,
+            model_worker=SimpleNamespace(prepare_for_kv_cache_release=MagicMock()),
             server_args=SimpleNamespace(pp_size=pp_size),
             disaggregation_mode=disaggregation,
             hisparse_coordinator=coordinator,
@@ -657,6 +701,9 @@ class TestPrefillStagingBatchNativeBoundary(unittest.TestCase):
         self.assertEqual(b.output_ids, [16])
         self.assertEqual(decoding.output_ids, [11])
         self.assertEqual(retracted.output_ids, [])
+        processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(
+            finish_now
+        )
 
     def test_separate_results_do_not_merge_their_staged_lists(self):
         lists = []
