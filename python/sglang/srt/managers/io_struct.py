@@ -939,6 +939,8 @@ class GenerateReqInput:
 
 
 class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+    # Canonical scheduler ingress assigns this before TP broadcast / PP relay.
+    dflash_request_epoch: Optional[int] = None
     # Assigned by PP0 before native TP broadcast and stage forwarding.
     hisparse_activation_episode: Optional[int] = None
     hisparse_prefill_origin_mb: Optional[int] = None

@@ -88,6 +88,10 @@ class GenerationBatchResult:
 
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
+    # Ordinary sparse-pool refusal, agreed by TP and carried by the PP ring.
+    # Worker failure remains an exception; these are terminal request outcomes.
+    request_capacity_errors: tuple[tuple[str, int, str], ...] = ()
+    dflash_decision_id: Optional[int] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None

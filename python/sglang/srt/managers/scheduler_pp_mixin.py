@@ -337,10 +337,7 @@ class SchedulerPPMixin:
 
     def _pp_assign_hisparse_admissions(self: Scheduler, requests: list) -> None:
         """Assign PP0 episodes before the actual native broadcast/forward path."""
-        if (
-            self.ps.pp_rank != 0
-            or getattr(self, "hisparse_promotion_controller", None) is None
-        ):
+        if self.ps.pp_rank != 0:
             return
         for message in requests:
             admissions = (
@@ -350,6 +347,15 @@ class SchedulerPPMixin:
             )
             for admission in admissions:
                 if not isinstance(admission, TokenizedGenerateReqInput):
+                    continue
+                if self.spec_algorithm.is_dflash():
+                    if admission.dflash_request_epoch is not None:
+                        raise RuntimeError("ingress cannot supply a DFlash2 episode")
+                    self._dflash_admission_epoch = (
+                        getattr(self, "_dflash_admission_epoch", 0) + 1
+                    )
+                    admission.dflash_request_epoch = self._dflash_admission_epoch
+                if getattr(self, "hisparse_promotion_controller", None) is None:
                     continue
                 if admission.hisparse_activation_episode is not None:
                     raise RuntimeError("PP ingress cannot supply a HiSparse episode")

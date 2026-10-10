@@ -2524,6 +2524,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        req.dflash_request_epoch = recv_req.dflash_request_epoch
         req.hisparse_activation_episode = recv_req.hisparse_activation_episode
         req.hisparse_prefill_origin_mb = recv_req.hisparse_prefill_origin_mb
         self._maybe_namespace_elastic_radix_cache(req)

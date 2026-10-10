@@ -674,8 +674,8 @@ class SchedulerBatchResultProcessor:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
-        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+        result.num_correct_drafts_per_req_cpu = [max(x - 1, 0) for x in accept_lens]
+        result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
 
         block_accept_lens = (
             result.block_accept_lens.tolist()
@@ -711,7 +711,11 @@ class SchedulerBatchResultProcessor:
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
-            if req.is_retracted or req.finished():
+            capacity_failed = any(
+                rid == req.rid and epoch == req.dflash_request_epoch
+                for rid, epoch, _ in getattr(result, "request_capacity_errors", ())
+            )
+            if req.is_retracted or req.finished() or capacity_failed:
                 # Nothing to settle: no worker pre-claims the bonus, so
                 # kv_committed_len already holds the committed prefix.
                 pass
@@ -885,6 +889,25 @@ class SchedulerBatchResultProcessor:
 
         for i, req in enumerate(batch.reqs):
             req: Req
+
+            capacity_error = next(
+                (
+                    detail
+                    for rid, epoch, detail in getattr(result, "request_capacity_errors", ())
+                    if rid == req.rid and epoch == req.dflash_request_epoch
+                ),
+                None,
+            )
+            if capacity_error is not None and not req.finished():
+                req.finished_reason = FINISH_ABORT(
+                    message=f"HiSparse capacity error: {capacity_error}",
+                    status_code=503,
+                    err_type="hisparse_capacity_error",
+                )
+                self._handle_finish_state_updated_req(
+                    req, batch, result, i, logits_output
+                )
+                continue
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted

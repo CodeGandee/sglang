@@ -63,6 +63,7 @@ class DFlashDraftInputV2(SpecInput):
     pp_episode_keys: Optional[tuple[tuple[str, int], ...]] = None
     pp_prefix_lens: Optional[torch.Tensor] = None
     pp_round_ids: Optional[tuple[int, ...]] = None
+    pp_anchor_ids: Optional[tuple[int, ...]] = None
     pp_force_fallback: Optional[tuple[bool, ...]] = None
     pp_selector_candidate_ids: Optional[torch.Tensor] = None
     pp_selector_q_rows: Optional[torch.Tensor] = None
@@ -243,6 +244,8 @@ class DFlashDraftInputV2(SpecInput):
             self.pp_episode_keys = tuple(self.pp_episode_keys[i] for i in rows)
             if self.pp_round_ids is not None:
                 self.pp_round_ids = tuple(self.pp_round_ids[i] for i in rows)
+            if self.pp_anchor_ids is not None:
+                self.pp_anchor_ids = tuple(self.pp_anchor_ids[i] for i in rows)
             if self.pp_force_fallback is not None:
                 self.pp_force_fallback = tuple(self.pp_force_fallback[i] for i in rows)
             for name in (
@@ -276,7 +279,7 @@ class DFlashDraftInputV2(SpecInput):
             if self.pp_episode_keys is None or spec_info.pp_episode_keys is None:
                 raise ValueError("DFlash2 PP merge mixed identified and unidentified rows")
             self.pp_episode_keys += spec_info.pp_episode_keys
-            for name in ("pp_round_ids", "pp_force_fallback"):
+            for name in ("pp_round_ids", "pp_force_fallback", "pp_anchor_ids"):
                 left, right = getattr(self, name), getattr(spec_info, name)
                 if left is None or right is None:
                     raise ValueError(f"DFlash2 PP merge omitted {name}")
