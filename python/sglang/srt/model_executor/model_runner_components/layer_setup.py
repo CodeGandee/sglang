@@ -200,6 +200,8 @@ def _assert_pp_mtp_compat(
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
+        # DFlash uses a separate trained draft, not the target's bundled MTP.
+        or spec_algorithm.is_dflash()
         or (
             (not spec_algorithm.is_none())
             and (num_effective_layers == model_num_layers)
