@@ -3004,6 +3004,11 @@ class Scheduler(
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
@@ -4584,6 +4589,11 @@ class Scheduler(
                 if getattr(self, "hisparse_promotion_controller", None) is not None:
                     self.hisparse_coordinator.retire_pending_promotion(req)
                 self.hisparse_coordinator.retract_req(req)
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
                 release_kv_cache(req, self.tree_cache, is_insert=False)
                 # No future forward exists for a retired staging owner under
                 # either handoff policy. Mark retained batch history terminal
@@ -4614,6 +4624,11 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -4634,6 +4649,11 @@ class Scheduler(
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
@@ -4652,6 +4672,11 @@ class Scheduler(
                     req.req_pool_idx is not None
                     or getattr(req, "mamba_pool_idx", None) is not None
                 ):
+                    prepare_release = getattr(
+                        self.model_worker, "prepare_for_kv_cache_release", None
+                    )
+                    if callable(prepare_release):
+                        prepare_release(req)
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 

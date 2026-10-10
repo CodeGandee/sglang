@@ -106,7 +106,7 @@ class TestDFlashConnectedLifecycle(TestCase):
         worker._request_refs = {}
         worker._verified_prefixes = {}
         worker._capacity_errors = {}
-        worker._locally_published_decisions = set()
+        worker._locally_published_decisions = {}
         worker._pp_active = True
         worker._pp_is_last = True
         retired, committed = [], []
@@ -334,6 +334,9 @@ class TestDFlashConnectedLifecycle(TestCase):
             "dflash_new_seq_lens": torch.tensor([11, 12]),
             "dflash_accept_lens": torch.tensor([1, 1]),
             "dflash_decision_id": 7,
+            "dflash_decision_episodes": (("a", 1), ("b", 1)),
+            "dflash_decision_prefixes": (10, 11),
+            "dflash_decision_rounds": (0, 0),
         }
         result = worker.rebind_pp_result(
             None,
@@ -406,3 +409,107 @@ class TestDFlashConnectedLifecycle(TestCase):
         release.assert_called_once()
         self.assertFalse(worker._request_state.contains(RequestEpisode("a", 1)))
         self.assertTrue(worker._request_state.contains(RequestEpisode("b", 1)))
+
+    def test_authoritative_frame_rejects_foreign_prefix_round_before_commit(self):
+        mutations = (
+            {"dflash_decision_episodes": (("b", 1), ("a", 1))},
+            {"dflash_decision_episodes": (("a", 2), ("b", 1))},
+            {"dflash_decision_prefixes": (9, 11)},
+            {"dflash_decision_rounds": (1, 0)},
+            {"dflash_new_seq_lens": torch.tensor([12, 12])},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                worker, batch, _, committed = self._worker_batch()
+                worker._pp_is_last = False
+                worker._decision_id = 0
+                values = {
+                    "next_token_ids": torch.tensor([10, 0, 0, 20, 0, 0]),
+                    "dflash_new_seq_lens": torch.tensor([11, 12]),
+                    "dflash_accept_lens": torch.tensor([1, 1]),
+                    "dflash_decision_id": 7,
+                    "dflash_decision_episodes": (("a", 1), ("b", 1)),
+                    "dflash_decision_prefixes": (10, 11),
+                    "dflash_decision_rounds": (0, 0),
+                }
+                values.update(mutation)
+                with self.assertRaisesRegex(ValueError, "decision"):
+                    worker.rebind_pp_result(
+                        None,
+                        batch,
+                        SimpleNamespace(can_run_cuda_graph=False),
+                        SimpleNamespace(tensors=values),
+                    )
+                self.assertEqual(committed, [])
+                self.assertEqual(batch.seq_lens.tolist(), [10, 11])
+                self.assertEqual([req._dflash_round for req in batch.reqs], [0, 0])
+
+    def test_native_target_pool_order_binds_late_created_coordinator(self):
+        from predkv_extensions.glm.dflash2 import GLMTargetBinding
+        from sglang.srt.managers.scheduler import Scheduler
+
+        worker, batch, _, _ = self._worker_batch()
+        worker.server_args = SimpleNamespace(enable_hisparse=True)
+        native_model = SimpleNamespace(
+            config=SimpleNamespace(num_hidden_layers=8),
+            model=SimpleNamespace(start_layer=0, end_layer=8),
+        )
+        worker.target_binding = GLMTargetBinding(native_model, (1, 4), 7, 3)
+        coordinator = SimpleNamespace(
+            begin_verify=lambda *a: None,
+            finish_verify=lambda: None,
+            commit_verified=lambda *a, **kw: None,
+            request_finished=lambda *a: None,
+        )
+        worker._capacity_coordinator = None
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                hisparse_coordinator=None, memory_pool_config=object()
+            ),
+            get_memory_pool=lambda: (object(), object()),
+        )
+        order = []
+
+        def target_ready():
+            order.append("target")
+            worker.target_worker.model_runner.hisparse_coordinator = coordinator
+
+        worker.init_hicache_draft_plan = lambda: order.append("draft-plan")
+        scheduler = SimpleNamespace(
+            init_target_memory_pool=target_ready,
+            tp_worker=worker.target_worker,
+            draft_worker=worker,
+        )
+        with (
+            patch.object(
+                DFlashWorkerV2,
+                "alloc_memory_pool",
+                side_effect=lambda **kw: order.append("draft"),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.kv_cache_builder.resolve_decode_retraction_backup"
+            ),
+        ):
+            Scheduler.init_memory_pools(scheduler)
+        self.assertEqual(order, ["target", "draft", "draft-plan"])
+        self.assertIs(worker._capacity_coordinator, coordinator)
+        self.assertEqual(
+            coordinator._dflash_capacity_agreement, worker.agree_capacity_refusals
+        )
+        self.assertIs(worker.target_binding._coordinator, coordinator)
+
+    def test_target_binding_receives_real_integer_frontiers(self):
+        from predkv_extensions.glm.hisparse.kv import KVFrontier
+
+        worker, batch, _, _ = self._worker_batch()
+        accepted = []
+
+        def strict_commit(requests, frontiers, decision_id, **kw):
+            for index, end in enumerate(frontiers):
+                accepted.append(
+                    KVFrontier(10 + index, 13 + index, 20 + index).accept(end)
+                )
+
+        worker.target_binding = SimpleNamespace(commit_verified=strict_commit)
+        worker._commit_target_decision(batch, torch.tensor([11, 12]), 1)
+        self.assertEqual([value.committed for value in accepted], [11, 12])

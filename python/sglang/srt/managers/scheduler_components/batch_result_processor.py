@@ -112,6 +112,11 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -288,6 +293,11 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        prepare_release = getattr(
+                            self.model_worker, "prepare_for_kv_cache_release", None
+                        )
+                        if callable(prepare_release):
+                            prepare_release(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -372,6 +382,11 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
+                        prepare_release = getattr(
+                            self.model_worker, "prepare_for_kv_cache_release", None
+                        )
+                        if callable(prepare_release):
+                            prepare_release(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
@@ -1146,16 +1161,16 @@ class SchedulerBatchResultProcessor:
             else:
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
                     if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()

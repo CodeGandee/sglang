@@ -92,6 +92,9 @@ class GenerationBatchResult:
     # Worker failure remains an exception; these are terminal request outcomes.
     request_capacity_errors: tuple[tuple[str, int, str], ...] = ()
     dflash_decision_id: Optional[int] = None
+    dflash_decision_episodes: Optional[tuple[tuple[str, int], ...]] = None
+    dflash_decision_prefixes: Optional[tuple[int, ...]] = None
+    dflash_decision_rounds: Optional[tuple[int, ...]] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
