@@ -190,7 +190,8 @@ class TestDFlashConnectedLifecycle(TestCase):
         block, fallback = worker._pp_prepare_live_block(draft, batch)
         self.assertEqual(block.tolist(), [[8, 99, 99], [3, 4, 5]])
         self.assertEqual(fallback, (0,))
-        self.assertEqual(retired, [old])
+        self.assertEqual(retired, [])
+        self.assertNotIn(old, worker._request_refs.values())
 
     def test_capacity_commit_preserves_peer_and_duplicate_decision_rejects(self):
         from predkv_extensions.dflash2.state import RequestEpisode
@@ -323,3 +324,85 @@ class TestDFlashConnectedLifecycle(TestCase):
         self.assertEqual((failed.kv_committed_len, healthy.kv_committed_len), (10, 12))
         self.assertEqual((failed.spec_verify_ct, healthy.spec_verify_ct), (0, 1))
         self.assertEqual(result.num_correct_drafts_per_req_cpu, [0, 1])
+
+    def test_native_rebind_constructs_maintained_result_abi(self):
+        worker, batch, _, _ = self._worker_batch()
+        worker._pp_is_last = False
+        worker._decision_id = 0
+        values = {
+            "next_token_ids": torch.tensor([10, 0, 0, 20, 0, 0]),
+            "dflash_new_seq_lens": torch.tensor([11, 12]),
+            "dflash_accept_lens": torch.tensor([1, 1]),
+            "dflash_decision_id": 7,
+        }
+        result = worker.rebind_pp_result(
+            None,
+            batch,
+            SimpleNamespace(can_run_cuda_graph=False),
+            SimpleNamespace(tensors=values),
+        )
+        self.assertEqual(result.accept_lens.tolist(), [1, 1])
+        self.assertEqual(result.new_seq_lens.tolist(), [11, 12])
+        with self.assertRaisesRegex(ValueError, "decision"):
+            worker.rebind_pp_result(
+                None,
+                batch,
+                SimpleNamespace(can_run_cuda_graph=False),
+                SimpleNamespace(tensors=values),
+            )
+
+    def test_real_finished_handler_cleans_target_once_then_dflash_state(self):
+        from predkv_extensions.dflash2.state import RequestEpisode
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+
+        worker, batch, _, _ = self._worker_batch()
+        request = batch.reqs[0]
+        request.finished = lambda: True
+        request.finished_reason = FINISH_ABORT()
+        request.multimodal_inputs = None
+        request.session = None
+        request.time_stats = SimpleNamespace(set_completion_time=lambda: None)
+        batch.mamba_track_mask_cpu = None
+        cleanups = []
+
+        def cleanup(req):
+            if cleanups:
+                raise ValueError("target request already retired")
+            cleanups.append(req)
+
+        worker.target_binding = SimpleNamespace(retire_request=cleanup)
+        processor = SimpleNamespace(
+            _mamba_prefix_cache_update=lambda *a, **kw: None,
+            _maybe_collect_routed_experts=lambda *a: None,
+            _maybe_collect_indexer_topk=lambda *a: None,
+            _maybe_collect_customized_info=lambda *a: None,
+            draft_worker=None,
+            model_worker=worker,
+            hisparse_coordinator=SimpleNamespace(request_finished=cleanup),
+            tree_cache=object(),
+        )
+        module = "sglang.srt.managers.scheduler_components.batch_result_processor"
+        with (
+            patch(module + ".mamba_extra_buffer_lazy_enabled", return_value=False),
+            patch(
+                module + ".get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_enable_offload_kvcache=False
+                ),
+            ),
+            patch(
+                module + ".get_memory",
+                return_value=SimpleNamespace(enable_hisparse=True),
+            ),
+            patch(module + ".release_kv_cache") as release,
+        ):
+            SchedulerBatchResultProcessor._handle_finish_state_updated_req(
+                processor, request, batch, None, 0, None
+            )
+        self.assertEqual(cleanups, [request])
+        release.assert_called_once()
+        self.assertFalse(worker._request_state.contains(RequestEpisode("a", 1)))
+        self.assertTrue(worker._request_state.contains(RequestEpisode("b", 1)))
