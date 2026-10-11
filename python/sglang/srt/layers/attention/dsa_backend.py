@@ -2075,6 +2075,18 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        grouped_owner = self.hisparse_coordinator
+        verify_round = (
+            getattr(getattr(grouped_owner, "_target_kv", None), "_round", None)
+            if grouped_owner is not None
+            else None
+        )
+        if verify_round is not None:
+            if not forward_batch.forward_mode.is_target_verify():
+                raise RuntimeError(
+                    "active target verification round entered non-verify forward"
+                )
+
         dsa_impl = (
             self.dsa_decode_impl
             if (
@@ -2147,14 +2159,9 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
-        grouped_owner = self.hisparse_coordinator
-        verify_round = (
-            getattr(getattr(grouped_owner, "_target_kv", None), "_round", None)
-            if grouped_owner is not None
-            else None
-        )
         if (
-            verify_round is not None
+            forward_batch.forward_mode.is_target_verify()
+            and verify_round is not None
             and getattr(grouped_owner, "_group_attention", None) is not None
             and dsa_impl == "flashmla_kv"
         ):
