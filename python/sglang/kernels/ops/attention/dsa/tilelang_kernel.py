@@ -344,10 +344,11 @@ def sparse_attention_fwd_kernel_v1(
             alpha = T.alloc_fragment([H_per_block], accum_dtype)
             m_i = T.alloc_fragment([H_per_block], accum_dtype)
             m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i_safe = T.alloc_fragment([H_per_block], accum_dtype)
 
             T.fill(acc_o, 0)
             T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
+            T.fill(m_i, -T.infinity(accum_dtype))
 
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
@@ -363,7 +364,8 @@ def sparse_attention_fwd_kernel_v1(
             for i_i in T.Pipelined(NI, num_stages=num_stages):
 
                 for bi_i in T.Parallel(BI):
-                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
+                    selected = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
+                    mask[bi_i] = (selected >= 0) & (selected < seq_len_kv)
 
                 for bi_i, d_i in T.Parallel(BI, D):
                     KV_shared[bi_i, d_i] = KV[
@@ -395,10 +397,15 @@ def sparse_attention_fwd_kernel_v1(
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
                 for h_i in T.Parallel(H_per_block):
-                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                    # Keep the true empty maximum, but avoid -inf - -inf while
+                    # processing an empty prefix before a later valid tile.
+                    m_i_safe[h_i] = T.if_then_else(
+                        m_i[h_i] == -T.infinity(accum_dtype), 0, m_i[h_i]
+                    )
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i_safe[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.exp2(
-                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                        acc_s[h_i, bi_i] * sm_scale - m_i_safe[h_i] * sm_scale
                     )
                 T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
                 for h_i in T.Parallel(H_per_block):
@@ -411,7 +418,9 @@ def sparse_attention_fwd_kernel_v1(
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
+                acc_o[h_i, d_i] = T.if_then_else(
+                    sumexp[h_i] > 0, acc_o[h_i, d_i] / sumexp[h_i], 0
+                )
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 
@@ -1380,9 +1389,20 @@ def tilelang_sparse_fwd(
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
-        kernel = sparse_attention_fwd_kernel_v2(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
-        )
+        if q.device.type == "cuda" and torch.cuda.get_device_capability(q.device) == (8, 0):
+            if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+                raise ValueError(
+                    "SM80 TileLang sparse attention requires BF16 queries and KV."
+                )
+            # The v1 Tensor layout is compact; native callers normally already are.
+            q, kv, indices = q.contiguous(), kv.contiguous(), indices.contiguous()
+            kernel = sparse_attention_fwd_kernel_v1(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
+            )
+        else:
+            kernel = sparse_attention_fwd_kernel_v2(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+            )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
