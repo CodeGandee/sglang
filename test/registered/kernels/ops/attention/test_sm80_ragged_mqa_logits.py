@@ -390,6 +390,7 @@ class TestSM80RaggedGPU(CustomTestCase):
         for chunk in (False, True):
             owner = SimpleNamespace(
                 index_topk=2048,
+                _MQA_LOGITS_BYTES_PER_ELEM=4,
                 ragged_mqa_logits_backend=DSARaggedMQALogitsBackend.TORCH_SM80,
                 _with_real_sm_count=contextlib.nullcontext,
                 _mask_init_and_local_tokens=lambda *args: None,
