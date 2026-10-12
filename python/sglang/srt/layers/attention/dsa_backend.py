@@ -325,6 +325,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "fa3",
     "tilelang",
     "trtllm",
+    "triton-sm80",
 ]
 
 
@@ -352,6 +353,23 @@ class DeepseekSparseAttnBackend(
         super().__init__()
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
+        if model_runner.server_args.dsa_prefill_backend == "triton-sm80":
+            raise ValueError("SM80 sparse-MLA is a decode-only backend.")
+        if model_runner.server_args.dsa_decode_backend == "triton-sm80":
+            from sglang.kernels.ops.attention.dsa.sparse_mla_decode_sm80 import (
+                validate_sm80_sparse_mla_config,
+            )
+
+            validate_sm80_sparse_mla_config(
+                device=torch.device(self.device),
+                prefill_backend=model_runner.server_args.dsa_prefill_backend,
+                kv_dtype=model_runner.token_to_kv_pool.dtype,
+                hisparse=(
+                    model_runner.server_args.enable_hisparse
+                    or model_runner.hisparse_coordinator is not None
+                ),
+                speculative=model_runner.server_args.speculative_algorithm is not None,
+            )
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             model_runner.server_args.dsa_paged_mqa_logits_backend
         )
@@ -2087,7 +2105,14 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
+        if self.dsa_prefill_impl == "triton-sm80" or (
+            self.dsa_decode_impl == "triton-sm80"
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+        ):
+            raise NotImplementedError("SM80 sparse-MLA supports ordinary decode only.")
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2446,7 +2471,33 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.dsa_decode_impl == "triton-sm80":
+            from sglang.kernels.ops.attention.dsa.sparse_mla_decode_sm80 import (
+                _require_sm80,
+            )
 
+            _require_sm80(q.device)
+            if (
+                not forward_batch.forward_mode.is_decode_or_idle()
+                or self.hisparse_coordinator is not None
+            ):
+                raise NotImplementedError(
+                    "SM80 sparse-MLA requires ordinary resident decode."
+                )
+            if (
+                self.token_to_kv_pool.dtype != torch.bfloat16
+                or any(
+                    tensor is not None and tensor.dtype != torch.bfloat16
+                    for tensor in (q, k, q_rope, k_rope)
+                )
+                or any(
+                    tensor is not None and tensor.device != q.device
+                    for tensor in (k, q_rope, k_rope)
+                )
+                or layer.v_head_dim != 512
+                or layer.head_dim != 576
+            ):
+                raise ValueError("SM80 sparse-MLA requires BF16 queries/KV and dimensions 512+64.")
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2552,7 +2603,20 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        if self.dsa_decode_impl == "flashmla_sparse":
+        if self.dsa_decode_impl == "triton-sm80":
+            from sglang.kernels.ops.attention.dsa.sparse_mla_decode_sm80 import (
+                sparse_mla_decode_sm80,
+            )
+
+            return sparse_mla_decode_sm80(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=layer.scaling,
+                d_v=layer.v_head_dim,
+            ).squeeze(0)
+        elif self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(

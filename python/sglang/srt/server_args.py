@@ -358,6 +358,7 @@ DSA_CHOICES = [
     "trtllm",
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
+DSA_DECODE_CHOICES = [*DSA_CHOICES, "triton-sm80"]
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
@@ -1809,8 +1810,8 @@ class ServerArgs:
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
-            choices=DSA_CHOICES,
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. 'triton-sm80' explicitly selects resident BF16 ordinary decode on SM80.",
+            choices=DSA_DECODE_CHOICES,
             resolvable=True,
         ),
         NS("exec.kernel"),
@@ -8825,7 +8826,7 @@ class ServerArgs:
             new_flag="--dsa-decode-backend",
             default=argparse.SUPPRESS,
             type=str,
-            choices=DSA_CHOICES,
+            choices=DSA_DECODE_CHOICES,
             help="[Deprecated] Use --dsa-decode-backend instead.",
         )
         parser.add_argument(
