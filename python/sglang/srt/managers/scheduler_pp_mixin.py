@@ -237,6 +237,9 @@ class SchedulerPPMixin:
                 promotion_controller is None
                 or not promotion_controller.has_ongoing_requests()
             ):
+                if getattr(self, "enable_hisparse", False):
+                    # The final output installs its history after result processing.
+                    self._pp_prune_finished_hisparse_history()
                 self.on_idle()
 
     def _pp_tick_hisparse_controls(self: Scheduler, mb_id: int) -> None:

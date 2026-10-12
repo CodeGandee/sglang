@@ -14,8 +14,13 @@ from sglang.srt.managers.hisparse_coordinator import (  # noqa: E402
     HiSparseCoordinator,
 )
 from sglang.srt.managers.io_struct import AbortReq, ShutdownReq  # noqa: E402
-from sglang.srt.managers.schedule_batch import Req  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    FINISH_LENGTH,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -32,6 +37,7 @@ def _scheduler_for_abort(staged_req: object, *, duplicate_in_last_batch: bool):
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.dllm_config = None
     scheduler.grammar_manager = MagicMock()
+    scheduler.model_worker = SimpleNamespace()
     scheduler.ps = SimpleNamespace(pp_size=1)
     scheduler.running_batch = SimpleNamespace(reqs=[])
     scheduler.last_batch = (
@@ -235,6 +241,107 @@ class TestSchedulerHiSparseAbort(unittest.TestCase):
 
 
 class TestSchedulerHiSparseAdmission(unittest.TestCase):
+    def test_ordinary_pp_final_output_history_is_pruned_before_idle_flush(self) -> None:
+        class StopLoop(Exception):
+            pass
+
+        request = Req.__new__(Req)
+        request.finished_reason = None
+        final_output = ScheduleBatch(reqs=[request])
+        empty = ScheduleBatch(reqs=[])
+        owner = _scheduler_for_admission(hisparse=True, staged_reqs=())
+        owner.hisparse_coordinator.has_ongoing_staging.return_value = False
+        owner.hisparse_growth_controller = None
+        owner.hisparse_promotion_controller = None
+        owner.ps = SimpleNamespace(pp_size=3)
+        owner.pp_group = SimpleNamespace(is_last_rank=True)
+        owner.pp_loop_size = 2
+        owner.running_mbs = [empty, empty]
+        owner.last_mbs = [None, None]
+        owner.mbs = [None, final_output]
+        owner.send_proxy_work = []
+        owner.init_pp_loop_state = lambda: None
+        owner.request_receiver = SimpleNamespace(recv_requests=lambda: [])
+        owner.process_input_requests = lambda reqs: None
+        owner._pp_commit_comm_work = lambda work: None
+        owner.get_next_batch_to_run = lambda **kwargs: SimpleNamespace(
+            running_batch=empty, batch_to_run=None
+        )
+        owner.chunked_req = None
+        owner.waiting_queue = []
+        owner.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        owner.enable_overlap = False
+        owner.disaggregation_mode = DisaggregationMode.NULL
+        owner.enable_hierarchical_cache = False
+        owner.grammar_manager = MagicMock()
+        owner.grammar_manager.grammar_queue = []
+        owner.tree_cache = MagicMock()
+        owner.token_to_kv_pool_allocator = MagicMock()
+        owner.metrics_reporter = MagicMock()
+        owner.metrics_reporter.is_stats_logging_rank = False
+        owner.draft_worker = None
+        owner.maybe_send_health_check_signal = MagicMock()
+        owner.enable_unified_memory = False
+        owner.invariant_checker = MagicMock()
+        owner.kv_events_publisher = MagicMock()
+        owner.new_token_ratio_tracker = MagicMock()
+        owner.publish_load_snapshot = MagicMock()
+        owner.maybe_sleep_on_idle = MagicMock()
+        result = object()
+        event = MagicMock()
+        owner._pp_commit_send_output_work_and_preprocess_output_tensors = (
+            lambda first, next_mb: (None, result, event)
+        )
+        processed: list[ScheduleBatch] = []
+
+        def process(batch: ScheduleBatch, output: object) -> None:
+            self.assertIs(batch, final_output)
+            self.assertIs(output, result)
+            # Final history is installed only AFTER result processing returns.
+            self.assertIsNone(owner.last_mbs[1])
+            request.finished_reason = FINISH_LENGTH(1)
+            self.assertFalse(owner.flush_cache(empty_cache=False))
+            processed.append(batch)
+
+        owner.process_batch_result = process
+
+        def idle() -> None:
+            self.assertEqual(processed, [final_output])
+            self.assertIs(owner.last_mbs[1], final_output)
+            self.assertIs(owner.last_batch, final_output)
+            self.assertTrue(final_output.is_empty())
+            self.assertTrue(owner._pp_microbatches_drained())
+            self.assertTrue(owner.is_fully_idle())
+            Scheduler.on_idle(owner)
+            owner.publish_load_snapshot.assert_called_once_with(force=True)
+            self.assertTrue(owner.flush_cache(empty_cache=False))
+            owner.tree_cache.reset.assert_called_once_with()
+            owner.req_to_token_pool.clear.assert_called_once_with()
+            owner.token_to_kv_pool_allocator.clear.assert_called_once_with()
+            raise StopLoop()
+
+        owner.on_idle = idle
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=SimpleNamespace(pp_async_batch_depth=0),
+            ),
+            self.assertRaises(StopLoop),
+        ):
+            owner.event_loop_pp()
+        event.synchronize.assert_called_once_with()
+
+    def test_ordinary_pp_pruning_preserves_outstanding_finished_output(self) -> None:
+        request = Req.__new__(Req)
+        request.finished_reason = FINISH_LENGTH(1)
+        history = ScheduleBatch(reqs=[request])
+        owner = SimpleNamespace(last_mbs=[history], mbs=[history])
+        SchedulerPPMixin._pp_prune_finished_hisparse_history(owner)
+        self.assertEqual(history.reqs, [request])
+        owner.mbs = [None]
+        SchedulerPPMixin._pp_prune_finished_hisparse_history(owner)
+        self.assertTrue(history.is_empty())
+
     def test_coordinated_pending_and_retiring_veto_full_idle_without_health_forward(
         self,
     ):
