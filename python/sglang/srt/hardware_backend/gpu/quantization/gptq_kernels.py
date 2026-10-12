@@ -24,6 +24,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -46,10 +47,12 @@ gptq_shuffle = _unsupported_kernel
 
 try:
     from sgl_kernel import gptq_gemm, gptq_shuffle
-
-    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 except Exception:
     pass
+
+# The maintained repacker is independent of optional legacy GPTQ exports.
+if is_cuda():
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 
 @dataclass
