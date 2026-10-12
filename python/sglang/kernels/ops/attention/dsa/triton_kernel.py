@@ -83,6 +83,11 @@ def _act_quant_kernel(
     tl.store(s_ptrs, scale, mask=s_mask)
 
 
+def _act_quant_uses_fp32_output(device: torch.device) -> bool:
+    # SM80 cannot lower a Triton E4M3FN store; Torch supports its encoding.
+    return device.type == "cuda" and torch.cuda.get_device_capability(device) == (8, 0)
+
+
 def act_quant(
     x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -109,7 +114,10 @@ def act_quant(
     M = x_flat.size(0)
 
     # Allocate output tensors
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    software_fp8 = _act_quant_uses_fp32_output(x.device)
+    y = torch.empty_like(
+        x, dtype=torch.float32 if software_fp8 else torch.float8_e4m3fn
+    )
     y_flat = y.view(-1, N)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
     s_flat = s.view(-1, N // block_size)
@@ -133,6 +141,8 @@ def act_quant(
         num_stages=0 if round_scale else 2,
     )
 
+    if software_fp8:
+        y = y.to(torch.float8_e4m3fn)
     return y, s
 
 
