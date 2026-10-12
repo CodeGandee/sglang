@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import copy
 import doctest
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -234,14 +235,22 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
-if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
-else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+def _test_runner_device_slot(visible_devices: str) -> int:
+    """Derive a bounded port offset without interpreting UUIDs as CUDA ordinals."""
+    first = visible_devices.split(",", 1)[0].strip()
+    if not first or first == "-1":
+        return 0
+    if first.isdecimal():
+        return int(first) % 16
+    return int.from_bytes(hashlib.sha256(first.encode()).digest()[:2], "big") % 16
+
+
+_test_device_slot = _test_runner_device_slot(os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
+    10000 + _test_device_slot * 2000
+    if is_in_ci()
+    else 20000 + _test_device_slot * 1000
+)
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
