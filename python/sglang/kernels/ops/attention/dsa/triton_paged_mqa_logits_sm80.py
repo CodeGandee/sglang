@@ -61,6 +61,7 @@ def _paged_mqa_logits_kernel(
     seq_lens_ptr,
     page_table_ptr,
     logits_ptr,
+    precast_ptr,
     num_physical_pages,
     num_logical_pages,
     max_seq_len,
@@ -78,6 +79,7 @@ def _paged_mqa_logits_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     VERIFY_FP64: tl.constexpr,
+    CAPTURE_PRECAST: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     logical_page = tl.program_id(1)
@@ -159,6 +161,12 @@ def _paged_mqa_logits_kernel(
     if VERIFY_FP64:
         k_scales = k_scales.to(tl.float64)
     output = tl.where(valid_tokens, scores * k_scales, 0.0)
+    if CAPTURE_PRECAST:
+        tl.store(
+            precast_ptr + query_idx * max_seq_len + logical_positions,
+            output,
+            mask=logical_positions < max_seq_len,
+        )
     tl.store(
         logits_ptr + query_idx * logits_stride_t + logical_positions,
         output,
@@ -226,6 +234,7 @@ def triton_paged_mqa_logits(
     max_seq_len: int,
     *,
     _verification_fp64: bool = False,
+    _verification_precast: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute single-query DSA paged-MQA logits on NVIDIA SM80.
 
@@ -255,6 +264,10 @@ def triton_paged_mqa_logits(
         Private eager-only arithmetic specialization. Widens dot products,
         gates and key scaling to FP64 within the same addressing/result kernel;
         output remains FP32. Production always uses the default false value.
+    _verification_precast : torch.Tensor, optional
+        Private contiguous FP64 sink shaped ``[rows, max_seq_len]`` on the
+        query device, accepted only with FP64 verification. Captures the
+        actual pre-cast results in the same launch that returns FP32 logits.
 
     Returns
     -------
@@ -329,6 +342,18 @@ def triton_paged_mqa_logits(
 
     if _verification_fp64 and torch.cuda.is_current_stream_capturing():
         raise ValueError("FP64 paged-MQA verification is eager-only.")
+    if _verification_precast is not None:
+        if not _verification_fp64:
+            raise ValueError("Pre-cast capture requires FP64 paged-MQA verification.")
+        if (
+            _verification_precast.dtype != torch.float64
+            or _verification_precast.shape != (q_fp8.shape[0], max_seq_len)
+            or _verification_precast.device != q_fp8.device
+            or not _verification_precast.is_contiguous()
+        ):
+            raise ValueError(
+                "Pre-cast capture requires a contiguous FP64 [rows, max_seq_len] sink on the query device."
+            )
 
     if k_cache.ndim < 2 or k_cache.shape[0] == 0:
         raise ValueError(
@@ -366,6 +391,7 @@ def triton_paged_mqa_logits(
         seq_lens,
         page_table,
         logits,
+        logits if _verification_precast is None else _verification_precast,
         k_cache.shape[0],
         page_table.shape[1],
         max_seq_len,
@@ -383,6 +409,7 @@ def triton_paged_mqa_logits(
         PAGE_SIZE=_PAGE_SIZE,
         HEAD_DIM=_HEAD_DIM,
         VERIFY_FP64=_verification_fp64,
+        CAPTURE_PRECAST=_verification_precast is not None,
         enable_fp_fusion=not _verification_fp64,
         num_warps=4,
         num_stages=1,

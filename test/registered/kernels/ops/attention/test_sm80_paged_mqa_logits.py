@@ -13,6 +13,7 @@ import math
 import struct
 import unittest
 from dataclasses import dataclass
+from fractions import Fraction
 from unittest.mock import patch
 
 import torch
@@ -145,7 +146,7 @@ def _tensor_reference(inputs: _Inputs) -> torch.Tensor:
     q, weights = inputs.q.double(), inputs.weights.double()
     out = torch.zeros(q.shape[0], inputs.width, dtype=torch.float64)
     for row in range(q.shape[0]):
-        positions = torch.arange(min(int(inputs.lengths[row]), inputs.width))
+        positions = torch.arange(max(0, min(int(inputs.lengths[row]), inputs.width)))
         if not positions.numel():
             continue
         page_numbers = positions // _PAGE
@@ -163,7 +164,9 @@ def _tensor_reference(inputs: _Inputs) -> torch.Tensor:
     return out
 
 
-def _kernel(inputs: _Inputs, *, fp64: bool = False) -> torch.Tensor:
+def _kernel(
+    inputs: _Inputs, *, fp64: bool = False, precast: torch.Tensor | None = None
+) -> torch.Tensor:
     from sglang.kernels.ops.attention.dsa.triton_paged_mqa_logits_sm80 import (
         triton_paged_mqa_logits,
     )
@@ -176,6 +179,7 @@ def _kernel(inputs: _Inputs, *, fp64: bool = False) -> torch.Tensor:
         inputs.table,
         inputs.width,
         _verification_fp64=fp64,
+        _verification_precast=precast,
     )
 
 
@@ -298,6 +302,35 @@ class TestSM80PagedMQALogits(CustomTestCase):
             else:
                 self.assertEqual(struct.pack("<f", value), struct.pack("<f", expected))
 
+    def test_native_wrapper_launch_witness(self) -> None:
+        from sglang.kernels.ops.attention.dsa import (
+            triton_paged_mqa_logits_sm80 as actual,
+        )
+        from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
+            sm80_paged_mqa_logits,
+        )
+
+        cpu = _fixture([65, 63], 4)
+        device = cpu.on("cuda")
+        with patch.object(
+            actual, "triton_paged_mqa_logits", wraps=actual.triton_paged_mqa_logits
+        ) as witness:
+            output = sm80_paged_mqa_logits(
+                device.q,
+                device.cache,
+                device.weights,
+                device.lengths,
+                device.table,
+                device.width,
+                q_offset=2,
+                B=2,
+                next_n=1,
+                is_decode=True,
+            )
+            torch.cuda.synchronize()
+            witness.assert_called_once()
+        self.assertTrue(torch.equal(output.cpu(), _tensor_reference(cpu).float()))
+
     def test_pages_lengths_head_tiles_and_isolation(self) -> None:
         for length in (1, 63, 64, 65, 2047, 2048, 2049, 4095, 4096, 4097, 16384):
             for heads in (1, 8, 16, 32) if length == 65 else (4,):
@@ -320,13 +353,50 @@ class TestSM80PagedMQALogits(CustomTestCase):
                     self.assertTrue(torch.equal(r1, r2))
                     # Exact dyadic reference sums fit within binary64 and the
                     # declared output boundary is FP32, not BF16.
-                    controlled = _kernel(cpu.on("cuda"), fp64=True).cpu()
+                    device = cpu.on("cuda")
+                    precast = torch.empty(r1.shape, dtype=torch.float64, device="cuda")
+                    controlled = _kernel(device, fp64=True, precast=precast).cpu()
+                    self.assertTrue(torch.equal(precast.cpu(), r1))
+                    self.assertTrue(torch.equal(controlled, precast.float().cpu()))
                     self.assertTrue(torch.equal(controlled, r1.float()))
                     production = _kernel(cpu.on("cuda")).cpu()
                     self.assertTrue(torch.equal(production, r1.float()))
                     print(
                         f"controlled-fp64 H={heads} dense={dense}: exact independent references and FP32 casts PASS"
                     )
+
+    def test_rounding_boundary_is_retained_as_numerically_ambiguous(self) -> None:
+        cpu = _fixture([1], 3)
+        cpu.weights[0] = torch.tensor([1.0, 2.0**-24, 2.0**-55])
+        device = cpu.on("cuda")
+        precast = torch.empty(1, 1, dtype=torch.float64, device="cuda")
+        output = _kernel(device, fp64=True, precast=precast).cpu()
+        r1, r2 = _scalar_reference(cpu), _tensor_reference(cpu)
+        self.assertTrue(torch.equal(r1, r2))
+        self.assertTrue(torch.equal(precast.cpu(), r1))
+        self.assertTrue(torch.equal(output, r1.float()))
+        next_float = torch.nextafter(torch.tensor(1.0), torch.tensor(math.inf))
+        midpoint = (Fraction(1) + Fraction.from_float(float(next_float))) / 2
+        exact = sum(
+            (Fraction.from_float(float(value)) for value in cpu.weights[0]), Fraction()
+        )
+        # FP64 drops the 2^-55 term; a rigorous roundoff interval crosses the
+        # FP32 midpoint even though both FP64 references and casts agree.
+        self.assertEqual(Fraction.from_float(float(precast.cpu()[0, 0])), midpoint)
+        self.assertGreater(exact, midpoint)
+        unit_roundoff = 2.0**-53
+        gamma_three = 3 * unit_roundoff / (1 - 3 * unit_roundoff)
+        bound = Fraction.from_float(
+            gamma_three
+            * float(
+                sum(abs(Fraction.from_float(float(value))) for value in cpu.weights[0])
+            )
+        )
+        self.assertLessEqual(abs(exact - midpoint), bound)
+        self.assertEqual(float(output[0, 0]), 1.0)
+        print(
+            "rounding-boundary: numerically-ambiguous; agreeing FP64 arms lose 2^-55 above FP32 midpoint; combined semantic/downcast pass not claimed"
+        )
 
     def test_invalid_page_masks_and_unavailable_table_entries(self) -> None:
         cpu = _fixture([129, 65], 1)
@@ -337,7 +407,18 @@ class TestSM80PagedMQALogits(CustomTestCase):
         )
         expected = _scalar_reference(short).float()
         self.assertTrue(torch.equal(expected, _tensor_reference(short).float()))
-        self.assertTrue(torch.equal(_kernel(short.on("cuda")).cpu(), expected))
+        device = short.on("cuda")
+        self.assertTrue(torch.equal(_kernel(device).cpu(), expected))
+        precast = torch.empty(expected.shape, dtype=torch.float64, device="cuda")
+        controlled = _kernel(device, fp64=True, precast=precast)
+        self.assertTrue(torch.equal(controlled.cpu(), expected))
+        self.assertTrue(torch.equal(precast.cpu(), expected.double()))
+        # Data-dependent length values cannot be read on the host during graph
+        # replay. Their defined behavior is clipping at output/table bounds.
+        cpu.lengths[:] = torch.tensor([-1, cpu.width + 100])
+        clipped = _scalar_reference(cpu).float()
+        self.assertTrue(torch.equal(_tensor_reference(cpu).float(), clipped))
+        self.assertTrue(torch.equal(_kernel(cpu.on("cuda")).cpu(), clipped))
 
     def test_actual_unfused_consumer_unique_cutoff_and_ties(self) -> None:
         from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
