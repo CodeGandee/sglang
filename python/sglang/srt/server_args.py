@@ -369,6 +369,7 @@ DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = [
     "aiter",
     "triton-sm80",
 ]
+DSA_RAGGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "torch-sm80"]
 
 MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
@@ -1832,6 +1833,14 @@ class ServerArgs:
         ),
         NS("exec.kernel"),
     ] = "sgl-kernel"
+    dsa_ragged_mqa_logits_backend: A[
+        str,
+        Arg(
+            help="Ordinary-prefill DSA index logits. 'auto' preserves the native backend; 'torch-sm80' opts into bounded resident SM80 Torch scoring, paired with paged 'triton-sm80', without HiSparse, speculation or context parallelism.",
+            choices=DSA_RAGGED_MQA_LOGITS_BACKEND_CHOICES,
+        ),
+        NS("exec.kernel"),
+    ] = "auto"
     disable_flashinfer_autotune: A[
         bool, "Disable FlashInfer autotuning.", NS("exec.kernel")
     ] = False

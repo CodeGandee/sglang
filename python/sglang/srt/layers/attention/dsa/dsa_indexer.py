@@ -26,6 +26,9 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
+from sglang.srt.layers.attention.dsa.ragged_mqa_logits_backend import (
+    DSARaggedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -43,8 +46,10 @@ from sglang.srt.runtime_context import (
     configured_pp_size,
     get_device,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -240,6 +245,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+        self.ragged_mqa_logits_backend = DSARaggedMQALogitsBackend.resolve(
+            get_exec().kernel.dsa_ragged_mqa_logits_backend
+        )
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
@@ -251,6 +259,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.cp_size = get_parallel().attn_cp_size
         else:
             self.cp_size = None
+        if self.ragged_mqa_logits_backend.is_torch_sm80():
+            self.ragged_mqa_logits_backend.validate_prefill_config(
+                hisparse=get_memory().enable_hisparse,
+                speculative=get_spec().speculative_algorithm is not None,
+                context_parallel=(
+                    self.dsa_enable_prefill_cp or get_parallel().attn_cp_size > 1
+                ),
+                paged_backend=self.paged_mqa_logits_backend.value,
+            )
         if _is_cuda:
             self.sm_count = (
                 torch.cuda.get_device_properties(
@@ -1042,6 +1059,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
 
+    def _get_cuda_ragged_mqa_logits(
+        self,
+        q_fp8: torch.Tensor,
+        kv_fp8: Tuple[torch.Tensor, torch.Tensor],
+        weights: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.ragged_mqa_logits_backend.is_torch_sm80():
+            from sglang.kernels.ops.attention.dsa.torch_mqa_logits_sm80 import (
+                torch_ragged_mqa_logits,
+            )
+
+            return torch_ragged_mqa_logits(q_fp8, *kv_fp8, weights, ks, ke)
+        q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
+        return deep_gemm.fp8_mqa_logits(
+            q_padded, kv_fp8, w_padded, ks, ke, clean_logits=False
+        )
+
     def _get_topk_ragged(
         self,
         enable_dual_stream: bool,
@@ -1150,16 +1186,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         clean_logits=False,
                     )
                 else:
-                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[:q_offset], weights[:q_offset]
-                    )
-                    logits = deep_gemm.fp8_mqa_logits(
-                        q_padded,
+                    logits = self._get_cuda_ragged_mqa_logits(
+                        q_fp8[:q_offset],
                         kv_fp8,
-                        w_padded,
+                        weights[:q_offset],
                         ks,
                         ke,
-                        clean_logits=False,
                     )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
@@ -1206,16 +1238,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         clean_logits=False,
                     )
                 else:
-                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[start:end], weights[start:end]
-                    )
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
-                        q_padded,
+                    logits_chunk = self._get_cuda_ragged_mqa_logits(
+                        q_fp8[start:end],
                         kv_fp8,
-                        w_padded,
+                        weights[start:end],
                         ks[start:end],
                         ke[start:end],
-                        clean_logits=False,
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]
@@ -1596,6 +1624,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        if self.ragged_mqa_logits_backend.is_torch_sm80() and (
+            forward_batch.attn_cp_metadata is not None
+            or not (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                or forward_batch.forward_mode.is_decode_or_idle()
+            )
+        ):
+            raise NotImplementedError("SM80 ragged logits support ordinary resident prefill only.")
         if self.paged_mqa_logits_backend.is_triton_sm80() and (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
