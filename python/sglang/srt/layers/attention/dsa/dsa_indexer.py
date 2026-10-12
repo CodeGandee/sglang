@@ -74,12 +74,14 @@ if not _is_npu:
         cutedsl_paged_mqa_logits,
         deepgemm_paged_mqa_logits_native,
         deepgemm_paged_mqa_logits_split,
+        sm80_paged_mqa_logits,
     )
 else:
     aiter_paged_mqa_logits = None
     cutedsl_paged_mqa_logits = None
     deepgemm_paged_mqa_logits_native = None
     deepgemm_paged_mqa_logits_split = None
+    sm80_paged_mqa_logits = None
 
 if _is_cuda:
     from sglang.kernels.ops.attention.dsa import pick_dsl_expand
@@ -235,6 +237,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            get_exec().kernel.dsa_paged_mqa_logits_backend
+        )
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
@@ -247,7 +252,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         else:
             self.cp_size = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            self.sm_count = (
+                torch.cuda.get_device_properties(
+                    get_device().device
+                ).multi_processor_count
+                if self.paged_mqa_logits_backend.is_triton_sm80()
+                else deep_gemm.get_num_sms()
+            )
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = configured_pp_size()
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -311,17 +322,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
 
-        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
-            get_exec().kernel.dsa_paged_mqa_logits_backend
-        )
-
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
         # request to receive the PP proxy tensor or output from the previous stage, occupying one SM resource.
         # Model execution runs in parallel with the recv operation, so the SMs available to the indexer must be reduced
         # by 1. Currently, the last rank starts the send result + recv request only after waiting for execution results.
-        if self.logits_with_pp_recv:
+        if (
+            self.logits_with_pp_recv
+            and not self.paged_mqa_logits_backend.is_triton_sm80()
+        ):
             pp_recv_sm_count = 1
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.sm_count - pp_recv_sm_count
@@ -468,8 +478,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
-            with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-                self.half_device_sm_count
+            with (
+                contextlib.nullcontext()
+                if self.paged_mqa_logits_backend.is_triton_sm80()
+                else deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                    self.half_device_sm_count
+                )
             ):
                 query, _ = self.wq_b(q_lora)
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
@@ -789,6 +803,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
+        if (
+            self.paged_mqa_logits_backend.is_triton_sm80()
+            and not forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            raise NotImplementedError(
+                "The SM80 paged-MQA indexer supports decode only."
+            )
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -867,7 +888,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
-        if _is_cuda:
+        if _is_cuda and not self.paged_mqa_logits_backend.is_triton_sm80():
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
@@ -883,7 +904,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if self.paged_mqa_logits_backend.is_aiter():
+        if self.paged_mqa_logits_backend.is_triton_sm80():
+            logits = sm80_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                seqlens_32,
+                block_tables,
+                max_seq_len,
+                q_offset=q_offset,
+                B=B,
+                next_n=next_n,
+                is_decode=forward_batch.forward_mode.is_decode_or_idle(),
+            )
+        elif self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1562,6 +1596,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        if self.paged_mqa_logits_backend.is_triton_sm80() and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            raise NotImplementedError(
+                "The SM80 paged-MQA indexer does not support speculative verification."
+            )
         if _is_hip:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:

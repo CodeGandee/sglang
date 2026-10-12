@@ -48,6 +48,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
@@ -349,6 +352,16 @@ class DeepseekSparseAttnBackend(
         super().__init__()
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            model_runner.server_args.dsa_paged_mqa_logits_backend
+        )
+        if (
+            self.paged_mqa_logits_backend.is_triton_sm80()
+            and model_runner.server_args.dsa_topk_backend != "torch"
+        ):
+            raise ValueError(
+                "The SM80 paged-MQA indexer requires dsa_topk_backend='torch'."
+            )
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
@@ -729,6 +742,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        if self.paged_mqa_logits_backend.is_triton_sm80():
+            return
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
@@ -1078,9 +1093,10 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if not self.paged_mqa_logits_backend.is_triton_sm80():
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -1560,9 +1576,10 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if not self.paged_mqa_logits_backend.is_triton_sm80():
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,

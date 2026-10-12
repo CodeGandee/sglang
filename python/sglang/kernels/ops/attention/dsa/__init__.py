@@ -6,6 +6,7 @@ from .paged_mqa_logits import (
     cutedsl_paged_mqa_logits,
     deepgemm_paged_mqa_logits_native,
     deepgemm_paged_mqa_logits_split,
+    sm80_paged_mqa_logits,
 )
 
 
@@ -30,4 +31,5 @@ __all__ = [
     "cutedsl_paged_mqa_logits",
     "deepgemm_paged_mqa_logits_native",
     "deepgemm_paged_mqa_logits_split",
+    "sm80_paged_mqa_logits",
 ]

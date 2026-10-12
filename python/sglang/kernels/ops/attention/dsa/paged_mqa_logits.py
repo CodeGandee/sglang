@@ -7,6 +7,67 @@ from collections.abc import Callable
 import torch
 
 
+def sm80_paged_mqa_logits(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_seq_len: int,
+    *,
+    q_offset: int,
+    B: int,
+    next_n: int,
+    is_decode: bool,
+    indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Dispatch the explicit SM80 indexer after validating its query boundary.
+
+    Parameters
+    ----------
+    q_fp8, kv_cache_fp8, weights, seq_lens, block_tables : torch.Tensor
+        Native represented queries, packed keys, head gates, lengths and pages.
+    max_seq_len : int
+        Number of output score columns.
+    q_offset : int
+        Actual query rows before padding.
+    B : int
+        Number of request rows.
+    next_n : int
+        Queries per request; must be one for nonempty decode batches.
+    is_decode : bool
+        Whether the caller is in decode/idle mode. Verification and extend
+        calls are rejected before import or launch.
+    indices : torch.Tensor, optional
+        Restricted key selection is unsupported by this implementation.
+
+    Returns
+    -------
+    torch.Tensor
+        FP32 logits for the actual query rows.
+    """
+    if not is_decode or q_offset != B or (B > 0 and next_n != 1):
+        raise NotImplementedError(
+            "The SM80 paged-MQA kernel supports single-query decode only."
+        )
+    if indices is not None:
+        raise NotImplementedError("The SM80 paged-MQA kernel does not support indices.")
+    if B < 0 or q_offset < 0 or q_offset > q_fp8.shape[0]:
+        raise ValueError("Invalid actual query row count for SM80 paged-MQA.")
+    from sglang.kernels.ops.attention.dsa.triton_paged_mqa_logits_sm80 import (
+        triton_paged_mqa_logits,
+    )
+
+    return triton_paged_mqa_logits(
+        q_fp8[:q_offset],
+        kv_cache_fp8,
+        weights[:q_offset],
+        seq_lens,
+        block_tables,
+        max_seq_len,
+    )
+
+
 def _restore_row_stride(logits: torch.Tensor) -> torch.Tensor:
     """Undo PyTorch's DLPack stride normalization on single-row DeepGEMM logits.
 

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from enum import Enum
 
-from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.utils import get_device_capability, is_cuda, is_hip, is_sm100_supported
 
 
 class DSAPagedMQALogitsBackend(Enum):
     DEEPGEMM = "deepgemm"
     CUTEDSL = "cutedsl"
     AITER = "aiter"
+    TRITON_SM80 = "triton-sm80"
 
     def is_deepgemm(self) -> bool:
         return self == DSAPagedMQALogitsBackend.DEEPGEMM
@@ -18,6 +19,16 @@ class DSAPagedMQALogitsBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == DSAPagedMQALogitsBackend.AITER
+
+    def is_triton_sm80(self) -> bool:
+        """Return whether the explicit single-query SM80 kernel is selected.
+
+        Returns
+        -------
+        bool
+            Whether SM80 single-query Triton dispatch is selected.
+        """
+        return self == DSAPagedMQALogitsBackend.TRITON_SM80
 
     @staticmethod
     def resolve(value: str) -> DSAPagedMQALogitsBackend:
@@ -31,6 +42,13 @@ class DSAPagedMQALogitsBackend(Enum):
 
         if value == "auto" or value == "deepgemm":
             return DSAPagedMQALogitsBackend.DEEPGEMM
+        if value == "triton-sm80":
+            if not is_cuda() or get_device_capability() != (8, 0):
+                raise ValueError(
+                    "dsa_paged_mqa_logits_backend='triton-sm80' requires SM80 "
+                    "(compute capability 8.0)."
+                )
+            return DSAPagedMQALogitsBackend.TRITON_SM80
         if value == "aiter":
             raise ValueError("dsa_paged_mqa_logits_backend='aiter' requires ROCm.")
         if value == "cutedsl":
