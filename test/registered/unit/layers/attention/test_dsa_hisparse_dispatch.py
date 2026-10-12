@@ -13,6 +13,8 @@ import torch
 from predkv_extensions.glm.hisparse.attention import GLMGroupedAttention
 from predkv_extensions.glm.hisparse.coordinator import GLMHiSparseCoordinator
 from sglang.srt.layers.attention import dsa_backend as dsa
+from sglang.srt.mem_cache import memory_pool
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -218,6 +220,165 @@ class TestDSAHiSparseDispatch(unittest.TestCase):
         for split_query in (True, False):
             with self.subTest(split_query=split_query):
                 self._run(extend=False, split_query=split_query)
+
+
+class TestSM80BF16HiSparseDispatch(unittest.TestCase):
+    """Check native ordinary BF16 dispatch with CPU producer/kernel seams.
+
+    These tests qualify dispatch, physical addressing and prefill exclusion;
+    CUDA transfers and native attention arithmetic require hardware checks.
+    """
+
+    def _run(self, *, prefill: bool, start_layer: int, split_query: bool) -> None:
+        pool = HiSparseDSATokenToKVPool.__new__(HiSparseDSATokenToKVPool)
+        pool.dtype = pool.store_dtype = torch.bfloat16
+        pool.size = 32
+        pool.page_size = 1
+        pool.start_layer = start_layer
+        pool.layer_transfer_counter = None
+        pool.kv_buffer = [torch.zeros((33, 1, 576), dtype=torch.bfloat16)]
+        pool.full_to_hisparse_device_index_mapping = torch.arange(33)
+        pool.full_to_hisparse_device_index_mapping[-1] = -1
+        pool.full_to_hisparse_device_index_mapping[3] = 17
+        pool.full_to_hisparse_device_index_mapping[7] = 24
+        locs = torch.tensor([3, 7], dtype=torch.int32)
+        selected = torch.tensor([[0, 2, -1], [1, 3, -1]], dtype=torch.int32)
+        physical = torch.tensor([[17, 9, -1], [24, 12, -1]], dtype=torch.int32)
+        query = torch.ones((2, 2, 512), dtype=torch.bfloat16)
+        rope = query[..., :64] * 2
+        keys = query[:, :1] * torch.tensor([3, 7])[:, None, None]
+        key_rope = keys[..., :64] * 2
+        backend = dsa.DeepseekSparseAttnBackend.__new__(dsa.DeepseekSparseAttnBackend)
+        backend.dsa_decode_impl = "triton-sm80"
+        backend.dsa_prefill_impl = "tilelang"
+        backend.use_mha = backend.use_fused_topk = False
+        backend.token_to_kv_pool = pool
+        backend.forward_metadata = SimpleNamespace(
+            page_table_1=torch.tensor([[3, 9, 0], [7, 12, 0]], dtype=torch.int32),
+            dsa_extend_seq_lens_list=[1, 1],
+            cu_seqlens_q=torch.arange(3, dtype=torch.int32),
+        )
+        backend.get_topk_transform_method = lambda mode: dsa.TopkTransformMethod.PAGED
+        co = SimpleNamespace(swap_in_selected_pages=None)
+        backend.hisparse_coordinator = co
+        layer = SimpleNamespace(
+            layer_id=start_layer,
+            tp_q_head_num=2,
+            head_dim=576,
+            v_head_dim=512,
+            scaling=0.125,
+            is_cross_attention=False,
+        )
+        batch = SimpleNamespace(
+            batch_size=2,
+            forward_mode=ForwardMode.EXTEND if prefill else ForwardMode.DECODE,
+            out_cache_loc=locs,
+            seq_lens=torch.tensor([3, 4], dtype=torch.int32),
+            req_pool_indices=torch.tensor([2, 5], dtype=torch.int32),
+        )
+
+        def write(buffer, physical_locs, nope, tail):
+            torch.testing.assert_close(physical_locs, torch.tensor([17, 24]))
+            buffer[physical_locs.long()] = torch.cat((nope, tail), dim=-1)
+
+        def materialize(requests, lengths, logical_selection, layer_id):
+            self.assertIs(requests, batch.req_pool_indices)
+            self.assertIs(lengths, batch.seq_lens)
+            self.assertIs(logical_selection, selected)
+            self.assertEqual(layer_id, start_layer)
+            # Producers must already be written through the native remapping.
+            torch.testing.assert_close(pool.kv_buffer[0][17, 0, :512], keys[0, 0])
+            torch.testing.assert_close(pool.kv_buffer[0][24, 0, :512], keys[1, 0])
+            return physical
+
+        def decode(**operands):
+            self.assertIs(operands["kv"], pool.kv_buffer[0])
+            torch.testing.assert_close(operands["indices"], physical[:, None])
+            torch.testing.assert_close(operands["q_nope"], query)
+            torch.testing.assert_close(operands["q_rope"], rope)
+            return query.unsqueeze(0)
+
+        def prefill_attention(**operands):
+            self.assertIs(operands["kv_cache"], pool.kv_buffer[0])
+            torch.testing.assert_close(operands["page_table_1"], physical)
+            return query
+
+        from sglang.kernels.ops.attention.dsa import sparse_mla_decode_sm80 as sm80
+
+        with (
+            patch.object(
+                memory_pool,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=1),
+            ),
+            patch.object(
+                memory_pool.MLATokenToKVPool, "_write_mla_kv_buffer", side_effect=write
+            ),
+            patch.object(sm80, "_require_sm80"),
+            patch.object(sm80, "sparse_mla_decode_sm80", side_effect=decode) as kernel,
+            patch.object(
+                co, "swap_in_selected_pages", side_effect=materialize
+            ) as fetch,
+            patch.object(backend, "_forward_tilelang", side_effect=prefill_attention),
+            patch.object(
+                dsa,
+                "concat_mla_absorb_q_general",
+                side_effect=lambda main, tail: torch.cat((main, tail), dim=-1),
+            ),
+            patch.object(
+                dsa,
+                "transform_index_page_table_prefill",
+                return_value=torch.tensor([[3, 9, -1], [7, 12, -1]], dtype=torch.int32),
+            ),
+            patch.object(
+                dsa,
+                "transform_index_page_table_decode",
+                side_effect=AssertionError(
+                    "HiSparse selections must use the materialization owner"
+                ),
+            ),
+        ):
+            entry = backend.forward_extend if prefill else backend.forward_decode
+            output = entry(
+                query if split_query else torch.cat((query, rope), dim=-1),
+                keys,
+                keys,
+                layer,
+                batch,
+                q_rope=rope if split_query else None,
+                k_rope=key_rope,
+                topk_indices=selected,
+            )
+        torch.testing.assert_close(output, query)
+        self.assertEqual(fetch.call_count, 0 if prefill else 1)
+        self.assertEqual(kernel.call_count, 0 if prefill else 1)
+        self.assertEqual(pool.kv_buffer[0][locs.long()].count_nonzero().item(), 0)
+        self.assertFalse(torch.cuda.is_initialized())
+
+    def test_decode_uses_materialized_physical_rows_after_remapped_writes(self) -> None:
+        for start_layer in (26, 52):
+            for split_query in (False, True):
+                with self.subTest(start_layer=start_layer, split_query=split_query):
+                    self._run(
+                        prefill=False, start_layer=start_layer, split_query=split_query
+                    )
+
+    def test_ordinary_prefill_reads_remapped_rows_without_selected_fetch(self) -> None:
+        for start_layer in (26, 52):
+            with self.subTest(start_layer=start_layer):
+                self._run(prefill=True, start_layer=start_layer, split_query=True)
+
+    def test_speculative_modes_fail_before_producing_or_fetching(self) -> None:
+        backend = dsa.DeepseekSparseAttnBackend.__new__(dsa.DeepseekSparseAttnBackend)
+        backend.dsa_decode_impl = "triton-sm80"
+        backend.dsa_prefill_impl = "tilelang"
+        query = torch.zeros((1, 2, 512), dtype=torch.bfloat16)
+        for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(NotImplementedError, "ordinary decode"):
+                    backend.forward_extend(
+                        query, query, query, None, SimpleNamespace(forward_mode=mode)
+                    )
 
 
 if __name__ == "__main__":

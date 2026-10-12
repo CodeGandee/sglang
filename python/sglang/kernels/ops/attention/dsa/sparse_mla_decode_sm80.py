@@ -1,4 +1,4 @@
-"""Explicit SM80 BF16 resident sparse-MLA decode with split-K softmax.
+"""Explicit SM80 BF16 sparse-MLA decode with split-K softmax.
 
 Derived from predkv-inference e5e38b9813908e69b35d1660b2d116337a714cc9,
 scripts/explore/sm80-dsa/sparse_mla_decode_sm80.py. The native port adds input
@@ -289,8 +289,9 @@ def validate_sm80_sparse_mla_config(
     kv_dtype: torch.dtype,
     hisparse: bool,
     speculative: bool,
+    hisparse_bf16: bool = False,
 ) -> None:
-    """Validate the initial resident SM80 decode configuration before allocation.
+    """Validate ordinary resident or explicitly admitted BF16 HiSparse decode.
 
     Parameters
     ----------
@@ -299,18 +300,20 @@ def validate_sm80_sparse_mla_config(
     prefill_backend : str, optional
         Independently selected prefill backend; SM80 decode is not a prefill route.
     kv_dtype : torch.dtype
-        Resident cache representation, required to be BF16.
+        Cache representation, required to be BF16.
     hisparse, speculative : bool
-        Whether unsupported offload or speculative execution is enabled.
+        Whether offload or unsupported speculative execution is enabled.
+    hisparse_bf16 : bool, optional
+        Whether the caller admitted the ordinary BF16 HiSparse backend pair.
     """
     _require_sm80(device)
     if prefill_backend == "triton-sm80":
         raise ValueError("SM80 sparse-MLA is a decode-only backend.")
     if kv_dtype != torch.bfloat16:
-        raise ValueError("SM80 sparse-MLA requires resident BF16 KV.")
-    if hisparse or speculative:
+        raise ValueError("SM80 sparse-MLA requires BF16 KV.")
+    if speculative or (hisparse and not hisparse_bf16):
         raise ValueError(
-            "SM80 sparse-MLA currently requires ordinary resident decode without HiSparse or speculation."
+            "SM80 sparse-MLA requires ordinary decode and explicit BF16 HiSparse admission; speculation is unsupported."
         )
 
 

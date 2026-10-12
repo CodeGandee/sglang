@@ -50,6 +50,32 @@ def validate_hisparse_dsa_backend(
     view = resolved_view(server_args)
     backend = getattr(view, attr)
     kv_cache_dtype = view.kv_cache_dtype
+    if view.dsa_decode_backend == "triton-sm80":
+        from sglang.srt.utils import get_device_capability
+
+        if (
+            _is_hip()
+            or get_device_capability() != (8, 0)
+            or kv_cache_dtype != "bfloat16"
+            or view.dsa_prefill_backend != "tilelang"
+            or view.dsa_paged_mqa_logits_backend != "triton-sm80"
+            or view.dsa_ragged_mqa_logits_backend != "torch-sm80"
+            or view.dsa_topk_backend != "torch"
+            or view.speculative_algorithm is not None
+            or view.attn_cp_size != 1
+            or view.dcp_size != 1
+            or view.enable_dsa_prefill_context_parallel
+            or view.enable_prefill_context_parallel
+        ):
+            raise ValueError(
+                "SM80 HiSparse requires ordinary BF16 tilelang prefill, "
+                "triton-sm80 decode and paged logits, torch-sm80 ragged logits "
+                "and torch top-k, without speculation or context parallelism."
+            )
+        hf_config = view.get_model_config().hf_config
+        if hf_config.architectures != ["GlmMoeDsaForCausalLM"]:
+            raise ValueError("SM80 BF16 HiSparse requires ordinary GLM DSA.")
+        return
     allowed_backends = _hisparse_allowed_backends(kv_cache_dtype)
     if backend is not None and backend not in allowed_backends:
         raise ValueError(

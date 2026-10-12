@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -267,6 +268,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     self.dsa_enable_prefill_cp or get_parallel().attn_cp_size > 1
                 ),
                 paged_backend=self.paged_mqa_logits_backend.value,
+                hisparse_bf16=(
+                    get_model().kv_cache_dtype == "bfloat16"
+                    and get_exec().kernel.dsa_prefill_backend == "tilelang"
+                    and get_exec().kernel.dsa_decode_backend == "triton-sm80"
+                    and get_exec().kernel.dsa_topk_backend == "torch"
+                ),
             )
         if _is_cuda:
             self.sm_count = (
@@ -1631,7 +1638,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 or forward_batch.forward_mode.is_decode_or_idle()
             )
         ):
-            raise NotImplementedError("SM80 ragged logits support ordinary resident prefill only.")
+            raise NotImplementedError("SM80 ragged logits support ordinary prefill only.")
         if self.paged_mqa_logits_backend.is_triton_sm80() and (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()

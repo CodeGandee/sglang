@@ -1811,7 +1811,7 @@ class ServerArgs:
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. 'triton-sm80' explicitly selects resident BF16 ordinary decode on SM80.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. 'triton-sm80' explicitly selects BF16 ordinary decode on SM80, including the qualified ordinary GLM HiSparse pair.",
             choices=DSA_DECODE_CHOICES,
             resolvable=True,
         ),
@@ -1836,7 +1836,7 @@ class ServerArgs:
     dsa_ragged_mqa_logits_backend: A[
         str,
         Arg(
-            help="Ordinary-prefill DSA index logits. 'auto' preserves the native backend; 'torch-sm80' opts into bounded resident SM80 Torch scoring, paired with paged 'triton-sm80', without HiSparse, speculation or context parallelism.",
+            help="Ordinary-prefill DSA index logits. 'auto' preserves the native backend; 'torch-sm80' opts into bounded SM80 Torch scoring, paired with paged 'triton-sm80', for resident or qualified BF16 ordinary GLM HiSparse, without speculation or context parallelism.",
             choices=DSA_RAGGED_MQA_LOGITS_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),

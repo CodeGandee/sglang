@@ -261,6 +261,15 @@ class TestSM80RaggedCPU(CustomTestCase):
             "paged_backend": "triton-sm80",
         }
         selected.validate_prefill_config(**config)
+        selected.validate_prefill_config(
+            **{**config, "hisparse": True}, hisparse_bf16=True
+        )
+        for excluded in ("speculative", "context_parallel"):
+            with self.assertRaises(ValueError):
+                selected.validate_prefill_config(
+                    **{**config, "hisparse": True, excluded: True},
+                    hisparse_bf16=True,
+                )
         for name in ("hisparse", "speculative", "context_parallel", "paged_backend"):
             bad = dict(config)
             bad[name] = "deepgemm" if name == "paged_backend" else True

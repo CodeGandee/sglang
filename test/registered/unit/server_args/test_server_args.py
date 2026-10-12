@@ -659,6 +659,85 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
+    def test_sm80_bf16_ordinary_glm_requires_complete_explicit_pair(self):
+        config = dict(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="tilelang",
+            dsa_decode_backend="triton-sm80",
+            dsa_paged_mqa_logits_backend="triton-sm80",
+            dsa_ragged_mqa_logits_backend="torch-sm80",
+            dsa_topk_backend="torch",
+        )
+        exclusions = (
+            {},
+            {"kv_cache_dtype": "fp8_e4m3"},
+            {"dsa_prefill_backend": "flashmla_sparse"},
+            {"dsa_paged_mqa_logits_backend": "auto"},
+            {"dsa_ragged_mqa_logits_backend": "auto"},
+            {"dsa_topk_backend": "sgl-kernel"},
+            {"speculative_algorithm": "EAGLE"},
+            {"attn_cp_size": 2},
+            {"dcp_size": 2},
+            {"enable_dsa_prefill_context_parallel": True},
+            {"enable_prefill_context_parallel": True},
+        )
+        for changed in exclusions:
+            with self.subTest(changed=changed):
+                args = ServerArgs(**{**config, **changed})
+                with (
+                    patch("sglang.srt.server_args.is_hip", return_value=False),
+                    patch(
+                        "sglang.srt.utils.get_device_capability", return_value=(8, 0)
+                    ),
+                    patch.object(
+                        args,
+                        "get_model_config",
+                        return_value=SimpleNamespace(
+                            hf_config=SimpleNamespace(
+                                architectures=["GlmMoeDsaForCausalLM"]
+                            )
+                        ),
+                    ),
+                ):
+                    for attr, label in (
+                        ("dsa_prefill_backend", "prefill"),
+                        ("dsa_decode_backend", "decode"),
+                    ):
+                        if changed:
+                            with self.assertRaisesRegex(
+                                ValueError, "SM80 HiSparse requires"
+                            ):
+                                args._validate_hisparse_dsa_backend(attr, label)
+                        else:
+                            args._validate_hisparse_dsa_backend(attr, label)
+
+        args = ServerArgs(**config)
+        for capability, arch, hip in (
+            ((9, 0), "GlmMoeDsaForCausalLM", False),
+            ((8, 0), "GlmMoeDsaForCausalLMNextN", False),
+            ((8, 0), "DeepseekV32ForCausalLM", False),
+            ((8, 0), "GlmMoeDsaForCausalLM", True),
+        ):
+            with self.subTest(capability=capability, arch=arch, hip=hip):
+                with (
+                    patch("sglang.srt.server_args.is_hip", return_value=hip),
+                    patch(
+                        "sglang.srt.utils.get_device_capability",
+                        return_value=capability,
+                    ),
+                    patch.object(
+                        args,
+                        "get_model_config",
+                        return_value=SimpleNamespace(
+                            hf_config=SimpleNamespace(architectures=[arch])
+                        ),
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    args._validate_hisparse_dsa_backend("dsa_decode_backend", "decode")
+
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self, _mock_is_hip):
         """SM120 GLM DSA resolves both DSA backends to flashinfer_sparse_mla, so

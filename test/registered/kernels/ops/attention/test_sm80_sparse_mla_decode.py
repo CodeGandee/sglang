@@ -290,6 +290,23 @@ class TestSM80SparseMLAReferences(CustomTestCase):
                 hisparse=False,
                 speculative=False,
             )
+            module.validate_sm80_sparse_mla_config(
+                device=torch.device("cuda"),
+                prefill_backend="tilelang",
+                kv_dtype=torch.bfloat16,
+                hisparse=True,
+                speculative=False,
+                hisparse_bf16=True,
+            )
+            with self.assertRaises(ValueError):
+                module.validate_sm80_sparse_mla_config(
+                    device=torch.device("cuda"),
+                    prefill_backend="tilelang",
+                    kv_dtype=torch.bfloat16,
+                    hisparse=True,
+                    speculative=True,
+                    hisparse_bf16=True,
+                )
             for prefill, dtype, hisparse, speculative in (
                 ("triton-sm80", torch.bfloat16, False, False),
                 ("fa3", torch.float8_e4m3fn, False, False),

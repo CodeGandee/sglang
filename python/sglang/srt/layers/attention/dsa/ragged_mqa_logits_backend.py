@@ -54,19 +54,24 @@ class DSARaggedMQALogitsBackend(Enum):
         speculative: bool,
         context_parallel: bool,
         paged_backend: str,
+        hisparse_bf16: bool = False,
     ) -> None:
         """Reject unqualified compositions before indexer state creation.
 
         Parameters
         ----------
         hisparse, speculative, context_parallel : bool
-            Whether excluded offload, speculation or context parallelism is enabled.
+            Whether offload, speculation or context parallelism is enabled.
         paged_backend : str
             Existing paired decode selector, required to be ``triton-sm80``.
+        hisparse_bf16 : bool, optional
+            Whether the caller admitted the ordinary BF16 HiSparse backend pair.
         """
-        if self.is_torch_sm80() and (hisparse or speculative or context_parallel):
+        if self.is_torch_sm80() and (
+            (hisparse and not hisparse_bf16) or speculative or context_parallel
+        ):
             raise ValueError(
-                "SM80 ragged logits require ordinary resident prefill without HiSparse, speculation or context parallelism."
+                "SM80 ragged logits require ordinary prefill with explicit BF16 HiSparse admission, without speculation or context parallelism."
             )
         if self.is_torch_sm80() and paged_backend != "triton-sm80":
             raise ValueError(

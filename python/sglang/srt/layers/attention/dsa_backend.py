@@ -369,6 +369,14 @@ class DeepseekSparseAttnBackend(
                     or model_runner.hisparse_coordinator is not None
                 ),
                 speculative=model_runner.server_args.speculative_algorithm is not None,
+                hisparse_bf16=(
+                    model_runner.server_args.dsa_prefill_backend == "tilelang"
+                    and model_runner.server_args.dsa_paged_mqa_logits_backend
+                    == "triton-sm80"
+                    and model_runner.server_args.dsa_ragged_mqa_logits_backend
+                    == "torch-sm80"
+                    and model_runner.server_args.dsa_topk_backend == "torch"
+                ),
             )
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             model_runner.server_args.dsa_paged_mqa_logits_backend
@@ -2477,12 +2485,9 @@ class DeepseekSparseAttnBackend(
             )
 
             _require_sm80(q.device)
-            if (
-                not forward_batch.forward_mode.is_decode_or_idle()
-                or self.hisparse_coordinator is not None
-            ):
+            if not forward_batch.forward_mode.is_decode_or_idle():
                 raise NotImplementedError(
-                    "SM80 sparse-MLA requires ordinary resident decode."
+                    "SM80 sparse-MLA requires ordinary decode."
                 )
             if (
                 self.token_to_kv_pool.dtype != torch.bfloat16
