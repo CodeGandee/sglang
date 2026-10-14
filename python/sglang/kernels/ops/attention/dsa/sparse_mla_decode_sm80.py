@@ -290,8 +290,10 @@ def validate_sm80_sparse_mla_config(
     hisparse: bool,
     speculative: bool,
     hisparse_bf16: bool = False,
+    dflash_verify: bool = False,
+    dflash_offload: bool = False,
 ) -> None:
-    """Validate ordinary resident or explicitly admitted BF16 HiSparse decode.
+    """Validate BF16 decode or explicitly admitted resident DFlash verification.
 
     Parameters
     ----------
@@ -305,13 +307,27 @@ def validate_sm80_sparse_mla_config(
         Whether offload or unsupported speculative execution is enabled.
     hisparse_bf16 : bool, optional
         Whether the caller admitted the ordinary BF16 HiSparse backend pair.
+    dflash_verify : bool, optional
+        Resolved admission of resident DFlash/ours block-eight verification.
+    dflash_offload : bool, optional
+        Separate resolved grouped BF16 offload admission; requires HiSparse.
     """
     _require_sm80(device)
     if prefill_backend == "triton-sm80":
         raise ValueError("SM80 sparse-MLA is a decode-only backend.")
     if kv_dtype != torch.bfloat16:
         raise ValueError("SM80 sparse-MLA requires BF16 KV.")
-    if speculative or (hisparse and not hisparse_bf16):
+    if dflash_verify and dflash_offload:
+        raise ValueError("DFlash storage admission must choose exactly one owner mode.")
+    if dflash_verify and (not speculative or hisparse or not hisparse_bf16):
+        raise ValueError("Resident DFlash requires its explicit resident BF16 recipe.")
+    if dflash_offload and (not speculative or not hisparse or not hisparse_bf16):
+        raise ValueError(
+            "Offload DFlash requires its explicit grouped BF16 owner recipe."
+        )
+    if (speculative and not (dflash_verify or dflash_offload)) or (
+        hisparse and not hisparse_bf16
+    ):
         raise ValueError(
             "SM80 sparse-MLA requires ordinary decode and explicit BF16 HiSparse admission; speculation is unsupported."
         )

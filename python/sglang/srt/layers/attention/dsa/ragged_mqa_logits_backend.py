@@ -55,6 +55,8 @@ class DSARaggedMQALogitsBackend(Enum):
         context_parallel: bool,
         paged_backend: str,
         hisparse_bf16: bool = False,
+        dflash_verify: bool = False,
+        dflash_offload: bool = False,
     ) -> None:
         """Reject unqualified compositions before indexer state creation.
 
@@ -66,9 +68,31 @@ class DSARaggedMQALogitsBackend(Enum):
             Existing paired decode selector, required to be ``triton-sm80``.
         hisparse_bf16 : bool, optional
             Whether the caller admitted the ordinary BF16 HiSparse backend pair.
+        dflash_verify : bool, optional
+            Resolved resident DFlash admission; requires resident target storage.
+        dflash_offload : bool, optional
+            Separate resolved grouped BF16 offload admission; CP stays refused.
         """
+        if dflash_verify and dflash_offload:
+            raise ValueError(
+                "DFlash storage admission must choose exactly one owner mode."
+            )
+        if dflash_verify and (
+            not speculative or hisparse or context_parallel or not hisparse_bf16
+        ):
+            raise ValueError(
+                "Resident DFlash requires its explicit resident BF16 recipe."
+            )
+        if dflash_offload and (
+            not speculative or not hisparse or context_parallel or not hisparse_bf16
+        ):
+            raise ValueError(
+                "Offload DFlash requires its explicit grouped BF16 owner recipe."
+            )
         if self.is_torch_sm80() and (
-            (hisparse and not hisparse_bf16) or speculative or context_parallel
+            (hisparse and not hisparse_bf16)
+            or (speculative and not (dflash_verify or dflash_offload))
+            or context_parallel
         ):
             raise ValueError(
                 "SM80 ragged logits require ordinary prefill with explicit BF16 HiSparse admission, without speculation or context parallelism."

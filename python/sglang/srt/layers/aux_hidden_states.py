@@ -1,5 +1,8 @@
 """Aux hidden states captured for Eagle3/DFlash draft models."""
 
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Callable, List, Optional, Union
 
 import torch
@@ -17,6 +20,97 @@ def set_aux_append_observer(
     """Install an explicit post-copy observer for one active DFlash target binding."""
     global _aux_append_observer
     _aux_append_observer = observer
+
+
+_aux_replay_observer: Optional[Callable[["AuxHiddenStatePacker"], None]] = None
+_aux_capture: ContextVar[Optional["AuxPackerCapture"]] = ContextVar(
+    "native_aux_graph_capture", default=None
+)
+
+
+def set_aux_replay_observer(
+    observer: Optional[Callable[["AuxHiddenStatePacker"], None]],
+) -> None:
+    """Install a replay notification for the active target binding.
+
+    Parameters
+    ----------
+    observer : callable or None
+        Receives an actual completed captured packer after successful replay.
+    """
+    global _aux_replay_observer
+    _aux_replay_observer = observer
+
+
+class AuxPackerCapture:
+    """Retain completed packers created during one actual graph capture.
+
+    Notes
+    -----
+    The backend owns this scope only around capture, excluding warmups. Retained
+    buffers live with that graph shape and are published after its replay.
+    """
+
+    def __init__(self) -> None:
+        self._packers: List[AuxHiddenStatePacker] = []
+
+    @property
+    def packers(self) -> tuple["AuxHiddenStatePacker", ...]:
+        """Return the actual completed native packers in capture order."""
+        return tuple(self._packers)
+
+    def record(self, packer: "AuxHiddenStatePacker") -> None:
+        """Retain an actual packer once after its final original append.
+
+        Parameters
+        ----------
+        packer : AuxHiddenStatePacker
+            Owner whose copied buffer and complete count remain unchanged.
+        """
+        if any(value is packer for value in self._packers):
+            raise RuntimeError("duplicate completed native auxiliary packer")
+        packer.finalize()
+        self._packers.append(packer)
+
+
+@contextmanager
+def capture_aux_packers() -> Iterator[AuxPackerCapture]:
+    """Scope native buffer retention to actual capture and clear it on failure.
+
+    Yields
+    ------
+    AuxPackerCapture
+        Native owners retained by the backend after successful capture.
+    """
+    if _aux_capture.get() is not None:
+        raise RuntimeError("nested native auxiliary graph capture")
+    retained = AuxPackerCapture()
+    token = _aux_capture.set(retained)
+    try:
+        yield retained
+    except BaseException:
+        retained._packers.clear()
+        raise
+    finally:
+        _aux_capture.reset(token)
+
+
+def publish_aux_replay(packers: Sequence["AuxHiddenStatePacker"]) -> None:
+    """Publish completed stable packer buffers after successful graph replay.
+
+    Parameters
+    ----------
+    packers : sequence of AuxHiddenStatePacker
+        Exact retained owners for the shape that has just replayed. No append,
+        copy, cursor mutation or synchronization is introduced here.
+    """
+    if len({id(packer) for packer in packers}) != len(packers):
+        raise RuntimeError("duplicate native auxiliary graph replay owner")
+    for packer in packers:
+        packer.finalize()
+    if _aux_replay_observer is not None:
+        for packer in packers:
+            _aux_replay_observer(packer)
 
 
 class AuxHiddenStatePacker:
@@ -48,6 +142,9 @@ class AuxHiddenStatePacker:
         self._idx += 1
         if _aux_append_observer is not None:
             _aux_append_observer(self)
+        captured = _aux_capture.get()
+        if captured is not None and self._idx == self._num_captures:
+            captured.record(self)
 
     def __len__(self) -> int:
         return self._idx

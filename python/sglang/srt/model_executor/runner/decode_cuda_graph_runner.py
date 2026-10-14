@@ -1278,6 +1278,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
+            # Attention metadata may be pre-planned before pipeline operands
+            # arrive. Replay still needs the current token-major proxy banks.
+            if (
+                pp_proxy_tensors is not None
+                and self.buffers.pp_proxy_tensors is not None
+            ):
+                for key, buffer in self.buffers.pp_proxy_tensors.items():
+                    source = pp_proxy_tensors.tensors[key]
+                    buffer[: source.shape[0]].copy_(source)
             variant_label = self._resolve_lora_variant(forward_batch)
             dsa_variant = self._resolve_dsa_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
@@ -1449,7 +1458,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            rows = (
+                self.raw_num_token
+                if forward_batch.forward_mode.is_target_verify()
+                else self.bs
+            )
+            return PPProxyTensors({k: v[:rows] for k, v in output.tensors.items()})
+
+    def output_buffer_rows(self, shape_key: ShapeKey) -> int:
+        """Translate decode request buckets into captured token-row capacity.
+
+        Parameters
+        ----------
+        shape_key : ShapeKey
+            Request-count bucket, or token-count bucket for ragged verification.
+
+        Returns
+        -------
+        int
+            Number of token rows before any model-owned output sharding.
+        """
+        return (
+            shape_key.size
+            if self.ragged_verify_mode
+            else shape_key.size * self.captured_req_width
+        )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

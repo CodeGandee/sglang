@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
-from typing import TYPE_CHECKING
+import math
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
+    from sglang.srt.arg_groups.overrides import ResolvedView
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,103 @@ def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
 # (arg_groups/overrides.py: _dsa_split_backend_resolution, hisparse arm).
 
 
+def _sm80_bf16_dflash_admitted(view: ResolvedView) -> bool:
+    """Admit only the explicit resolved fixed-wait BF16 DFlash composition.
+
+    Parameters
+    ----------
+    view : ResolvedView
+        Genuine unmodified native resolving state.
+
+    Returns
+    -------
+    bool
+        Whether this speculation exception has the required finite recipe.
+    """
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate HiSparse admission field")
+            result[key] = value
+        return result
+
+    config = json.loads(view.hisparse_config or "{}", object_pairs_hook=unique_object)
+    if not isinstance(config, dict):
+        return False
+    shared = config.get("shared_pool")
+    if not isinstance(shared, dict):
+        return False
+    # Full JSON schema/default normalization stays with product treatment().
+    # Admission follows finite native geometry and explicit fixed backing.
+    pool_fields = {
+        "initial_entries",
+        "growth_entries",
+        "ceiling_entries",
+        "headroom_ratio",
+        "total_budget_bytes",
+    }
+    if shared.keys() - pool_fields:
+        return False
+    sizes = [
+        shared.get(field)
+        for field in ("initial_entries", "growth_entries", "ceiling_entries")
+    ]
+    if any(type(value) is not int or value < 64 or value % 64 for value in sizes):
+        return False
+    initial_entries, growth_entries, ceiling_entries = (
+        cast(int, value) for value in sizes
+    )
+    if initial_entries != ceiling_entries or growth_entries > ceiling_entries:
+        return False
+    if (
+        any(
+            type(value) is not int or value <= 0
+            for value in (
+                view.pp_size,
+                view.max_running_requests,
+                view.context_length,
+                view.max_total_tokens,
+            )
+        )
+        or view.max_total_tokens % 64
+    ):
+        return False
+    cohort = view.max_running_requests * (
+        (min(view.context_length, 8 * 2048) + 63) // 64 * 64
+    )
+    if initial_entries < cohort:
+        return False
+    headroom = shared.get("headroom_ratio")
+    if (
+        isinstance(headroom, bool)
+        or not isinstance(headroom, (int, float))
+        or not math.isfinite(headroom)
+        or headroom < 1.0
+    ):
+        return False
+    explicit_budget = shared.get("total_budget_bytes")
+    if explicit_budget is not None and (
+        type(explicit_budget) is not int or explicit_budget <= 0
+    ):
+        return False
+    return bool(
+        view.speculative_algorithm == "DFLASH"
+        and view.speculative_dflash_implementation == "ours"
+        and view.speculative_num_draft_tokens == 8
+        and view.speculative_dflash_block_size in (None, 8)
+        and view.pp_async_batch_depth == 0
+        and view.disable_overlap_schedule == (view.pp_size > 1)
+        and type(config.get("top_k")) is int
+        and config["top_k"] == 2048
+        and config.get("handoff") == "wait"
+        and config.get("live_growth") is False
+        and type(config.get("initial_device_tokens")) is int
+        and config["initial_device_tokens"] == view.max_total_tokens
+    )
+
+
 def validate_hisparse_dsa_backend(
     server_args: ServerArgs, attr: str, label: str
 ) -> None:
@@ -61,7 +161,10 @@ def validate_hisparse_dsa_backend(
             or view.dsa_paged_mqa_logits_backend != "triton-sm80"
             or view.dsa_ragged_mqa_logits_backend != "torch-sm80"
             or view.dsa_topk_backend != "torch"
-            or view.speculative_algorithm is not None
+            or (
+                view.speculative_algorithm is not None
+                and not _sm80_bf16_dflash_admitted(view)
+            )
             or view.attn_cp_size != 1
             or view.dcp_size != 1
             or view.enable_dsa_prefill_context_parallel

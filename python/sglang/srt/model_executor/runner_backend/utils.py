@@ -61,6 +61,15 @@ def resolve_decode_backend(
     cfg = model_runner.server_args.cuda_graph_config
     backend_name = cfg.decode.backend if cfg is not None else Backend.FULL
 
+    # The target breaks at sparse attention; the independent dense DFlash draft
+    # captures its complete forward. Never rewrite their shared server config.
+    if (
+        backend_name == Backend.BREAKABLE
+        and model_runner.is_draft_worker
+        and model_runner.spec_algorithm.is_dflash_family()
+    ):
+        backend_name = Backend.FULL
+
     enable_memory_saver = model_runner.server_args.enable_memory_saver
 
     if model_runner.device == "npu":

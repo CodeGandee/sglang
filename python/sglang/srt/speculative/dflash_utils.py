@@ -201,6 +201,20 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
             break
         backend = full_backend
     backend_name = type(backend).__name__
+    if backend_name == "DeepseekSparseAttnBackend":
+        from sglang.srt.layers.attention.dsa.sm80_dflash_verify import (
+            sm80_dflash_any_config_admitted,
+        )
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        if type(backend) is DeepseekSparseAttnBackend:
+            device = torch.device(backend.device)
+            if (
+                device.type == "cuda"
+                and sm80_dflash_any_config_admitted()
+                and torch.cuda.get_device_capability(device) == (8, 0)
+            ):
+                return backend_name, False
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 

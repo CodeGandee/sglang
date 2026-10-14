@@ -19,6 +19,7 @@ No torch.compile.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
@@ -26,6 +27,12 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStatePacker,
+    capture_aux_packers,
+    publish_aux_replay,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -55,6 +62,26 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
+def _logits_parts(output: LogitsProcessorOutput) -> Dict[str, Optional[torch.Tensor]]:
+    """Admit only the graph body's row-major tensor result fields."""
+    names = ("next_token_logits", "hidden_states", "full_logits")
+    for descriptor in fields(output):
+        if (
+            descriptor.name not in names
+            and getattr(output, descriptor.name) is not None
+        ):
+            raise ValueError(f"Unsupported BCG logits field: {descriptor.name}")
+    parts = {name: getattr(output, name) for name in names}
+    if not any(value is not None for value in parts.values()):
+        raise ValueError("BCG logits output has no tensor result")
+    for value in parts.values():
+        if value is not None and (not torch.is_tensor(value) or value.ndim < 2):
+            raise ValueError("BCG logits fields must be row-major tensors")
+    if len({value.shape[0] for value in parts.values() if value is not None}) != 1:
+        raise ValueError("BCG logits fields disagree on token rows")
+    return parts
+
+
 class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
@@ -67,10 +94,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
+        self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._capture_inputs: Dict[Any, Any] = {}
+        self._aux_packers: Dict[Any, tuple[AuxHiddenStatePacker, ...]] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
@@ -125,14 +154,18 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
-        size = shape_key.size
+        size = self._cuda_graph_runner.output_buffer_rows(shape_key)
         if self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
-        with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
-            cuda_graph=graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            barrier_fn=self._tp_group.barrier,
+        with (
+            capture_aux_packers() as auxiliary,
+            graph_pool_capture_scope(),
+            BreakableCUDAGraphCapture(
+                cuda_graph=graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                barrier_fn=self._tp_group.barrier,
+            ),
         ):
             out = captured_fn()
             out_rows = self._output_rows(out, size)
@@ -143,6 +176,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
+        self._aux_packers[shape_key] = auxiliary.packers
 
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.
@@ -152,6 +186,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         """
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
+        if isinstance(output, LogitsProcessorOutput):
+            return min(
+                self._output_rows(value, cap)
+                for value in _logits_parts(output).values()
+                if value is not None
+            )
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
@@ -165,6 +205,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return None
         if torch.is_tensor(output):
             return output.new_empty((size, *output.shape[1:]))
+        if isinstance(output, LogitsProcessorOutput):
+            return replace(
+                output,
+                **{
+                    name: self._alloc_full_buffer(value, size)
+                    for name, value in _logits_parts(output).items()
+                },
+            )
         if isinstance(output, PPProxyTensors):
             return PPProxyTensors(
                 {
@@ -183,6 +231,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return None
         if torch.is_tensor(output):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            return replace(
+                output,
+                **{
+                    name: self._slice_output(value, num_tokens)
+                    for name, value in _logits_parts(output).items()
+                },
+            )
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
         if isinstance(output, tuple):
@@ -202,7 +258,27 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 f"{type(output)} vs {type(output_buffer)}"
             )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
+            if (
+                output.ndim != output_buffer.ndim
+                or output.shape[1:] != output_buffer.shape[1:]
+                or output.shape[0] < num_tokens
+                or output_buffer.shape[0] < num_tokens
+                or output.dtype != output_buffer.dtype
+                or output.device != output_buffer.device
+            ):
+                raise ValueError("BCG output tensor geometry changed")
             output_buffer[:num_tokens].copy_(output[:num_tokens])
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            source, destination = _logits_parts(output), _logits_parts(output_buffer)
+            if any(
+                (source[name] is None) != (destination[name] is None) for name in source
+            ):
+                raise ValueError("BCG logits field presence changed")
+            for name, tensor in source.items():
+                self._copy_output_to_buffer(tensor, destination[name], num_tokens)
             return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors
@@ -247,8 +323,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        with graph_pool_replay_scope():
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            graph_forward_batch_scope,
+        )
+
+        with graph_forward_batch_scope(static_forward_batch), graph_pool_replay_scope():
             self._graphs[shape_key].replay()
+            publish_aux_replay(self._aux_packers[shape_key])
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
@@ -256,5 +337,6 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._graphs.clear()
         self._outputs.clear()
         self._capture_inputs.clear()
+        self._aux_packers.clear()
         self._pool = None
         self._shared_output_buffer = None

@@ -35,6 +35,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
     from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
         BaseCudaGraphBackend,
     )
@@ -132,6 +133,21 @@ class BaseCudaGraphRunner(BaseRunner):
     # Subclasses populate before calling capture().
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
+
+    def output_buffer_rows(self, shape_key: ShapeKey) -> int:
+        """Return token-row capacity for a captured shape.
+
+        Parameters
+        ----------
+        shape_key : ShapeKey
+            Phase-owned capture geometry; prefill sizes already count tokens.
+
+        Returns
+        -------
+        int
+            Leading row capacity required by the model output buffers.
+        """
+        return shape_key.size
 
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:

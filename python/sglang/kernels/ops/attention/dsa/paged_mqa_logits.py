@@ -3,8 +3,33 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
+
+
+@dataclass(frozen=True)
+class SM80DFlashVerifyLayout:
+    """Carry the request-major verification extent of one admitted call.
+
+    Parameters
+    ----------
+    batch_size : int
+        Positive number of requests in the current native verification call.
+    """
+
+    batch_size: int
+
+    @property
+    def query_rows(self) -> int:
+        """Return the actual rows in the linear block-eight layout.
+
+        Returns
+        -------
+        int
+            Unpadded query count for the current call.
+        """
+        return self.batch_size * 8
 
 
 def sm80_paged_mqa_logits(
@@ -20,6 +45,7 @@ def sm80_paged_mqa_logits(
     next_n: int,
     is_decode: bool,
     indices: torch.Tensor | None = None,
+    verify_layout: SM80DFlashVerifyLayout | None = None,
 ) -> torch.Tensor:
     """Dispatch the explicit SM80 indexer after validating its query boundary.
 
@@ -34,19 +60,36 @@ def sm80_paged_mqa_logits(
     B : int
         Number of request rows.
     next_n : int
-        Queries per request; must be one for nonempty decode batches.
+        Queries per request; one for decode or eight for admitted verification.
     is_decode : bool
-        Whether the caller is in decode/idle mode. Verification and extend
-        calls are rejected before import or launch.
+        Whether the caller is in decode/idle mode.
     indices : torch.Tensor, optional
         Restricted key selection is unsupported by this implementation.
+    verify_layout : SM80DFlashVerifyLayout, optional
+        Call-local layout validated against actual native DFlash target input.
+        Missing admission retains the existing decode-only contract.
 
     Returns
     -------
     torch.Tensor
         FP32 logits for the actual query rows.
     """
-    if not is_decode or q_offset != B or (B > 0 and next_n != 1):
+    if verify_layout is not None:
+        if (
+            is_decode
+            or type(verify_layout.batch_size) is not int
+            or verify_layout.batch_size < 1
+            or B != verify_layout.batch_size
+            or next_n != 8
+            or q_offset != verify_layout.query_rows
+            or seq_lens.shape != (q_offset,)
+            or block_tables.ndim != 2
+            or block_tables.shape[0] != q_offset
+        ):
+            raise ValueError(
+                "SM80 verification requires matching request-major Bx8 rows"
+            )
+    elif not is_decode or q_offset != B or (B > 0 and next_n != 1):
         raise NotImplementedError(
             "The SM80 paged-MQA kernel supports single-query decode only."
         )

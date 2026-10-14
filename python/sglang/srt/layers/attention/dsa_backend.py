@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -15,6 +15,7 @@ from typing import (
 )
 
 import torch
+
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel, get_spec
 
@@ -51,6 +52,11 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
+from sglang.srt.layers.attention.dsa.sm80_dflash_verify import (
+    require_sm80_dflash_verify,
+    sm80_dflash_offload_config_admitted,
+    sm80_dflash_verify_config_admitted,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
@@ -73,7 +79,11 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_utils import capture_mode
+from sglang.srt.runtime_context import get_buffer, get_exec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -329,6 +339,40 @@ _DSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
+def _sm80_dflash_capture_stub(
+    backend: DeepseekSparseAttnBackend,
+    q: torch.Tensor,
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    save_kv_cache: bool,
+    q_rope: torch.Tensor | None,
+    k_rope: torch.Tensor | None,
+    topk_indices: torch.Tensor | None,
+) -> torch.Tensor:
+    """Allocate the admitted capture bridge without touching live KV owners."""
+    del backend, k, v, save_kv_cache, q_rope, k_rope, topk_indices
+    layout = require_sm80_dflash_verify(forward_batch, q.shape[0])
+    graph = get_exec().graph.cuda_graph_config
+    if (
+        graph.decode.backend != "breakable"
+        or graph.prefill.backend != "disabled"
+        or q.shape[0] != layout.query_rows
+        or q.dtype != torch.bfloat16
+        or layer.tp_q_head_num <= 0
+        or layer.head_dim != 576
+        or layer.v_head_dim != 512
+        or layer.is_cross_attention
+    ):
+        raise ValueError(
+            "SM80 target capture requires a declared breakable Bx8 BF16 MLA bucket"
+        )
+    # The native graph runner selects its effective request bucket after
+    # capacity clamping/alignment. Raw declarations need not contain that size.
+    return q.new_zeros((layout.query_rows, layer.tp_q_head_num, 512))
+
+
 class DeepseekSparseAttnBackend(
     DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
@@ -377,6 +421,8 @@ class DeepseekSparseAttnBackend(
                     == "torch-sm80"
                     and model_runner.server_args.dsa_topk_backend == "torch"
                 ),
+                dflash_verify=sm80_dflash_verify_config_admitted(),
+                dflash_offload=sm80_dflash_offload_config_admitted(),
             )
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             model_runner.server_args.dsa_paged_mqa_logits_backend
@@ -2097,6 +2143,248 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    @eager_on_graph(True, capture_stub=_sm80_dflash_capture_stub)
+    def _forward_sm80_dflash_verify(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        q_rope: torch.Tensor | None,
+        k_rope: torch.Tensor | None,
+        topk_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Execute the admitted resident verification through unchanged MLA.
+
+        Parameters
+        ----------
+        q, k, v, q_rope, k_rope : torch.Tensor, optional
+            Existing native MLA operands; queries and KV remain BF16.
+        layer : RadixAttention
+            Native causal MLA layer with dimensions 512+64.
+        forward_batch : ForwardBatch
+            Actual request-major linear DFlash verification input.
+        save_kv_cache : bool
+            Whether the native producer must store the supplied KV operands.
+        topk_indices : torch.Tensor, optional
+            Native logical selections, padded to the query input extent.
+
+        Returns
+        -------
+        torch.Tensor
+            Native BF16 attention outputs, including zeroed padded query rows.
+        """
+        if capture_mode.is_capture_mode:
+            return _sm80_dflash_capture_stub(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                topk_indices,
+            )
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            get_graph_forward_batch,
+        )
+
+        live_frame = get_graph_forward_batch()
+        current_frame = forward_batch if live_frame is None else live_frame
+        layout = require_sm80_dflash_verify(current_frame, q.shape[0])
+        rows = layout.query_rows
+        if (
+            live_frame is not None
+            and live_frame is not forward_batch
+            and (
+                forward_batch.forward_mode != live_frame.forward_mode
+                or forward_batch.spec_algorithm != live_frame.spec_algorithm
+                or forward_batch.batch_size < layout.batch_size
+                or q.shape[0] != forward_batch.batch_size * 8
+            )
+        ):
+            raise ValueError("SM80 graph capture geometry differs from its live frame")
+        if current_frame.out_cache_loc.shape != (rows,) or any(
+            tensor is not None and tensor.shape[0] < rows for tensor in (k, k_rope)
+        ):
+            raise ValueError("SM80 live KV production geometry differs")
+        if (
+            self.use_mha
+            or self.use_fused_topk
+            or layer.is_cross_attention
+            or self.speculative_num_draft_tokens != 8
+            or self.real_page_size != 64
+            or self.token_to_kv_pool.dtype != torch.bfloat16
+            or layer.v_head_dim != 512
+            or layer.head_dim != 576
+            or any(
+                tensor is not None
+                and (tensor.dtype != torch.bfloat16 or tensor.device != q.device)
+                for tensor in (q, k, q_rope, k_rope)
+            )
+        ):
+            raise ValueError("SM80 resident verification requires causal BF16 MLA")
+        if topk_indices is None:
+            raise RuntimeError("SM80 verification lacks logical selections")
+        metadata = self.forward_metadata
+        if (
+            self.hisparse_coordinator is None
+            and (metadata.page_table_1 is None or metadata.page_table_1.shape[0] < rows)
+        ) or metadata.dsa_cache_seqlens_int32.shape != (forward_batch.batch_size * 8,):
+            raise ValueError(
+                "SM80 resident verification lacks expanded native metadata"
+            )
+        if rows < forward_batch.batch_size * 8:
+            metadata = replace(
+                metadata,
+                page_table_1=(
+                    None
+                    if metadata.page_table_1 is None
+                    else metadata.page_table_1[:rows]
+                ),
+                cu_seqlens_q=metadata.cu_seqlens_q[: layout.batch_size + 1],
+                dsa_cache_seqlens_int32=metadata.dsa_cache_seqlens_int32[:rows],
+                dsa_seqlens_expanded=metadata.dsa_seqlens_expanded[:rows],
+            )
+        coordinator = self.hisparse_coordinator
+        transaction = None
+        if coordinator is not None:
+            grouped = coordinator._group_attention
+            transaction = coordinator._target_kv._round
+            if (
+                grouped is None
+                or grouped.record_bytes != 1152
+                or transaction is None
+                or transaction.block_size != 8
+                or len(transaction.owners) != layout.batch_size
+            ):
+                raise RuntimeError(
+                    "BF16 verification requires its actual grouped target transaction"
+                )
+        selected = self._pad_topk_indices(topk_indices, q.shape[0])[:rows]
+        lengths = metadata.dsa_seqlens_expanded[:rows]
+        if (
+            selected.shape != (rows, 2048)
+            or selected.dtype not in (torch.int32, torch.int64)
+            or lengths.shape != (rows,)
+            or selected.device != lengths.device
+        ):
+            raise ValueError(
+                "SM80 verification requires per-query lengths and 2048 selections"
+            )
+        selected = torch.where(
+            (selected >= 0) & (selected < lengths[:, None]), selected, -1
+        )
+        if k is not None and save_kv_cache:
+            if v is None:
+                raise ValueError("Native MLA producer requires its value operand")
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer,
+                current_frame.out_cache_loc,
+                k[:rows],
+                None if k_rope is None else k_rope[:rows],
+            )
+        cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if q_rope is None:
+            q_all = q.contiguous().view(-1, layer.tp_q_head_num, 576)
+        else:
+            q_all = concat_mla_absorb_q_general(
+                q.view(-1, layer.tp_q_head_num, 512),
+                q_rope.view(-1, layer.tp_q_head_num, 64),
+            )
+        from sglang.kernels.ops.attention.dsa.sparse_mla_decode_sm80 import (
+            sparse_mla_decode_sm80,
+        )
+
+        def consume(
+            backend: DeepseekSparseAttnBackend,
+            query: torch.Tensor,
+            working_cache: torch.Tensor,
+            value_width: int,
+            scale: float,
+            attention_layer: RadixAttention,
+            local_metadata: DSAMetadata,
+            locations: torch.Tensor,
+        ) -> torch.Tensor:
+            """Consume actual leased rows once; release stays with the binding.
+
+            Parameters
+            ----------
+            backend, query, working_cache, value_width, scale, attention_layer,
+            local_metadata, locations : object
+                The maintained binding's unmodified operands and actual lease.
+
+            Returns
+            -------
+            Tensor
+                Native BF16 MLA output in flattened request/query order.
+            """
+            if (
+                query.dtype != torch.bfloat16
+                or working_cache.dtype != torch.bfloat16
+                or tuple(working_cache.shape[1:]) != (1, 576)
+                or not working_cache.is_contiguous()
+                or working_cache.data_ptr() % 16
+                or locations.shape != (query.shape[0], 2048)
+                or local_metadata.dsa_cache_seqlens_int32.shape != (query.shape[0],)
+            ):
+                raise ValueError("BF16 leased consumer geometry differs")
+            return sparse_mla_decode_sm80(
+                q_nope=query[:, :, :512],
+                q_rope=query[:, :, 512:],
+                kv=working_cache,
+                indices=locations.unsqueeze(1),
+                sm_scale=scale,
+                d_v=value_width,
+            ).squeeze(0)
+
+        if coordinator is not None:
+            assert transaction is not None
+            output = coordinator.attend_group(
+                self,
+                consume,
+                q_all[:rows],
+                cache,
+                layer.v_head_dim,
+                layer.scaling,
+                layer,
+                metadata,
+                selected.reshape(layout.batch_size, 8, 2048),
+                layer.layer_id,
+                torch.stack([owner.scratch[:8] for owner in transaction.owners]),
+                transaction.committed,
+                lengths.reshape(layout.batch_size, 8),
+            )
+        else:
+            physical = transform_index_page_table_prefill(
+                page_table=metadata.page_table_1,
+                topk_indices=selected,
+                extend_lens_cpu=[8] * layout.batch_size,
+                page_size=1,
+                output_num_tokens=rows,
+                page_table_is_expanded=True,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+            )
+            output = consume(
+                self,
+                q_all[:rows],
+                cache,
+                layer.v_head_dim,
+                layer.scaling,
+                layer,
+                metadata,
+                physical,
+            )
+        if q_all.shape[0] > rows:
+            output = torch.cat(
+                (output, output.new_zeros(q_all.shape[0] - rows, *output.shape[1:]))
+            )
+        return output
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2113,6 +2401,21 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            self.dsa_decode_impl == "triton-sm80"
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            return self._forward_sm80_dflash_verify(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                topk_indices,
+            )
         if self.dsa_prefill_impl == "triton-sm80" or (
             self.dsa_decode_impl == "triton-sm80"
             and (
@@ -2227,9 +2530,12 @@ class DeepseekSparseAttnBackend(
             producer_locs = torch.stack(
                 [owner.scratch[:query_count] for owner in verify_round.owners]
             )
-            limits = verify_round.committed[:, None] + torch.arange(
-                1, query_count + 1, device=selected_group.device
-            )[None, :]
+            limits = (
+                verify_round.committed[:, None]
+                + torch.arange(1, query_count + 1, device=selected_group.device)[
+                    None, :
+                ]
+            )
             return grouped_owner.attend_group(
                 self,
                 DeepseekSparseAttnBackend._forward_flashmla_kv,
@@ -2486,9 +2792,7 @@ class DeepseekSparseAttnBackend(
 
             _require_sm80(q.device)
             if not forward_batch.forward_mode.is_decode_or_idle():
-                raise NotImplementedError(
-                    "SM80 sparse-MLA requires ordinary decode."
-                )
+                raise NotImplementedError("SM80 sparse-MLA requires ordinary decode.")
             if (
                 self.token_to_kv_pool.dtype != torch.bfloat16
                 or any(
@@ -2502,7 +2806,9 @@ class DeepseekSparseAttnBackend(
                 or layer.v_head_dim != 512
                 or layer.head_dim != 576
             ):
-                raise ValueError("SM80 sparse-MLA requires BF16 queries/KV and dimensions 512+64.")
+                raise ValueError(
+                    "SM80 sparse-MLA requires BF16 queries/KV and dimensions 512+64."
+                )
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2572,9 +2878,11 @@ class DeepseekSparseAttnBackend(
             if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             batch_size = forward_batch.batch_size
-            producer_locs = grouped_owner.mem_pool_device.full_to_hisparse_device_index_mapping[
-                forward_batch.out_cache_loc.long()
-            ].reshape(batch_size, 1)
+            producer_locs = (
+                grouped_owner.mem_pool_device.full_to_hisparse_device_index_mapping[
+                    forward_batch.out_cache_loc.long()
+                ].reshape(batch_size, 1)
+            )
             committed = forward_batch.seq_lens - 1
             return grouped_owner.attend_group(
                 self,

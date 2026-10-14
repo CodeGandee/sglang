@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Iterator
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_backend_utils import (
@@ -25,7 +27,49 @@ from sglang.srt.model_executor.runner_backend_utils import (
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 _in_breakable_cuda_graph = False
+_forward_batch: ContextVar[ForwardBatch | None] = ContextVar(
+    "breakable_graph_forward_batch", default=None
+)
+
+
+def get_graph_forward_batch() -> ForwardBatch | None:
+    """Return the current real frame while retaining captured tensor geometry.
+
+    Returns
+    -------
+    ForwardBatch, optional
+        Actual native frame supplied by the current target/replay owner.
+    """
+    return _forward_batch.get()
+
+
+@contextmanager
+def graph_forward_batch_scope(forward_batch: ForwardBatch) -> Iterator[None]:
+    """Delegate one actual native frame and restore it after success or failure.
+
+    Parameters
+    ----------
+    forward_batch : ForwardBatch
+        Original live frame. An enclosing authenticated target scope must
+        delegate this same object; captured frames are never mutated.
+
+    Yields
+    ------
+    None
+        Scope in which eager graph breaks can read current live geometry.
+    """
+    current = _forward_batch.get()
+    if current is not None and current is not forward_batch:
+        raise RuntimeError("graph replay supplied a foreign target forward frame")
+    token = _forward_batch.set(forward_batch)
+    try:
+        yield
+    finally:
+        _forward_batch.reset(token)
 
 
 def is_in_breakable_cuda_graph() -> bool:

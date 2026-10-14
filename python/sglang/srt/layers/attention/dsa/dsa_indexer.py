@@ -29,6 +29,11 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 from sglang.srt.layers.attention.dsa.ragged_mqa_logits_backend import (
     DSARaggedMQALogitsBackend,
 )
+from sglang.srt.layers.attention.dsa.sm80_dflash_verify import (
+    require_sm80_dflash_verify,
+    sm80_dflash_offload_config_admitted,
+    sm80_dflash_verify_config_admitted,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -274,6 +279,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     and get_exec().kernel.dsa_decode_backend == "triton-sm80"
                     and get_exec().kernel.dsa_topk_backend == "torch"
                 ),
+                dflash_verify=sm80_dflash_verify_config_admitted(),
+                dflash_offload=sm80_dflash_offload_config_admitted(),
             )
         if _is_cuda:
             self.sm_count = (
@@ -827,9 +834,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
+        verify_layout = None
+        if (
+            self.paged_mqa_logits_backend.is_triton_sm80()
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            verify_layout = require_sm80_dflash_verify(forward_batch, q_fp8.shape[0])
+            if (
+                metadata.get_seqlens_expanded().shape != (verify_layout.query_rows,)
+                or metadata.get_page_table_64().shape[0] != verify_layout.query_rows
+                or sum(metadata.get_dsa_extend_len_cpu()) != verify_layout.query_rows
+            ):
+                raise ValueError("SM80 verification requires expanded causal metadata")
         if (
             self.paged_mqa_logits_backend.is_triton_sm80()
             and not forward_batch.forward_mode.is_decode_or_idle()
+            and verify_layout is None
         ):
             raise NotImplementedError(
                 "The SM80 paged-MQA indexer supports decode only."
@@ -940,6 +960,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 B=B,
                 next_n=next_n,
                 is_decode=forward_batch.forward_mode.is_decode_or_idle(),
+                verify_layout=verify_layout,
             )
         elif self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
@@ -1631,17 +1652,34 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        sm80_verify = (
+            self.paged_mqa_logits_backend.is_triton_sm80()
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        if sm80_verify:
+            require_sm80_dflash_verify(forward_batch)
+            if self.dsa_enable_prefill_cp:
+                raise NotImplementedError(
+                    "SM80 DFlash verification rejects context parallelism"
+                )
         if self.ragged_mqa_logits_backend.is_torch_sm80() and (
             forward_batch.attn_cp_metadata is not None
             or not (
-                forward_batch.forward_mode.is_extend_without_speculative()
+                sm80_verify
+                or forward_batch.forward_mode.is_extend_without_speculative()
                 or forward_batch.forward_mode.is_decode_or_idle()
             )
         ):
-            raise NotImplementedError("SM80 ragged logits support ordinary prefill only.")
-        if self.paged_mqa_logits_backend.is_triton_sm80() and (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+            raise NotImplementedError(
+                "SM80 ragged logits support ordinary prefill only."
+            )
+        if (
+            self.paged_mqa_logits_backend.is_triton_sm80()
+            and not sm80_verify
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             raise NotImplementedError(
                 "The SM80 paged-MQA indexer does not support speculative verification."
@@ -1659,7 +1697,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         x_meta = x[0] if isinstance(x, tuple) else x
 
         in_piecewise_or_breakable_cuda_graph = (
-            _is_in_piecewise_or_breakable_cuda_graph()
+            _is_in_piecewise_or_breakable_cuda_graph() and not sm80_verify
         )
 
         # In piecewise/breakable CUDA graph mode, metadata is fetched inside
