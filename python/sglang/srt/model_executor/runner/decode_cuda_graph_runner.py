@@ -429,6 +429,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
+            pp_proxy_aux_keys=self.model_runner.get_pp_proxy_dflash_aux_keys(),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same

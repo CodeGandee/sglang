@@ -44,6 +44,7 @@ def _buffers(
     hc_width: int | None = None,
     residual_blocks: int | None = None,
     topk: int | None = None,
+    aux: list[str] | None = None,
 ) -> DecodeInputBuffers:
     return DecodeInputBuffers.create(
         device=torch.device("cpu"),
@@ -64,6 +65,7 @@ def _buffers(
         hc_hidden_size=hc_width,
         pp_proxy_topk_size=topk,
         pp_proxy_residual_num_blocks=residual_blocks,
+        pp_proxy_aux_keys=aux,
     )
 
 
@@ -332,6 +334,120 @@ class TestDecodePPTokenBuffers(unittest.TestCase):
             for name, bank in buffers.pp_proxy_tensors.items():
                 self.assertTrue(torch.equal(bank, before[name]))
             self.assertEqual(metadata.call_count, 1)
+
+    def test_dflash_aux_pipeline_buffers_allocate_adopt_and_refresh(self) -> None:
+        aux = ["dflash_aux_l5", "dflash_aux_l23"]
+        buffers = _buffers(2, 16, aux=aux)
+        assert buffers.pp_proxy_tensors is not None
+        for name in aux:
+            self.assertEqual(buffers.pp_proxy_tensors[name].shape, (16, 6144))
+            self.assertEqual(buffers.pp_proxy_tensors[name].dtype, torch.bfloat16)
+        self.assertIsNone(_buffers(pp=1, aux=aux).pp_proxy_tensors)
+        buffers.share_buffers()
+        registry = _registry(buffers)
+        for name in aux:
+            self.assertIs(
+                registry.get_slot("pp_proxy_tensors." + name).buffer,
+                buffers.pp_proxy_tensors[name],
+            )
+        runner = _runner(buffers)
+        forward, backend, _ = runner.capture_prepare(1)
+        for bank in buffers.pp_proxy_tensors.values():
+            bank.fill_(-9)
+        with patch.object(backend, "init_forward_metadata_out_graph") as metadata:
+            runner.load_batch(forward)
+            forward.mark_forward_metadata_ready()
+            incoming = PPProxyTensors(
+                {
+                    name: torch.full_like(bank[:8], 5)
+                    for name, bank in buffers.pp_proxy_tensors.items()
+                }
+            )
+            runner.load_batch(forward, incoming)
+            for name, bank in buffers.pp_proxy_tensors.items():
+                self.assertTrue((bank[:8] == 5).all(), name)
+                self.assertTrue((bank[8:] == -9).all(), name)
+            self.assertEqual(metadata.call_count, 1)
+
+    def test_resolve_pp_proxy_dflash_aux_keys_matches_stage_ownership(self) -> None:
+        from sglang.srt.model_executor.model_runner_components import misc_utils
+
+        glm = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+        )
+        features = [5, 23, 41, 59]
+        # GLM-5.3 runs 78 layers; a PP4 stage owns a half-open native range
+        # and receives exactly the features captured at upstream layer outputs.
+        for pp_rank, start_layer, expected in (
+            (0, 0, None),
+            (1, 20, ["dflash_aux_l5"]),
+            (2, 40, ["dflash_aux_l5", "dflash_aux_l23"]),
+            (3, 59, ["dflash_aux_l5", "dflash_aux_l23", "dflash_aux_l41"]),
+        ):
+            with self.subTest(pp_rank=pp_rank):
+                self.assertEqual(
+                    misc_utils.resolve_pp_proxy_dflash_aux_keys(
+                        model_config=glm,
+                        pp_size=4,
+                        pp_rank=pp_rank,
+                        start_layer=start_layer,
+                        dflash_target_layer_ids=features,
+                    ),
+                    expected,
+                )
+        # A feature whose capture point opens the stage is local, not relayed.
+        self.assertIsNone(
+            misc_utils.resolve_pp_proxy_dflash_aux_keys(
+                model_config=glm,
+                pp_size=4,
+                pp_rank=1,
+                start_layer=20,
+                dflash_target_layer_ids=[19],
+            )
+        )
+        for pp_size, ids in ((1, features), (4, None), (4, [])):
+            with self.subTest(pp_size=pp_size, ids=ids):
+                self.assertIsNone(
+                    misc_utils.resolve_pp_proxy_dflash_aux_keys(
+                        model_config=glm,
+                        pp_size=pp_size,
+                        pp_rank=3,
+                        start_layer=59,
+                        dflash_target_layer_ids=ids,
+                    )
+                )
+        with self.assertRaisesRegex(RuntimeError, "post-layer capture"):
+            misc_utils.resolve_pp_proxy_dflash_aux_keys(
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+                ),
+                pp_size=4,
+                pp_rank=1,
+                start_layer=20,
+                dflash_target_layer_ids=features,
+            )
+
+    def test_dflash_aux_key_contract_matches_predkv_plugin(self) -> None:
+        from predkv_extensions.dflash2 import capture as predkv_capture
+        from predkv_extensions.dflash2 import pp_worker as predkv_pp_worker
+        from sglang.srt.model_executor.model_runner_components import misc_utils
+
+        glm = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+        )
+        resolved = misc_utils.resolve_pp_proxy_dflash_aux_keys(
+            model_config=glm,
+            pp_size=4,
+            pp_rank=3,
+            start_layer=59,
+            dflash_target_layer_ids=[5, 23, 41, 59],
+        )
+        assert resolved is not None
+        self.assertEqual(
+            resolved,
+            [f"{predkv_capture.AUX_PREFIX}{i}" for i in (5, 23, 41)],
+        )
+        self.assertEqual(resolved, [predkv_pp_worker.aux_key(i) for i in (5, 23, 41)])
 
     def test_registry_refuses_oversized_pipeline_payload(self) -> None:
         buffers = _buffers()

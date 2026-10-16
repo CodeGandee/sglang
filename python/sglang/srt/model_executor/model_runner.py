@@ -776,6 +776,15 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_dflash_aux_keys(self) -> Optional[List[str]]:
+        return misc_utils.resolve_pp_proxy_dflash_aux_keys(
+            model_config=self.model_config,
+            pp_size=self.ps.pp_size,
+            pp_rank=self.ps.pp_rank,
+            start_layer=self.layer_info.start_layer,
+            dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
+        )
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
@@ -90,3 +90,43 @@ def resolve_pp_proxy_residual_num_blocks(
     if block_size is None:
         return None
     return (start_layer + block_size - 1) // block_size
+
+
+# Target families whose native DFlash capture records the aux hidden state at
+# the layer output, i.e. feature id + 1 is the native capture index, so stage
+# ownership follows the native half-open stage layer range.
+_DFLASH_POST_LAYER_CAPTURE_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    }
+)
+
+
+def resolve_pp_proxy_dflash_aux_keys(
+    *,
+    model_config: ModelConfig,
+    pp_size: int,
+    pp_rank: int,
+    start_layer: int,
+    dflash_target_layer_ids: Optional[List[int]],
+) -> Optional[List[str]]:
+    """Return the relayed DFlash aux proxy keys arriving at this PP stage.
+
+    Each non-zero stage receives one ``dflash_aux_l<id>`` proxy entry per
+    target feature captured at an upstream layer output. The decode graph
+    input buffers must carry exactly these keys: the populate loop copies
+    every buffered key out of the incoming proxy, and a missing buffer leaves
+    the replay reading stale data.
+    """
+    if pp_size <= 1 or pp_rank == 0 or not dflash_target_layer_ids:
+        return None
+    architectures = getattr(model_config.hf_config, "architectures", None) or []
+    if not _DFLASH_POST_LAYER_CAPTURE_ARCHITECTURES.intersection(architectures):
+        raise RuntimeError(
+            "DFlash PP graph input buffers require the post-layer capture "
+            f"convention; unsupported target architectures {architectures!r}."
+        )
+    upstream = [i for i in dflash_target_layer_ids if i + 1 < start_layer]
+    return [f"dflash_aux_l{i}" for i in upstream] or None

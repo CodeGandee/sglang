@@ -19,7 +19,7 @@ import inspect
 import logging
 from abc import ABC, abstractmethod
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 
@@ -83,6 +83,7 @@ def _allocate_decode_buffers(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    pp_proxy_aux_keys: Optional[List[str]] = None,
     allocate_logits_buffer: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
@@ -136,6 +137,10 @@ def _allocate_decode_buffers(
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
                 )
+            # Relayed DFlash aux captures arrive as named proxy entries; the
+            # buffered set must match exactly the keys upstream stages relay.
+            for aux_key in pp_proxy_aux_keys or ():
+                pp_proxy_tensors[aux_key] = torch.zeros((max_num_token, hs), dtype=dtype)
         else:
             pp_proxy_tensors = None
 
@@ -364,6 +369,7 @@ class BaseRunner(ABC):
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
+            pp_proxy_aux_keys=mr.get_pp_proxy_dflash_aux_keys(),
             allocate_logits_buffer=allocate_logits_buffer,
         )
 

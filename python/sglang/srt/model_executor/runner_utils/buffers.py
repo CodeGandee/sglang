@@ -106,6 +106,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
+        pp_proxy_aux_keys: Optional[List[str]] = None,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -150,6 +151,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if pp_proxy_topk_size is not None:
                     pp_proxy_tensors["topk_indices"] = torch.zeros(
                         (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                    )
+                # Relayed DFlash aux captures arrive as named proxy entries;
+                # the populate loop copies every buffered key from the
+                # incoming proxy, so the buffered set must match exactly the
+                # keys upstream stages relay to this stage.
+                for aux_key in pp_proxy_aux_keys or ():
+                    pp_proxy_tensors[aux_key] = torch.zeros(
+                        (max_num_token, hs), dtype=dtype
                     )
             else:
                 pp_proxy_tensors = None
