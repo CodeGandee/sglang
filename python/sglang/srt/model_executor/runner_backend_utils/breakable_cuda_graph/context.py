@@ -72,6 +72,37 @@ def graph_forward_batch_scope(forward_batch: ForwardBatch) -> Iterator[None]:
         _forward_batch.reset(token)
 
 
+def delegated_replay_frame(
+    live_frame: ForwardBatch | None, fallback_frame: ForwardBatch
+) -> ForwardBatch:
+    """Resolve the frame a nested graph replay must delegate.
+
+    An enclosing authenticated target scope (e.g., the DFlash target hook)
+    publishes the live serving frame; a nested replay must delegate that same
+    object so eager break regions keep reading live geometry. When no scope
+    is active, or the published frame is not the batch being executed, the
+    replay keeps its own static frame and the foreign-frame refusal in
+    graph_forward_batch_scope stays in force.
+
+    Parameters
+    ----------
+    live_frame : ForwardBatch, optional
+        The batch the nested replay is executing on behalf of.
+    fallback_frame : ForwardBatch
+        Static frame captured for this replay when delegation is not valid.
+
+    Returns
+    -------
+    ForwardBatch
+        Published live frame when it authenticates `live_frame`, otherwise
+        `fallback_frame`.
+    """
+    published = get_graph_forward_batch()
+    if published is not None and published is live_frame:
+        return published
+    return fallback_frame
+
+
 def is_in_breakable_cuda_graph() -> bool:
     return _in_breakable_cuda_graph
 

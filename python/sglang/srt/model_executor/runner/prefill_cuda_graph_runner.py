@@ -104,6 +104,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     BCG_FAILURE_HINT,
+    delegated_replay_frame,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     TCPCG_FAILURE_HINT,
@@ -1680,7 +1681,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
-            hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            hs = self.backend.replay(
+                shape_key,
+                delegated_replay_frame(forward_batch, static_forward_batch),
+                **kwargs,
+            )
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
