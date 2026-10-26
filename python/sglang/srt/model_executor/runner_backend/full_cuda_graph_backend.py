@@ -80,6 +80,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         finally:
             self._capture_stream = None
 
+    def make_graph(self) -> torch.cuda.CUDAGraph:
+        """Construct the graph owned by one capture bucket.
+
+        Returns
+        -------
+        torch.cuda.CUDAGraph
+            A native graph. Specialized backends may retain its source graph
+            for composition without changing global CUDA graph constructors.
+        """
+        return torch.cuda.CUDAGraph()
+
     def capture_one(
         self,
         shape_key: ShapeKey,
@@ -113,7 +124,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = torch.cuda.CUDAGraph()
+        graph = self.make_graph()
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
