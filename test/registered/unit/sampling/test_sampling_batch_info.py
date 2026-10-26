@@ -309,6 +309,15 @@ class TestUpdateRegexVocabMask(CustomTestCase):
 # filter_batch
 class TestFilterBatch(CustomTestCase):
 
+    def test_filter_without_penalizer_orchestrator(self):
+        """Filtering a copied batch must tolerate the optional orchestrator being absent."""
+        info = _make_info(batch_size=2, penalizer_orchestrator=None)
+        info.temperatures = torch.tensor([[1.0], [2.0]])
+        keep = torch.tensor([1])
+        info.filter_batch([1], keep)
+        self.assertEqual(len(info), 1)
+        self.assertAlmostEqual(info.temperatures[0, 0].item(), 2.0)
+
     def test_filter_keeps_correct_indices(self):
         """Test that filter retains rows at indices 0 and 2, dropping index 1."""
         info = _make_info(batch_size=3)
