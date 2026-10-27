@@ -163,22 +163,20 @@ class TestCaptureOneWithProfiling(CustomTestCase):
 
 
 class TestAuxiliaryReplayPublication(CustomTestCase):
-    def test_capture_reuses_an_existing_auxiliary_scope(self):
+    def test_capture_retries_when_forward_owns_auxiliary_scope(self):
         runner = _make_runner(enable_profile=False, profiler=None)
         backend = _make_backend(runner)
         shape_key = ShapeKey(size=4)
-        active = SimpleNamespace(packers=(object(),))
 
         with mock.patch(
-            "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.active_aux_packers",
-            return_value=active,
-        ), mock.patch(
             "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.capture_aux_packers",
-            side_effect=AssertionError("nested capture"),
+            side_effect=RuntimeError("nested native auxiliary graph capture"),
         ), mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
-            backend.capture_one(shape_key, mock.Mock(return_value="output"))
+            forward = mock.Mock(return_value="output")
+            backend.capture_one(shape_key, forward)
 
-        self.assertIs(backend._aux_packers[shape_key], active.packers)
+        self.assertEqual(forward.call_count, 3)
+        self.assertEqual(backend._aux_packers[shape_key], ())
 
     def test_replay_publishes_shape_owned_packers_once(self):
         runner = _make_runner(enable_profile=False, profiler=None)
