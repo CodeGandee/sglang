@@ -24,6 +24,12 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStatePacker,
+    capture_aux_packers,
+    publish_aux_replay,
+)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
@@ -168,15 +174,58 @@ class TestAuxiliaryReplayPublication(CustomTestCase):
         backend = _make_backend(runner)
         shape_key = ShapeKey(size=4)
 
-        with mock.patch(
-            "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.capture_aux_packers",
-            side_effect=RuntimeError("nested native auxiliary graph capture"),
-        ), mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+        with (
+            mock.patch(
+                "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.capture_aux_packers",
+                side_effect=RuntimeError("nested native auxiliary graph capture"),
+            ),
+            mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
+        ):
             forward = mock.Mock(return_value="output")
             backend.capture_one(shape_key, forward)
 
         self.assertEqual(forward.call_count, 3)
         self.assertEqual(backend._aux_packers[shape_key], ())
+
+    def test_nested_retry_retains_bounded_packers_for_replay(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        backend = _make_backend(runner)
+        shape_key = ShapeKey(size=2)
+        retained = []
+        output = object()
+
+        def bounded_body():
+            if not torch.cuda.is_current_stream_capturing():
+                return output
+            with capture_aux_packers() as auxiliary:
+                packer = AuxHiddenStatePacker(1)
+                packer.append(torch.zeros((2, 4), dtype=torch.bfloat16))
+            retained.append(packer)
+            backend._aux_packers[shape_key] = auxiliary.packers
+            return output
+
+        with (
+            mock.patch(
+                "torch.cuda.CUDAGraph",
+                return_value=SimpleNamespace(replay=mock.Mock()),
+            ),
+            mock.patch.object(
+                torch.cuda,
+                "is_current_stream_capturing",
+                side_effect=[False, False, True, True],
+            ),
+            mock.patch(
+                "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.publish_aux_replay",
+                wraps=publish_aux_replay,
+            ) as publish,
+        ):
+            backend.capture_one(shape_key, bounded_body)
+            self.assertEqual(backend._aux_packers[shape_key], (retained[0],))
+            result = backend.replay(shape_key, static_forward_batch=object())
+
+        self.assertIs(result, output)
+        publish.assert_called_once_with((retained[0],))
+        self.assertEqual(retained[0]._idx, 1)
 
     def test_replay_publishes_shape_owned_packers_once(self):
         runner = _make_runner(enable_profile=False, profiler=None)

@@ -17,9 +17,10 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
@@ -61,15 +62,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
     ) -> None:
-        self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
-        self._outputs: Dict[Any, Any] = {}
-        self._aux_packers: Dict[Any, tuple[AuxHiddenStatePacker, ...]] = {}
+        self._graphs: dict[Any, torch.cuda.CUDAGraph] = {}
+        self._outputs: dict[Any, Any] = {}
+        self._aux_packers: dict[Any, tuple[AuxHiddenStatePacker, ...]] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
-        self._capture_stream: Optional[torch.cuda.Stream] = None
-        self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
+        self._capture_stream: torch.cuda.Stream | None = None
+        self._memory_saver_adapter: Any | None = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
@@ -100,8 +101,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        capture_inputs: Optional[Any] = None,
-        post_warmup_hook: Optional[Callable[[], None]] = None,
+        capture_inputs: Any | None = None,
+        post_warmup_hook: Callable[[], None] | None = None,
     ) -> None:
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
@@ -165,7 +166,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
-        self._aux_packers[shape_key] = captured_aux
+        self._aux_packers[shape_key] = self._aux_packers.get(shape_key, captured_aux)
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
