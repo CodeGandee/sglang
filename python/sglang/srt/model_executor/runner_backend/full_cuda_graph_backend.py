@@ -17,7 +17,7 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -28,6 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
+    active_aux_packers,
     capture_aux_packers,
     publish_aux_replay,
 )
@@ -143,8 +144,13 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = self._device_module.graph
 
+        auxiliary_scope = (
+            nullcontext(active)
+            if (active := active_aux_packers()) is not None
+            else capture_aux_packers()
+        )
         with (
-            capture_aux_packers() as auxiliary,
+            auxiliary_scope as auxiliary,
             graph_pool_capture_scope(),
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):

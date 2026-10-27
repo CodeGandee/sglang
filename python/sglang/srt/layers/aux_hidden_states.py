@@ -95,6 +95,11 @@ def capture_aux_packers() -> Iterator[AuxPackerCapture]:
         _aux_capture.reset(token)
 
 
+def active_aux_packers() -> Optional[AuxPackerCapture]:
+    """Return the current graph-owned auxiliary capture, if one is active."""
+    return _aux_capture.get()
+
+
 def publish_aux_replay(packers: Sequence["AuxHiddenStatePacker"]) -> None:
     """Publish completed stable packer buffers after successful graph replay.
 
