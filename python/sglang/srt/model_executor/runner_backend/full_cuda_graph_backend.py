@@ -22,10 +22,14 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
-
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
+)
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStatePacker,
+    capture_aux_packers,
+    publish_aux_replay,
 )
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -59,6 +63,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._aux_packers: Dict[Any, tuple[AuxHiddenStatePacker, ...]] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -139,6 +144,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = self._device_module.graph
 
         with (
+            capture_aux_packers() as auxiliary,
             graph_pool_capture_scope(),
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
@@ -149,6 +155,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        self._aux_packers[shape_key] = auxiliary.packers
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -165,9 +172,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> Any:
         with graph_pool_replay_scope():
             self._graphs[shape_key].replay()
+            publish_aux_replay(self._aux_packers[shape_key])
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()
+        self._aux_packers.clear()
         self._pool = None

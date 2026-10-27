@@ -54,6 +54,7 @@ def _make_backend(runner):
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
     backend._graphs = {}
     backend._outputs = {}
+    backend._aux_packers = {}
     backend._pool = None
     backend._capture_stream = None
     backend._memory_saver_adapter = None
@@ -136,8 +137,11 @@ class TestCaptureOneWithProfiling(CustomTestCase):
             rf_names.append(name)
             return contextlib.nullcontext()
 
-        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"), mock.patch(
-            "torch.profiler.record_function", side_effect=_fake_record_function
+        with (
+            mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
+            mock.patch(
+                "torch.profiler.record_function", side_effect=_fake_record_function
+            ),
         ):
             backend.capture_one(ShapeKey(size=size), forward_fn)
 
@@ -156,6 +160,36 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         # trace naming is handled by the profiler's on_trace_ready callback.
         _, _, rf_names = self._run(size=4, num_tokens_per_bs=1, mode_name="DECODE")
         self.assertEqual(rf_names, [])
+
+
+class TestAuxiliaryReplayPublication(CustomTestCase):
+    def test_replay_publishes_shape_owned_packers_once(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        backend = _make_backend(runner)
+        shape_key = ShapeKey(size=4)
+        replay = mock.Mock(name="replay")
+        packers = (object(),)
+        backend._graphs[shape_key] = SimpleNamespace(replay=replay)
+        backend._outputs[shape_key] = "output"
+        backend._aux_packers[shape_key] = packers
+
+        with mock.patch(
+            "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.publish_aux_replay"
+        ) as publish:
+            result = backend.replay(shape_key, static_forward_batch=object())
+
+        self.assertEqual(result, "output")
+        replay.assert_called_once_with()
+        publish.assert_called_once_with(packers)
+
+    def test_cleanup_drops_auxiliary_replay_owners(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        backend = _make_backend(runner)
+        backend._aux_packers[ShapeKey(size=2)] = (object(),)
+
+        backend.cleanup()
+
+        self.assertEqual(backend._aux_packers, {})
 
 
 if __name__ == "__main__":
