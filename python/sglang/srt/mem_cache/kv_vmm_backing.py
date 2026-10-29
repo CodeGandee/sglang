@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 from dataclasses import dataclass
 from math import prod
@@ -112,15 +113,35 @@ class KvVmmArena:
         return self._stub.cursor_bytes
 
     def close(self) -> None:
+        """Retire private tensor blocks before unmapping their virtual addresses.
+
+        Raises
+        ------
+        RuntimeError
+            A live/deferred tensor block retains this arena. Keep its mappings
+            and open ownership so the caller can drop aliases and retry.
+        """
         if self._closed:
             return
-        self._closed = True
         with torch.cuda.device(self.device_id):
-            try:
-                torch.cuda.synchronize(self.device_id)
-            except Exception as e:  # pragma: no cover
-                logger.warning("KvVmmArena.close synchronize failed: %s", e)
+            torch.cuda.synchronize(self.device_id)
+            if self.pool is not None:
+                segments = self.pool.snapshot(include_traces=False)
+                if any(
+                    not isinstance(segment.get("blocks"), list)
+                    or any(
+                        block.get("state") != "inactive"
+                        for block in segment["blocks"]
+                    )
+                    for segment in segments
+                ):
+                    raise RuntimeError("VMM arena retains live or deferred tensor blocks")
+                # Retire the caching allocator while its bump allocator and VA
+                # still exist. Releasing VA first permits unsafe address reuse.
+                self.pool = None
+                gc.collect()
             self._allocation.close()
+            self._closed = True
 
 
 # torch's caching allocator hands the pluggable allocator whole large-pool segments
@@ -388,8 +409,9 @@ class KvVmmBufferOwner:
 
     def close(self) -> None:
         self.tensors = []
-        self._specs = []
+        gc.collect()
         if self._arena is not None:
             self._arena.close()
             self._arena = None
+        self._specs = []
         self._usable_num_tokens = 0

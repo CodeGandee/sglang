@@ -1,12 +1,17 @@
 """CPU owning-boundary regressions for live backing and allocator publication."""
 
+import gc
 import unittest
+import weakref
+from collections.abc import Callable
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt import cuda_vmm_utils
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_vmm_backing import (
@@ -65,6 +70,114 @@ def _owner():
     owner.tensors = []
     owner.grow_prefix(4)
     return owner
+
+
+class _SnapshotPool:
+    def __init__(self, segments: list[dict[str, Any]], calls: list[str]) -> None:
+        self.segments = segments
+        self.calls = calls
+        self.snapshots = 0
+
+    def snapshot(self, *, include_traces: bool) -> list[dict[str, Any]]:
+        assert include_traces is False
+        self.snapshots += 1
+        return self.segments
+
+    def __del__(self) -> None:
+        self.calls.append("pool-retired")
+
+
+def _probe_with_constructor_tensor(
+    probe: Callable[[], object],
+) -> tuple[weakref.ReferenceType[torch.Tensor], object]:
+    # Match the native constructor aliases seen in the device teardown trace.
+    tensor = torch.empty(1)
+    t = tensor
+    buffer = tensor
+    reference = weakref.ref(tensor)
+    result = probe()
+    assert t is buffer
+    return reference, result
+
+
+class TestVmmProbeWarningLifetime(unittest.TestCase):
+    def test_fabric_warning_record_releases_constructor_tensor(self) -> None:
+        def refuse_fabric(device: object) -> None:
+            raise RuntimeError("fabric query unavailable")
+
+        with (
+            patch.object(
+                cuda_vmm_utils,
+                "pynvml",
+                SimpleNamespace(nvmlInit=lambda: None, nvmlShutdown=lambda: None),
+            ),
+            patch.object(cuda_vmm_utils, "_gpu_fabric_clique", refuse_fabric),
+            self.assertLogs(cuda_vmm_utils.logger, level="WARNING") as captured,
+        ):
+            reference, ready = _probe_with_constructor_tensor(
+                lambda: cuda_vmm_utils.is_gpu_fabric_ready(torch.device("cuda", 3))
+            )
+        self.assertFalse(ready)
+        self.assertEqual(len(captured.records), 1)
+        record = captured.records[0]
+        self.assertIsNone(record.exc_info)
+        self.assertEqual(record.args, ("RuntimeError('fabric query unavailable')",))
+        self.assertEqual(
+            record.getMessage(),
+            "GPU fabric readiness query failed: RuntimeError('fabric query unavailable')",
+        )
+        gc.collect()
+        # The capture handler still owns its record, just as pytest does.
+        self.assertIsNone(reference())
+
+    def test_fallback_warning_record_releases_constructor_tensor(self) -> None:
+        def granularity(handle_type: int) -> int:
+            if handle_type == 1:
+                raise RuntimeError("fabric backing unavailable")
+            return 65536
+
+        driver = SimpleNamespace(
+            CUmemAllocationHandleType=SimpleNamespace(
+                CU_MEM_HANDLE_TYPE_FABRIC=1,
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR=2,
+            ),
+            cuMemCreate=lambda *args: 7,
+            cuMemRelease=lambda *args: None,
+        )
+        cuda_vmm_utils.get_device_allocation_handle_type.cache_clear()
+        try:
+            with (
+                patch.object(cuda_vmm_utils, "_get_cuda_driver", return_value=driver),
+                patch.object(cuda_vmm_utils, "is_gpu_fabric_ready", return_value=True),
+                patch.object(
+                    cuda_vmm_utils,
+                    "make_device_allocation_prop",
+                    side_effect=lambda device, *, handle_types, **kwargs: handle_types,
+                ),
+                patch.object(cuda_vmm_utils, "get_allocation_granularity", granularity),
+                patch.object(
+                    cuda_vmm_utils,
+                    "check_drv",
+                    side_effect=lambda value, label: value,
+                ),
+                self.assertLogs(cuda_vmm_utils.logger, level="WARNING") as captured,
+            ):
+                reference, selected = _probe_with_constructor_tensor(
+                    lambda: cuda_vmm_utils.get_device_allocation_handle_type(3)
+                )
+            self.assertEqual(selected, 2)
+            self.assertEqual(len(captured.records), 1)
+            record = captured.records[0]
+            self.assertIsNone(record.exc_info)
+            self.assertEqual(record.args, ("FABRIC", 3, "fabric backing unavailable"))
+            self.assertEqual(
+                record.getMessage(),
+                "CUDA VMM FABRIC backing unavailable on device 3; trying fallback: fabric backing unavailable",
+            )
+            gc.collect()
+            self.assertIsNone(reference())
+        finally:
+            cuda_vmm_utils.get_device_allocation_handle_type.cache_clear()
 
 
 class TestLiveAllocatorGrowth(unittest.TestCase):
@@ -162,6 +275,8 @@ class TestLiveVmmGrowth(unittest.TestCase):
         arena = object.__new__(KvVmmArena)
         arena._closed = False
         arena.device_id = 3
+        arena.pool = _SnapshotPool([{"blocks": [{"state": "inactive"}]}], calls)
+        pool_reference = weakref.ref(arena.pool)
         arena._allocation = SimpleNamespace(close=lambda: calls.append("driver-close"))
         with (
             patch.object(torch.cuda, "device", return_value=Context()) as device,
@@ -174,9 +289,132 @@ class TestLiveVmmGrowth(unittest.TestCase):
             arena.close()
             arena.close()
             device.assert_called_once_with(3)
+        self.assertIsNone(pool_reference())
+        self.assertIsNone(arena.pool)
+        self.assertTrue(arena._closed)
         self.assertEqual(
-            calls, ["enter-device-3", "sync-3", "driver-close", "exit-device-3"]
+            calls,
+            [
+                "enter-device-3",
+                "sync-3",
+                "pool-retired",
+                "driver-close",
+                "exit-device-3",
+            ],
         )
+
+    def test_live_deferred_and_unknown_blocks_keep_mapping_until_retry(self) -> None:
+        for state in ("active_allocated", "active_awaiting_free", "unknown", None):
+            with self.subTest(state=state):
+                calls: list[str] = []
+                arena = object.__new__(KvVmmArena)
+                arena._closed = False
+                arena.device_id = 3
+                arena.pool = _SnapshotPool([{"blocks": [{"state": state}]}], calls)
+                pool_reference = weakref.ref(arena.pool)
+                allocation = SimpleNamespace(close=lambda: calls.append("driver-close"))
+                arena._allocation = allocation
+                with (
+                    patch.object(torch.cuda, "device", return_value=nullcontext()),
+                    patch.object(torch.cuda, "synchronize") as synchronize,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "retains live or deferred"
+                    ):
+                        arena.close()
+                    self.assertFalse(arena._closed)
+                    self.assertIs(arena._allocation, allocation)
+                    self.assertIs(arena.pool, pool_reference())
+                    self.assertEqual(calls, [])
+                    arena.pool.segments[0]["blocks"][0]["state"] = "inactive"
+                    arena.close()
+                    arena.close()
+                self.assertEqual(
+                    synchronize.call_args_list, [unittest.mock.call(3)] * 2
+                )
+                self.assertIsNone(pool_reference())
+                self.assertTrue(arena._closed)
+                self.assertEqual(calls, ["pool-retired", "driver-close"])
+
+    def test_missing_or_malformed_block_inventory_keeps_mapping(self) -> None:
+        for segment in ({}, {"blocks": None}, {"blocks": ()}):
+            with self.subTest(segment=segment):
+                calls: list[str] = []
+                arena = object.__new__(KvVmmArena)
+                arena._closed = False
+                arena.device_id = 3
+                arena.pool = _SnapshotPool([segment], calls)
+                arena._allocation = SimpleNamespace(
+                    close=lambda: calls.append("driver-close")
+                )
+                with (
+                    patch.object(torch.cuda, "device", return_value=nullcontext()),
+                    patch.object(torch.cuda, "synchronize"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "retains live or deferred"
+                    ):
+                        arena.close()
+                    self.assertFalse(arena._closed)
+                    self.assertEqual(calls, [])
+                    arena.pool.segments = [{"blocks": [{"state": "inactive"}]}]
+                    arena.close()
+                self.assertEqual(calls, ["pool-retired", "driver-close"])
+
+    def test_failed_synchronize_keeps_pool_and_mapping_until_retry(self) -> None:
+        calls: list[str] = []
+        arena = object.__new__(KvVmmArena)
+        arena._closed = False
+        arena.device_id = 3
+        arena.pool = _SnapshotPool([{"blocks": [{"state": "inactive"}]}], calls)
+        pool_reference = weakref.ref(arena.pool)
+        arena._allocation = SimpleNamespace(close=lambda: calls.append("driver-close"))
+        with (
+            patch.object(torch.cuda, "device", return_value=nullcontext()),
+            patch.object(
+                torch.cuda, "synchronize", side_effect=RuntimeError("drain failed")
+            ) as synchronize,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "drain failed"):
+                arena.close()
+            self.assertFalse(arena._closed)
+            self.assertIs(arena.pool, pool_reference())
+            self.assertEqual(arena.pool.snapshots, 0)
+            self.assertEqual(calls, [])
+            synchronize.side_effect = None
+            arena.close()
+        self.assertIsNone(pool_reference())
+        self.assertTrue(arena._closed)
+        self.assertEqual(calls, ["pool-retired", "driver-close"])
+
+    def test_owner_refusal_preserves_backing_receipts_until_retry(self) -> None:
+        owner = _owner()
+        arena = owner._arena
+        arena.reserved = 4096
+        specs = owner._specs
+        states = owner.buffer_states
+        before = (
+            owner.backed_bytes,
+            owner.reserved_virtual_bytes,
+            owner.usable_num_tokens,
+        )
+        with patch.object(arena, "close", side_effect=RuntimeError("live alias")):
+            with self.assertRaisesRegex(RuntimeError, "live alias"):
+                owner.close()
+        self.assertFalse(arena.closed)
+        self.assertIs(owner._arena, arena)
+        self.assertIs(owner._specs, specs)
+        self.assertEqual(owner.buffer_states, states)
+        self.assertEqual(
+            (owner.backed_bytes, owner.reserved_virtual_bytes, owner.usable_num_tokens),
+            before,
+        )
+        owner.close()
+        owner.close()
+        self.assertTrue(arena.closed)
+        self.assertEqual(owner.buffer_states, ())
+        self.assertEqual(owner.reserved_virtual_bytes, 0)
+        self.assertEqual(owner.usable_num_tokens, 0)
 
     def test_construction_failure_closes_partial_mappings(self):
         arena = _Arena()

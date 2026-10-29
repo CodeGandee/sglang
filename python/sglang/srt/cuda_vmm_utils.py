@@ -197,7 +197,7 @@ def is_gpu_fabric_ready(device: torch.device) -> bool:
         finally:
             pynvml.nvmlShutdown()
     except Exception as error:
-        logger.warning("GPU fabric readiness query failed: %r", error)
+        logger.warning("GPU fabric readiness query failed: %s", repr(error))
         return False
 
 
@@ -254,7 +254,7 @@ def get_device_allocation_handle_type(device_id: int) -> int:
                 "CUDA VMM %s backing unavailable on device %d; trying fallback: %s",
                 name,
                 device_id,
-                error,
+                str(error),
             )
             continue
         logger.info(
