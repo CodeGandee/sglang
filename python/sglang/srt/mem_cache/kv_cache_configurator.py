@@ -239,6 +239,8 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_inkling_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    _profiled_pool_budget_bytes: int = field(init=False)
+    _runtime_capture_reserve_bytes: int = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
