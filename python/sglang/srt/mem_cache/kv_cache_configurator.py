@@ -1808,7 +1808,12 @@ class KVCacheConfigurator:
                 f"decoding, draft weights are now counted."
             )
 
-        return int(rest_memory * (1 << 30))  # return in bytes
+        # Retain the actual native plan for storage consumers that need to
+        # protect a finite capture allowance before backing another arena.
+        # Multimodal and fixed mamba reservations remain outside this scope.
+        self._profiled_pool_budget_bytes = int(rest_memory * (1 << 30))
+        self._runtime_capture_reserve_bytes = int(slack_gb * (1 << 30))
+        return self._profiled_pool_budget_bytes
 
     def _calculate_mamba_ratio(self) -> int:
         if get_memory().disable_radix_cache:
@@ -1941,6 +1946,8 @@ class KVCacheConfigurator:
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
+        config.profiled_pool_budget_bytes = self._profiled_pool_budget_bytes
+        config.runtime_capture_reserve_bytes = self._runtime_capture_reserve_bytes
         return config
 
     def config_from_budget(

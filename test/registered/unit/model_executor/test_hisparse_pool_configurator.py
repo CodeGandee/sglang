@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -13,6 +13,35 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestHiSparsePoolConfigurator(CustomTestCase):
+    def test_native_pool_and_capture_allowances_preserve_actual_profile(self):
+        from sglang.srt.mem_cache import kv_cache_configurator as native
+
+        owner = SimpleNamespace(
+            device="cpu",
+            gpu_id=0,
+            mambaish_config=None,
+            model_config=SimpleNamespace(is_multimodal=False),
+            server_args=SimpleNamespace(mm_feature_transport="none"),
+        )
+        with (
+            patch.object(native, "get_available_gpu_memory", return_value=70),
+            patch.object(
+                native,
+                "get_world_group",
+                return_value=SimpleNamespace(world_size=1, cpu_group=None),
+            ),
+            patch.object(
+                native,
+                "get_schedule",
+                return_value=SimpleNamespace(mem_fraction_static=0.875),
+            ),
+            patch.object(native, "mm_runtime_reservation_gb", return_value=2),
+        ):
+            available = native.KVCacheConfigurator._profile_available_bytes(owner, 80)
+        self.assertEqual(available, 58 * (1 << 30))
+        self.assertEqual(owner._profiled_pool_budget_bytes, available)
+        self.assertEqual(owner._runtime_capture_reserve_bytes, 10 * (1 << 30))
+
     def _compute_cell_size(
         self,
         kv_cache_dtype: torch.dtype,

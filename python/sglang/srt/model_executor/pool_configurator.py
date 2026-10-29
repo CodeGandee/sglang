@@ -54,7 +54,14 @@ from sglang.srt.utils.common import (
 
 @dataclass
 class MemoryPoolConfig:
-    """Resolved memory pool config, shared between target and draft workers."""
+    """Resolved memory pool config, shared between target and draft workers.
+
+    ``profiled_pool_budget_bytes`` records the native post-weight static pool
+    allowance before token constraints. ``runtime_capture_reserve_bytes`` is
+    the existing non-static runtime/capture reserve, not an additional pool.
+    They describe one process memory plan even when a draft inherits this
+    config; consumers must not add a second copy for that draft.
+    """
 
     max_total_num_tokens: int
     max_running_requests: Optional[int] = None
@@ -68,6 +75,8 @@ class MemoryPoolConfig:
     c128_state_pool_size: int = 0
 
     mem_fraction_static: Optional[float] = None
+    profiled_pool_budget_bytes: Optional[int] = None
+    runtime_capture_reserve_bytes: Optional[int] = None
 
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
