@@ -111,7 +111,14 @@ class TestSM80TileLangDispatch(CustomTestCase):
                 with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
                     self.assertIs(_maintained_wrapper(v1, v2)(*tensors, 0.0625), result)
                 v1.assert_called_once_with(
-                    heads, 512, 64, 2048, sm_scale=0.0625, block_I=16, num_stages=1
+                    heads,
+                    512,
+                    64,
+                    2048,
+                    sm_scale=0.0625,
+                    block_I=16,
+                    num_stages=1,
+                    threads=64,
                 )
                 v2.assert_not_called()
                 launch.assert_called_once_with(*tensors)
@@ -224,30 +231,50 @@ class TestSM80TileLangPrefill(CustomTestCase):
 
     def test_weighted_logical_reference_diagnostic(self) -> None:
         generator = torch.Generator().manual_seed(91)
-        q = (
-            (torch.randn((2, 8, 576), generator=generator) / 8)
-            .to(torch.bfloat16)
-            .cuda()
-        )
-        kv = (
-            (torch.randn((67, 1, 576), generator=generator) / 8)
-            .to(torch.bfloat16)
-            .cuda()
-        )
-        indices = torch.full((2, 1, 2048), -1, dtype=torch.int32, device="cuda")
-        indices[0, 0, 64:128] = torch.arange(64, device="cuda")
-        indices[1, 0, 0] = 66
-        reference = _logical_reference(q, kv, indices)
-        output = _native_forward(q, kv, indices).cpu()
-        self.assertTrue(torch.isfinite(output).all().item())
-        # One selected key is an exact arithmetic witness for arbitrary q/kv.
-        self.assertTrue(torch.equal(output[0, 1], kv[66, 0, :512].cpu().expand(8, 512)))
-        mismatch = int((output != reference.to(torch.bfloat16)).sum())
-        residual = float((output.double() - reference).abs().max())
-        print(
-            f"weighted diagnostic: max_abs={residual:.9g}, strict_bf16_mismatches={mismatch}; "
-            "FP64 logical reference does not qualify existing BF16 probabilities/exp2 semantics"
-        )
+        for heads in (8, 64, 128):
+            with self.subTest(heads=heads):
+                q = (
+                    (torch.randn((2, heads, 576), generator=generator) / 8)
+                    .to(torch.bfloat16)
+                    .cuda()
+                )
+                kv = (
+                    (torch.randn((67, 1, 576), generator=generator) / 8)
+                    .to(torch.bfloat16)
+                    .cuda()
+                )
+                indices = torch.full((2, 1, 2048), -1, dtype=torch.int32, device="cuda")
+                indices[0, 0, 64:128] = torch.arange(64, device="cuda")
+                indices[1, 0, 0] = 66
+                reference = _logical_reference(q, kv, indices)
+                output = _native_forward(q, kv, indices).cpu()
+                self.assertTrue(torch.isfinite(output).all().item())
+                # One selected key is an exact arithmetic witness for arbitrary q/kv.
+                self.assertTrue(
+                    torch.equal(output[0, 1], kv[66, 0, :512].cpu().expand(heads, 512))
+                )
+                mismatch = int((output != reference.to(torch.bfloat16)).sum())
+                residual = float((output.double() - reference).abs().max())
+                print(
+                    f"weighted diagnostic H{heads}: max_abs={residual:.9g}, "
+                    f"strict_bf16_mismatches={mismatch}; "
+                    "FP64 logical reference does not qualify existing BF16 probabilities/exp2 semantics"
+                )
+                # Independent heads and query rows must retain their exact
+                # identity under reordering, including across replicated H64
+                # tiles. This is a geometry check of the same candidate, not
+                # arithmetic equality to the FP64 diagnostic reference.
+                head_order = torch.randperm(heads, generator=generator).to(q.device)
+                row_order = torch.tensor([1, 0], device=q.device)
+                reordered = _native_forward(
+                    q.index_select(0, row_order).index_select(1, head_order),
+                    kv,
+                    indices.index_select(0, row_order),
+                ).cpu()
+                expected = output.index_select(1, row_order.cpu()).index_select(
+                    2, head_order.cpu()
+                )
+                self.assertTrue(torch.equal(reordered, expected))
 
 
 if __name__ == "__main__":

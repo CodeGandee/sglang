@@ -1402,6 +1402,9 @@ def tilelang_sparse_fwd(
             # too large on SM80; use the existing BI16 template for that tile.
             if num_heads > 32:
                 kernel_options["block_I"] = 16
+                # FullCol must give QK (N16) and PV (N512) the same row
+                # ownership: two warps keep both GEMMs at m1/n2.
+                kernel_options["threads"] = 64
             kernel = sparse_attention_fwd_kernel_v1(
                 num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, **kernel_options
             )
