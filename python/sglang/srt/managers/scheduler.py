@@ -618,6 +618,7 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
+        self.init_schedule_stream()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1502,6 +1503,31 @@ class Scheduler(
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
+    def init_schedule_stream(self) -> None:
+        """Initialize the final scheduling stream before publishing readiness.
+
+        The event loop reuses this exact stream so startup qualification and
+        serving retain the same native allocation and synchronization owner.
+        """
+        if use_mlx():
+            return
+
+        self.schedule_stream = self.device_module.Stream(priority=0)
+        if self.device == "cpu":
+            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        elif is_cuda() or _is_hip:
+            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
+            # stream aliases forward_stream, which would eliminate scheduler
+            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
+            # other accelerators (e.g. NPU/XPU) skip the alias check.
+            _redraws = 0
+            while (
+                self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
+                and _redraws < 64
+            ):
+                self.schedule_stream = self.device_module.Stream(priority=0)
+                _redraws += 1
+
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
             self.tp_worker.model_runner.ngram_embedding_manager
@@ -1669,8 +1695,8 @@ class Scheduler(
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
-        Sets up the schedule stream and dispatches to the appropriate event loop.
-        The event loop blocks until shutdown.
+        Reuses the initialized schedule stream and dispatches to the appropriate
+        event loop, which blocks until shutdown.
         """
         # Engine init (graph capture, warmups) is done; from here on any
         # Triton kernel device-load is a lazy first-use at serving time.
@@ -1683,21 +1709,6 @@ class Scheduler(
             dispatch_event_loop(self)
             return
 
-        self.schedule_stream = self.device_module.Stream(priority=0)
-        if self.device == "cpu":
-            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif is_cuda() or _is_hip:
-            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
-            # stream aliases forward_stream, which would eliminate scheduler
-            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
-            # other accelerators (e.g. NPU/XPU) skip the alias check.
-            _redraws = 0
-            while (
-                self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
-                and _redraws < 64
-            ):
-                self.schedule_stream = self.device_module.Stream(priority=0)
-                _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
