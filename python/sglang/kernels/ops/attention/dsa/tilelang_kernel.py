@@ -1396,8 +1396,14 @@ def tilelang_sparse_fwd(
                 )
             # The v1 Tensor layout is compact; native callers normally already are.
             q, kv, indices = q.contiguous(), kv.contiguous(), indices.contiguous()
+            kernel_options = {"num_stages": 1}
+            # v1 pads 33..64 heads to an H64 tile and replicates that tile for
+            # larger admitted head counts. Its default BI64 shared buffers are
+            # too large on SM80; use the existing BI16 template for that tile.
+            if num_heads > 32:
+                kernel_options["block_I"] = 16
             kernel = sparse_attention_fwd_kernel_v1(
-                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, **kernel_options
             )
         else:
             kernel = sparse_attention_fwd_kernel_v2(

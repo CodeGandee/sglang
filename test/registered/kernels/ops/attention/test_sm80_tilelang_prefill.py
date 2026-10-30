@@ -77,21 +77,46 @@ def _logical_reference(
 
 class TestSM80TileLangDispatch(CustomTestCase):
     def test_sm80_selects_single_stage_v1_and_compacts_views(self) -> None:
-        result = torch.zeros(1)
-        launch = Mock(return_value=result)
-        v1, v2 = Mock(return_value=launch), Mock()
-        tensors = (
-            _fake_tensor((3, 8, 576), torch.bfloat16),
-            _fake_tensor((4, 1, 576), torch.bfloat16),
-            _fake_tensor((3, 1, 2048), torch.int32),
-        )
-        with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
-            self.assertIs(_maintained_wrapper(v1, v2)(*tensors, 0.0625), result)
-        v1.assert_called_once_with(8, 512, 64, 2048, sm_scale=0.0625, num_stages=1)
-        v2.assert_not_called()
-        launch.assert_called_once_with(*tensors)
-        for tensor in tensors:
-            tensor.contiguous.assert_called_once_with()
+        for heads in (8, 32):
+            with self.subTest(heads=heads):
+                result = torch.zeros(1)
+                launch = Mock(return_value=result)
+                v1, v2 = Mock(return_value=launch), Mock()
+                tensors = (
+                    _fake_tensor((3, heads, 576), torch.bfloat16),
+                    _fake_tensor((4, 1, 576), torch.bfloat16),
+                    _fake_tensor((3, 1, 2048), torch.int32),
+                )
+                with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
+                    self.assertIs(_maintained_wrapper(v1, v2)(*tensors, 0.0625), result)
+                v1.assert_called_once_with(
+                    heads, 512, 64, 2048, sm_scale=0.0625, num_stages=1
+                )
+                v2.assert_not_called()
+                launch.assert_called_once_with(*tensors)
+                for tensor in tensors:
+                    tensor.contiguous.assert_called_once_with()
+
+    def test_sm80_effective_h64_tile_uses_smaller_existing_index_block(self) -> None:
+        for heads in (64, 128):
+            with self.subTest(heads=heads):
+                result = torch.zeros(1)
+                launch = Mock(return_value=result)
+                v1, v2 = Mock(return_value=launch), Mock()
+                tensors = (
+                    _fake_tensor((3, heads, 576), torch.bfloat16),
+                    _fake_tensor((4, 1, 576), torch.bfloat16),
+                    _fake_tensor((3, 1, 2048), torch.int32),
+                )
+                with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
+                    self.assertIs(_maintained_wrapper(v1, v2)(*tensors, 0.0625), result)
+                v1.assert_called_once_with(
+                    heads, 512, 64, 2048, sm_scale=0.0625, block_I=16, num_stages=1
+                )
+                v2.assert_not_called()
+                launch.assert_called_once_with(*tensors)
+                for tensor in tensors:
+                    tensor.contiguous.assert_called_once_with()
 
     def test_other_cuda_architectures_preserve_v2(self) -> None:
         for capability in ((9, 0), (10, 0)):
@@ -99,13 +124,13 @@ class TestSM80TileLangDispatch(CustomTestCase):
                 launch = Mock(return_value=torch.zeros(1))
                 v1, v2 = Mock(), Mock(return_value=launch)
                 tensors = (
-                    _fake_tensor((2, 32, 576), torch.bfloat16),
+                    _fake_tensor((2, 64, 576), torch.bfloat16),
                     _fake_tensor((4, 1, 576), torch.bfloat16),
                     _fake_tensor((2, 1, 2048), torch.int32),
                 )
                 with patch("torch.cuda.get_device_capability", return_value=capability):
                     _maintained_wrapper(v1, v2)(*tensors, 0.0625)
-                v2.assert_called_once_with(32, 512, 64, 2048, sm_scale=0.0625)
+                v2.assert_called_once_with(64, 512, 64, 2048, sm_scale=0.0625)
                 v1.assert_not_called()
                 for tensor in tensors:
                     tensor.contiguous.assert_not_called()
@@ -136,7 +161,7 @@ class TestSM80TileLangDispatch(CustomTestCase):
 )
 class TestSM80TileLangPrefill(CustomTestCase):
     def test_native_empty_prefix_padding_and_head_partitions(self) -> None:
-        for heads in (8, 32):
+        for heads in (8, 32, 64):
             with self.subTest(heads=heads):
                 # Admitted sliced layouts are compacted only by the SM80 branch.
                 q = torch.zeros(
@@ -169,6 +194,33 @@ class TestSM80TileLangPrefill(CustomTestCase):
                 self.assertTrue(
                     torch.equal(_native_forward(q, kv, indices).cpu(), expected)
                 )
+
+    def test_native_h64_full_topk_and_changed_selection(self) -> None:
+        q = torch.zeros((2, 64, 576), device="cuda", dtype=torch.bfloat16)
+        kv = torch.empty((2048, 1, 576), device="cuda", dtype=torch.bfloat16)
+        rows = torch.arange(2048, device="cuda", dtype=torch.int32)
+        kv.copy_((rows.remainder(2) + 1)[:, None, None])
+        indices = torch.full((2, 1, 2048), -1, device="cuda", dtype=torch.int32)
+        indices[0, 0] = rows
+        properties = torch.cuda.get_device_properties(q.device)
+        print(
+            "SM80 native H64 prefill: "
+            f"device={q.device}, shared_memory_per_block_optin="
+            f"{properties.shared_memory_per_block_optin}, topk=2048"
+        )
+        expected = torch.zeros((1, 2, 64, 512), dtype=torch.bfloat16)
+        expected[:, 0].fill_(1.5)
+        output = _native_forward(q, kv, indices)
+        self.assertTrue(torch.isfinite(output).all().item())
+        self.assertTrue(torch.equal(output.cpu(), expected))
+
+        # The same admitted shapes now gather only even rows (all ones), while
+        # the previously empty row gathers exactly one odd row (all twos).
+        indices[0, 0] = rows.remainder(1024) * 2
+        indices[1, 0, 0] = 2047
+        expected[:, 0].fill_(1)
+        expected[:, 1].fill_(2)
+        self.assertTrue(torch.equal(_native_forward(q, kv, indices).cpu(), expected))
 
     def test_weighted_logical_reference_diagnostic(self) -> None:
         generator = torch.Generator().manual_seed(91)
