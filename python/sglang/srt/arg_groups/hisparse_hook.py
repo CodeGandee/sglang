@@ -44,7 +44,7 @@ def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
 
 
 def _sm80_bf16_dflash_admitted(view: ResolvedView) -> bool:
-    """Admit only the explicit resolved fixed-wait BF16 DFlash composition.
+    """Admit the resolved fixed-wait BF16 DFlash storage composition.
 
     Parameters
     ----------
@@ -54,7 +54,8 @@ def _sm80_bf16_dflash_admitted(view: ResolvedView) -> bool:
     Returns
     -------
     bool
-        Whether this speculation exception has the required finite recipe.
+        Whether default per-layer or explicit legacy storage has finite bounds.
+        Product policy still owns ratio normalization and physical admission.
     """
 
     def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -68,6 +69,48 @@ def _sm80_bf16_dflash_admitted(view: ResolvedView) -> bool:
     config = json.loads(view.hisparse_config or "{}", object_pairs_hook=unique_object)
     if not isinstance(config, dict):
         return False
+    if (
+        any(
+            type(value) is not int or value <= 0
+            for value in (
+                view.pp_size,
+                view.tp_size,
+                view.max_running_requests,
+                view.context_length,
+                view.max_total_tokens,
+            )
+        )
+        or view.page_size != 64
+        or view.max_total_tokens % 64
+    ):
+        return False
+    budget = config.get("worker_budget_bytes")
+    if budget is not None and (type(budget) is not int or budget <= 0):
+        return False
+    initial = config.get("initial_device_tokens", view.max_total_tokens)
+    if not (
+        view.speculative_algorithm == "DFLASH"
+        and view.speculative_dflash_implementation == "ours"
+        and view.speculative_num_draft_tokens == 8
+        and view.speculative_dflash_block_size in (None, 8)
+        and view.pp_async_batch_depth == 0
+        and view.disable_overlap_schedule == (view.pp_size > 1)
+        and type(config.get("top_k", 2048)) is int
+        and config.get("top_k", 2048) == 2048
+        and config.get("handoff", "wait") == "wait"
+        and config.get("live_growth", False) is False
+        and config.get("completion_mode", "synchronous") == "synchronous"
+        and type(initial) is int
+        and initial == view.max_total_tokens
+    ):
+        return False
+    storage = config.get("storage_mode", "per-layer")
+    if storage == "per-layer":
+        # Native capacity is fixed; product policy derives its working arena.
+        # A legacy quota cannot redefine the default per-layer geometry.
+        return "shared_pool" not in config
+    if storage != "shared-window":
+        return False
     shared = config.get("shared_pool")
     if not isinstance(shared, dict):
         return False
@@ -78,7 +121,6 @@ def _sm80_bf16_dflash_admitted(view: ResolvedView) -> bool:
         "growth_entries",
         "ceiling_entries",
         "headroom_ratio",
-        "total_budget_bytes",
     }
     if shared.keys() - pool_fields:
         return False
@@ -93,50 +135,17 @@ def _sm80_bf16_dflash_admitted(view: ResolvedView) -> bool:
     )
     if initial_entries != ceiling_entries or growth_entries > ceiling_entries:
         return False
-    if (
-        any(
-            type(value) is not int or value <= 0
-            for value in (
-                view.pp_size,
-                view.max_running_requests,
-                view.context_length,
-                view.max_total_tokens,
-            )
-        )
-        or view.max_total_tokens % 64
-    ):
-        return False
     cohort = view.max_running_requests * (
         (min(view.context_length, 8 * 2048) + 63) // 64 * 64
     )
     if initial_entries < cohort:
         return False
     headroom = shared.get("headroom_ratio")
-    if (
-        isinstance(headroom, bool)
-        or not isinstance(headroom, (int, float))
-        or not math.isfinite(headroom)
-        or headroom < 1.0
-    ):
-        return False
-    explicit_budget = shared.get("total_budget_bytes")
-    if explicit_budget is not None and (
-        type(explicit_budget) is not int or explicit_budget <= 0
-    ):
-        return False
-    return bool(
-        view.speculative_algorithm == "DFLASH"
-        and view.speculative_dflash_implementation == "ours"
-        and view.speculative_num_draft_tokens == 8
-        and view.speculative_dflash_block_size in (None, 8)
-        and view.pp_async_batch_depth == 0
-        and view.disable_overlap_schedule == (view.pp_size > 1)
-        and type(config.get("top_k")) is int
-        and config["top_k"] == 2048
-        and config.get("handoff") == "wait"
-        and config.get("live_growth") is False
-        and type(config.get("initial_device_tokens")) is int
-        and config["initial_device_tokens"] == view.max_total_tokens
+    return (
+        not isinstance(headroom, bool)
+        and isinstance(headroom, (int, float))
+        and math.isfinite(headroom)
+        and headroom >= 1.0
     )
 
 
@@ -171,13 +180,14 @@ def validate_hisparse_dsa_backend(
             or view.enable_prefill_context_parallel
         ):
             raise ValueError(
-                "SM80 HiSparse requires ordinary BF16 tilelang prefill, "
+                "SM80 HiSparse requires BF16 tilelang prefill, "
                 "triton-sm80 decode and paged logits, torch-sm80 ragged logits "
-                "and torch top-k, without speculation or context parallelism."
+                "and torch top-k, with ordinary decoding or admitted fixed-wait "
+                "DFlash speculation, without context parallelism."
             )
         hf_config = view.get_model_config().hf_config
         if hf_config.architectures != ["GlmMoeDsaForCausalLM"]:
-            raise ValueError("SM80 BF16 HiSparse requires ordinary GLM DSA.")
+            raise ValueError("SM80 BF16 HiSparse requires GLM DSA.")
         return
     allowed_backends = _hisparse_allowed_backends(kv_cache_dtype)
     if backend is not None and backend not in allowed_backends:
@@ -224,9 +234,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+    assert server_args.disable_radix_cache, (
+        "Hierarchical sparse attention currently requires --disable-radix-cache."
+    )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

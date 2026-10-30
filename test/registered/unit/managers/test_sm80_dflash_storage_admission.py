@@ -1,11 +1,11 @@
-"""Resident and grouped DFlash admission are explicit distinct native modes."""
+"""Resident, per-layer and legacy grouped DFlash admission remain distinct."""
 
 from __future__ import annotations
 
 import json
 import unittest
 from types import SimpleNamespace
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import torch
@@ -15,8 +15,232 @@ from sglang.srt.layers.attention.dsa.ragged_mqa_logits_backend import (
     DSARaggedMQALogitsBackend,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
 
 class TestSM80DFlashStorageAdmission(unittest.TestCase):
+    @staticmethod
+    def _per_layer_arguments(pp_size: int = 1, tp_size: int = 8) -> SimpleNamespace:
+        """Carry the frozen serving packet's values without creating CUDA state."""
+        return SimpleNamespace(
+            hisparse_config=json.dumps(
+                {
+                    "handoff": "wait",
+                    "live_growth": False,
+                    "top_k": 2048,
+                    "device_buffer_size": 4096,
+                    "host_to_device_ratio": 2,
+                    "swap_in_block_size": 960,
+                }
+            ),
+            speculative_algorithm="DFLASH",
+            speculative_dflash_implementation="ours",
+            speculative_num_draft_tokens=8,
+            speculative_dflash_block_size=8,
+            pp_size=pp_size,
+            tp_size=tp_size,
+            page_size=64,
+            pp_async_batch_depth=0,
+            disable_overlap_schedule=pp_size > 1,
+            max_running_requests=2,
+            context_length=16384,
+            max_total_tokens=32768,
+            kv_cache_dtype="bfloat16",
+            dsa_decode_backend="triton-sm80",
+            dsa_prefill_backend="tilelang",
+            dsa_paged_mqa_logits_backend="triton-sm80",
+            dsa_ragged_mqa_logits_backend="torch-sm80",
+            dsa_topk_backend="torch",
+            attn_cp_size=1,
+            dcp_size=1,
+            enable_dsa_prefill_context_parallel=False,
+            enable_prefill_context_parallel=False,
+            get_model_config=lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+            ),
+        )
+
+    def test_default_per_layer_packet_reaches_actual_native_backend_validation(
+        self,
+    ) -> None:
+        """Admit the real default recipe, independent of legacy shared quotas."""
+        from sglang.srt.arg_groups import hisparse_hook
+        from sglang.srt.arg_groups.overrides import ResolvedView
+
+        with (
+            patch.object(hisparse_hook, "_is_hip", return_value=False),
+            patch("sglang.srt.utils.get_device_capability", return_value=(8, 0)),
+        ):
+            for pp_size, tp_size in ((1, 8), (8, 1)):
+                args = self._per_layer_arguments(pp_size=pp_size, tp_size=tp_size)
+                self.assertEqual(args.tp_size, tp_size)
+                default = json.loads(args.hisparse_config)
+                for extra in (
+                    {},
+                    {"storage_mode": "per-layer"},
+                    {
+                        "storage_mode": "per-layer",
+                        "initial_device_tokens": 32768,
+                        "worker_budget_bytes": 1 << 30,
+                        "ratio_reserve": {"8": 0.5},
+                    },
+                    {"ratio_reserve": {"8": 1.5}},
+                ):
+                    with self.subTest(pp_size=pp_size, tp_size=tp_size, extra=extra):
+                        args.hisparse_config = json.dumps({**default, **extra})
+                        for label in ("prefill", "decode"):
+                            hisparse_hook.validate_hisparse_dsa_backend(
+                                cast("ServerArgs", args),
+                                "dsa_" + label + "_backend",
+                                label,
+                            )
+                        self.assertTrue(
+                            hisparse_hook._sm80_bf16_dflash_admitted(ResolvedView(args))
+                        )
+
+    def test_per_layer_refuses_legacy_quotas_and_invalid_native_recipes(self) -> None:
+        """Keep fixed, synchronous, finite and ordinary-CP restrictions intact."""
+        from sglang.srt.arg_groups import hisparse_hook
+
+        config_changes: tuple[tuple[str, object], ...] = (
+            ("storage_mode", "unknown"),
+            ("storage_mode", "shared-window"),
+            ("completion_mode", "overlapped"),
+            ("shared_pool", {}),
+            ("shared_pool", None),
+            ("handoff", "coordinated"),
+            ("live_growth", True),
+            ("live_growth", 0),
+            ("initial_device_tokens", 16384),
+            ("initial_device_tokens", True),
+            ("top_k", True),
+            ("top_k", 1024),
+            ("worker_budget_bytes", True),
+            ("worker_budget_bytes", 0),
+            ("worker_budget_bytes", -1),
+            ("worker_budget_bytes", 1.5),
+            ("worker_budget_bytes", "1073741824"),
+        )
+        argument_changes = (
+            ("speculative_algorithm", "EAGLE"),
+            ("speculative_dflash_implementation", "native"),
+            ("speculative_num_draft_tokens", 7),
+            ("speculative_dflash_block_size", 4),
+            ("pp_async_batch_depth", 1),
+            ("disable_overlap_schedule", True),
+            ("pp_size", 0),
+            ("tp_size", True),
+            ("max_running_requests", 0),
+            ("context_length", -1),
+            ("max_total_tokens", 0),
+            ("max_total_tokens", 32769),
+            ("page_size", 128),
+            ("attn_cp_size", 2),
+            ("dcp_size", 2),
+            ("enable_dsa_prefill_context_parallel", True),
+            ("enable_prefill_context_parallel", True),
+            ("kv_cache_dtype", "fp8_e4m3"),
+            ("dsa_prefill_backend", "flashmla_sparse"),
+            ("dsa_paged_mqa_logits_backend", "auto"),
+            ("dsa_ragged_mqa_logits_backend", "auto"),
+            ("dsa_topk_backend", "sgl-kernel"),
+        )
+        with (
+            patch.object(hisparse_hook, "_is_hip", return_value=False),
+            patch("sglang.srt.utils.get_device_capability", return_value=(8, 0)),
+        ):
+            for key, value in config_changes:
+                args = self._per_layer_arguments()
+                args.hisparse_config = json.dumps(
+                    {**json.loads(args.hisparse_config), key: value}
+                )
+                with (
+                    self.subTest(config=key, value=value),
+                    self.assertRaises(ValueError),
+                ):
+                    hisparse_hook.validate_hisparse_dsa_backend(
+                        cast("ServerArgs", args), "dsa_decode_backend", "decode"
+                    )
+            for key, value in argument_changes:
+                args = self._per_layer_arguments()
+                setattr(args, key, value)
+                with (
+                    self.subTest(argument=key, value=value),
+                    self.assertRaises(ValueError),
+                ):
+                    hisparse_hook.validate_hisparse_dsa_backend(
+                        cast("ServerArgs", args), "dsa_decode_backend", "decode"
+                    )
+            args = self._per_layer_arguments()
+            legacy = json.loads(args.hisparse_config)
+            legacy.update(
+                storage_mode="shared-window",
+                shared_pool={
+                    "initial_entries": 32768,
+                    "growth_entries": 32768,
+                    "ceiling_entries": 32768,
+                    "headroom_ratio": 1.25,
+                    "total_budget_bytes": 1 << 30,
+                },
+            )
+            args.hisparse_config = json.dumps(legacy)
+            with self.assertRaises(ValueError):
+                hisparse_hook.validate_hisparse_dsa_backend(
+                    cast("ServerArgs", args), "dsa_decode_backend", "decode"
+                )
+
+    def test_actual_runtime_predicates_keep_per_layer_offload_distinct(self) -> None:
+        """Evaluate real downstream predicates with explicit CPU config bags."""
+        from sglang.srt.layers.attention.dsa import sm80_dflash_verify as verify
+
+        args = self._per_layer_arguments()
+        spec = SimpleNamespace(
+            speculative_algorithm=args.speculative_algorithm,
+            speculative_dflash_implementation=args.speculative_dflash_implementation,
+            speculative_num_draft_tokens=args.speculative_num_draft_tokens,
+            speculative_dflash_block_size=args.speculative_dflash_block_size,
+        )
+        kernel = SimpleNamespace(
+            **{
+                name: getattr(args, name)
+                for name in (
+                    "dsa_prefill_backend",
+                    "dsa_decode_backend",
+                    "dsa_paged_mqa_logits_backend",
+                    "dsa_ragged_mqa_logits_backend",
+                    "dsa_topk_backend",
+                )
+            }
+        )
+        memory = SimpleNamespace(enable_hisparse=True)
+        with (
+            patch.object(verify, "get_spec", return_value=spec),
+            patch.object(
+                verify,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=1, attn_dcp_size=1),
+            ),
+            patch.object(
+                verify,
+                "get_model",
+                return_value=SimpleNamespace(kv_cache_dtype="bfloat16"),
+            ),
+            patch.object(
+                verify, "get_exec", return_value=SimpleNamespace(kernel=kernel)
+            ),
+            patch.object(verify, "get_memory", return_value=memory),
+        ):
+            self.assertTrue(verify.sm80_dflash_offload_config_admitted())
+            self.assertFalse(verify.sm80_dflash_verify_config_admitted())
+            self.assertTrue(verify.sm80_dflash_any_config_admitted())
+            memory.enable_hisparse = False
+            self.assertFalse(verify.sm80_dflash_offload_config_admitted())
+            self.assertTrue(verify.sm80_dflash_verify_config_admitted())
+            memory.enable_hisparse = True
+            spec.speculative_algorithm = "EAGLE"
+            self.assertFalse(verify.sm80_dflash_any_config_admitted())
+
     def check(
         self,
         *,
@@ -97,6 +321,7 @@ class TestSM80DFlashStorageAdmission(unittest.TestCase):
         from sglang.srt.arg_groups.overrides import ResolvedView
 
         config = {
+            "storage_mode": "shared-window",
             "top_k": 2048,
             "device_buffer_size": 4096,
             "host_to_device_ratio": 2,
@@ -118,6 +343,8 @@ class TestSM80DFlashStorageAdmission(unittest.TestCase):
             speculative_num_draft_tokens=8,
             speculative_dflash_block_size=8,
             pp_size=1,
+            tp_size=8,
+            page_size=64,
             pp_async_batch_depth=0,
             disable_overlap_schedule=False,
             max_running_requests=2,
@@ -145,7 +372,7 @@ class TestSM80DFlashStorageAdmission(unittest.TestCase):
             self.assertTrue(hisparse_hook._sm80_bf16_dflash_admitted(view))
             for label in ("prefill", "decode"):
                 hisparse_hook.validate_hisparse_dsa_backend(
-                    args, "dsa_" + label + "_backend", label
+                    cast("ServerArgs", args), "dsa_" + label + "_backend", label
                 )
             for key, value in (
                 ("live_growth", True),
@@ -158,19 +385,19 @@ class TestSM80DFlashStorageAdmission(unittest.TestCase):
                 args.hisparse_config = json.dumps(bad)
                 with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                     hisparse_hook.validate_hisparse_dsa_backend(
-                        args, "dsa_decode_backend", "decode"
+                        cast("ServerArgs", args), "dsa_decode_backend", "decode"
                     )
             for raw in ("[]", '{"top_k":2048,"top_k":2048}', "{bad"):
                 args.hisparse_config = raw
                 with self.subTest(raw=raw), self.assertRaises((ValueError, TypeError)):
                     hisparse_hook.validate_hisparse_dsa_backend(
-                        args, "dsa_decode_backend", "decode"
+                        cast("ServerArgs", args), "dsa_decode_backend", "decode"
                     )
             args.hisparse_config = json.dumps(config)
             args.speculative_algorithm = "EAGLE"
             with self.assertRaises(ValueError):
                 hisparse_hook.validate_hisparse_dsa_backend(
-                    args, "dsa_decode_backend", "decode"
+                    cast("ServerArgs", args), "dsa_decode_backend", "decode"
                 )
 
     def test_native_policy_derives_pp8_three_request_cohort(self) -> None:
@@ -184,6 +411,7 @@ class TestSM80DFlashStorageAdmission(unittest.TestCase):
             "headroom_ratio": 1.25,
         }
         config = {
+            "storage_mode": "shared-window",
             "top_k": 2048,
             "handoff": "wait",
             "live_growth": False,
@@ -197,6 +425,8 @@ class TestSM80DFlashStorageAdmission(unittest.TestCase):
             speculative_num_draft_tokens=8,
             speculative_dflash_block_size=8,
             pp_size=8,
+            tp_size=8,
+            page_size=64,
             pp_async_batch_depth=0,
             disable_overlap_schedule=True,
             max_running_requests=3,
