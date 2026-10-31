@@ -345,6 +345,31 @@ def test_build_directory_entries_are_dropped(tmp_path):
     assert [entry.relpath for entry in entries] == [str(outside)]
 
 
+def test_symlinked_build_remains_reusable_after_publication(tmp_path):
+    """Generated sources must be excluded through a symlinked cache root too."""
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    scope = alias / "cache"
+    staging = scope / ".staging-test"
+    generated = _write(staging / "cuda.cu", "// generated")
+    outside = _write(tmp_path / "real.cuh", "// input")
+    spec = _spec(cuda_files=(str(outside),))
+    _write(staging / f"{spec.module_name}.so", "library fixture")
+    library = cache.commit_build(
+        spec, scope=scope, staging=staging, dependencies=[generated, outside]
+    )
+    assert library is not None
+    assert not staging.exists()
+    cache.clear_digest_cache()
+    assert cache.find_prebuilt(scope=scope, module_name=spec.module_name) == library
+    # Retaining the external header dependency still invalidates real changes.
+    outside.write_text("// changed input")
+    cache.clear_digest_cache()
+    assert cache.find_prebuilt(scope=scope, module_name=spec.module_name) is None
+
+
 def test_publish_loses_the_race_gracefully(tmp_path):
     """Two processes building identical content: the loser adopts the winner's leaf."""
     winner = tmp_path / "leaf"
