@@ -368,9 +368,9 @@ def all_gather_inner(
         f"hidden_states.data_ptr()={hex(hidden_states.data_ptr())} must be "
         f"16-byte aligned for 128-bit multimem.st"
     )
-    assert (
-        tp_hidden_dim % world_size == 0
-    ), f"tp_hidden_dim={tp_hidden_dim} must be divisible by world_size={world_size}"
+    assert tp_hidden_dim % world_size == 0, (
+        f"tp_hidden_dim={tp_hidden_dim} must be divisible by world_size={world_size}"
+    )
     local_hidden = tp_hidden_dim // world_size
     assert local_hidden % _NUMEL_PER_THREAD == 0, (
         f"per-rank hidden shard ({local_hidden}) must be a multiple of "
@@ -381,12 +381,12 @@ def all_gather_inner(
         f"state.hidden_dim={state.hidden_dim}"
     )
     total_tokens, in_hidden = hidden_states.shape
-    assert (
-        in_hidden == local_hidden
-    ), f"input hidden ({in_hidden}) != this rank's shard ({local_hidden})"
-    assert (
-        total_tokens <= state.max_token_num
-    ), f"total_tokens={total_tokens} exceeds max_token_num={state.max_token_num}"
+    assert in_hidden == local_hidden, (
+        f"input hidden ({in_hidden}) != this rank's shard ({local_hidden})"
+    )
+    assert total_tokens <= state.max_token_num, (
+        f"total_tokens={total_tokens} exceeds max_token_num={state.max_token_num}"
+    )
 
     hidden_offset = local_hidden * state.rank_in_group
     symm_mem_hdl = state.symm_mem_hdl
@@ -446,7 +446,10 @@ class MultimemAllGatherer:
     entry point for every caller. Owns one symmetric buffer built lazily on the
     first eager call, and uses the kernel only when the input fits its
     dtype/shape/alignment contract. Guards use TP-replicated quantities so all
-    ranks pick the same path. ``skip_entry_sync=True`` drops the entry barrier;
+    ranks pick the same path. Unsupported devices collectively select NCCL
+    before allocating symmetric memory. Initialization failures are fatal:
+    falling back independently can strand another rank inside rendezvous.
+    ``skip_entry_sync=True`` drops the entry barrier;
     only safe when a cross-rank sync sits between consecutive calls."""
 
     _UNINIT = object()
@@ -469,6 +472,24 @@ class MultimemAllGatherer:
             from sglang.srt.runtime_context import get_parallel
 
             tp_group = get_tp_group()
+            if tp_group.world_size <= 1:
+                self._state = None
+                return
+            supported = torch.tensor(
+                [
+                    int(
+                        torch.cuda.is_available()
+                        and torch.cuda.get_device_capability()[0] >= 9
+                    )
+                ],
+                dtype=torch.int32,
+                device="cpu",
+            )
+            dist.all_reduce(supported, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
+            if not supported.item():
+                logger.info("multimem all-gather disabled (unsupported TP device)")
+                self._state = None
+                return
             # Only probe node topology when the deployment can actually span
             # nodes. Check world_size first so a TP=1 gatherer short-circuits
             # before reading the parallel config (which may be unpublished on
@@ -522,27 +543,33 @@ class MultimemAllGatherer:
             return self._UNINIT
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None
-        try:
-            from sglang.srt.distributed import get_tp_group
+        from sglang.srt.distributed import get_tp_group
 
-            tp_group = get_tp_group()
-            if tp_group.world_size <= 1:
-                return None
+        tp_group = get_tp_group()
+        # Warm-up/JIT work before the first gather can finish at different times.
+        # Join every rank before starting the symmetric-memory store timeout.
+        dist.barrier(group=tp_group.cpu_group)
+        try:
             state = create_state(
                 group=tp_group.device_group,
                 rank_in_group=tp_group.rank_in_group,
                 max_tokens=self._max_tokens,
                 hidden_size=x.shape[-1] * tp_group.world_size,
             )
-            if state.symm_mem_hdl.multicast_ptr == 0:
-                # No multicast for this world size / arch; multimem.st would
-                # write nowhere. Fall back to NCCL.
-                logger.warning(
-                    "multimem all-gather disabled (no multicast for world_size=%d)",
-                    tp_group.world_size,
-                )
-                return None
-            return state
         except Exception as e:
-            logger.warning("multimem all-gather disabled (%s)", e)
+            raise RuntimeError(
+                "multimem all-gather collective initialization failed; "
+                "abort the TP group instead of falling back on individual ranks"
+            ) from e
+        available = torch.tensor(
+            [int(state.symm_mem_hdl.multicast_ptr != 0)],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        dist.all_reduce(available, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
+        if not available.item():
+            logger.warning(
+                "multimem all-gather disabled (no multicast on every TP rank)"
+            )
             return None
+        return state
