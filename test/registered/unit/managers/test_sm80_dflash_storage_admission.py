@@ -561,6 +561,11 @@ class TestSM80DFlashStorageAdmission(unittest.TestCase):
         with (
             patch.object(verify, "sm80_dflash_any_config_admitted", return_value=True),
             patch.object(verify, "get_schedule", return_value=schedule),
+            patch.object(
+                verify,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="DFLASH"),
+            ),
         ):
             self.assertEqual(
                 verify.require_sm80_dflash_verify(batch, 24).query_rows, 24
@@ -589,6 +594,116 @@ class TestSM80DFlashStorageAdmission(unittest.TestCase):
                 with self.assertRaises(NotImplementedError):
                     verify.require_sm80_dflash_verify(batch, 24)
                 restore()
+
+    def test_native_canonical_call_admits_only_product_b1_q2(self) -> None:
+        from sglang.srt.layers.attention.dsa import sm80_dflash_verify as verify
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        spec = DFlashVerifyInput(
+            draft_token=torch.zeros(2, dtype=torch.int64),
+            positions=torch.arange(2),
+            draft_token_num=2,
+        )
+        batch = SimpleNamespace(
+            spec_info=spec,
+            batch_size=1,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_algorithm=SimpleNamespace(name="DUALDECODER"),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            req_pool_indices=torch.zeros(1, dtype=torch.int64),
+            attn_cp_metadata=None,
+        )
+        with (
+            patch.object(verify, "sm80_dflash_any_config_admitted", return_value=True),
+            patch.object(
+                verify,
+                "get_schedule",
+                return_value=SimpleNamespace(max_running_requests=1),
+            ),
+            patch.object(
+                verify,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="DUALDECODER"),
+            ),
+        ):
+            layout = verify.require_sm80_dflash_verify(cast(ForwardBatch, batch), 2)
+            self.assertEqual(
+                (layout.batch_size, layout.tokens_per_request, layout.query_rows),
+                (1, 2, 2),
+            )
+            for owner, name, wrong in (
+                (spec, "draft_token_num", 8),
+                (spec, "custom_mask", torch.ones(1)),
+                (batch, "spec_algorithm", SpeculativeAlgorithm.DFLASH),
+                (batch, "batch_size", 2),
+                (batch, "attn_cp_metadata", object()),
+            ):
+                old = getattr(owner, name)
+                setattr(owner, name, wrong)
+                with self.subTest(name=name), self.assertRaises(NotImplementedError):
+                    verify.require_sm80_dflash_verify(cast(ForwardBatch, batch), 2)
+                setattr(owner, name, old)
+            with self.assertRaises(NotImplementedError):
+                verify.require_sm80_dflash_verify(cast(ForwardBatch, batch), 1)
+
+    def test_canonical_logits_use_both_causal_rows_and_reject_other_shapes(
+        self,
+    ) -> None:
+        from sglang.kernels.ops.attention.dsa import paged_mqa_logits as logits
+        from sglang.kernels.ops.attention.dsa import (
+            triton_paged_mqa_logits_sm80 as leaf,
+        )
+
+        q = torch.zeros(4, 8, 128)
+        weights = torch.zeros(4, 8)
+        lengths = torch.tensor([65, 66], dtype=torch.int32)
+        pages = torch.zeros(2, 2, dtype=torch.int32)
+        expected = torch.ones(2, 128)
+        with patch.object(
+            leaf, "triton_paged_mqa_logits", return_value=expected
+        ) as compute:
+            result = logits.sm80_paged_mqa_logits(
+                q,
+                torch.empty(0),
+                weights,
+                lengths,
+                pages,
+                128,
+                q_offset=2,
+                B=1,
+                next_n=2,
+                is_decode=False,
+                verify_layout=logits.SM80DFlashVerifyLayout(1, 2),
+            )
+            self.assertIs(result, expected)
+            self.assertEqual(compute.call_args.args[0].shape, (2, 8, 128))
+            self.assertEqual(compute.call_args.args[2].shape, (2, 8))
+            self.assertIs(compute.call_args.args[3], lengths)
+            self.assertIs(compute.call_args.args[4], pages)
+            for layout in (
+                logits.SM80DFlashVerifyLayout(2, 2),
+                logits.SM80DFlashVerifyLayout(1, 4),
+                logits.SM80DFlashVerifyLayout(1, True),
+            ):
+                with self.subTest(layout=layout), self.assertRaises(ValueError):
+                    logits.sm80_paged_mqa_logits(
+                        q,
+                        torch.empty(0),
+                        weights,
+                        lengths,
+                        pages,
+                        128,
+                        q_offset=2,
+                        B=1,
+                        next_n=2,
+                        is_decode=False,
+                        verify_layout=layout,
+                    )
 
     def test_native_three_request_logits_delegates_exact_twenty_four_rows(self) -> None:
         from sglang.kernels.ops.attention.dsa import paged_mqa_logits as logits

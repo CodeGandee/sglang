@@ -111,27 +111,38 @@ def require_sm80_dflash_verify(
 
     spec = forward_batch.spec_info
     batch_size = forward_batch.batch_size
+    canonical = get_spec().speculative_algorithm == "DUALDECODER"
+    tokens_per_request = 2 if canonical else 8
+    algorithm_matches = (
+        forward_batch.spec_algorithm.name == "DUALDECODER"
+        if canonical
+        else forward_batch.spec_algorithm == SpeculativeAlgorithm.DFLASH
+    )
     if (
         not sm80_dflash_any_config_admitted()
         or forward_batch.forward_mode != ForwardMode.TARGET_VERIFY
-        or forward_batch.spec_algorithm != SpeculativeAlgorithm.DFLASH
+        or not algorithm_matches
         or not isinstance(spec, DFlashVerifyInput)
         or spec.spec_input_type != SpecInputType.DFLASH_VERIFY
-        or spec.draft_token_num != 8
+        or spec.draft_token_num != tokens_per_request
         or spec.topk != 1
         or spec.custom_mask is not None
         or spec.ragged_verify_layout is not None
         or forward_batch.attn_cp_metadata is not None
         or type(batch_size) is not int
         or batch_size < 1
+        or canonical
+        and batch_size != 1
         or not capture_mode.is_capture_mode
         and batch_size > get_schedule().max_running_requests
         or forward_batch.seq_lens.shape != (batch_size,)
         or forward_batch.req_pool_indices.shape != (batch_size,)
         or query_rows is not None
-        and query_rows < batch_size * 8
+        and query_rows < batch_size * tokens_per_request
     ):
         raise NotImplementedError(
-            "Resident SM80 DFlash admission requires linear request-major Bx8 target verification without CP"
+            "SM80 admission requires linear DFlash Bx8 or product DualDecoder B1x2 target verification without CP"
         )
-    return SM80DFlashVerifyLayout(batch_size=batch_size)
+    return SM80DFlashVerifyLayout(
+        batch_size=batch_size, tokens_per_request=tokens_per_request
+    )

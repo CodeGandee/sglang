@@ -331,6 +331,50 @@ class TestSM80PagedMQALogits(CustomTestCase):
             witness.assert_called_once()
         self.assertTrue(torch.equal(output.cpu(), _tensor_reference(cpu).float()))
 
+    def test_linear_q2_q8_wrapper_graph_replays_changed_inputs(self) -> None:
+        from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
+            SM80DFlashVerifyLayout,
+            sm80_paged_mqa_logits,
+        )
+
+        for tokens in (2, 8):
+            cpu = _fixture(list(range(65, 65 + tokens)), 8)
+            device = cpu.on("cuda")
+
+            def run() -> torch.Tensor:
+                return sm80_paged_mqa_logits(
+                    device.q,
+                    device.cache,
+                    device.weights,
+                    device.lengths,
+                    device.table,
+                    device.width,
+                    q_offset=tokens,
+                    B=1,
+                    next_n=tokens,
+                    is_decode=False,
+                    verify_layout=SM80DFlashVerifyLayout(1, tokens),
+                )
+
+            with self.subTest(tokens=tokens):
+                self.assertTrue(
+                    torch.equal(run().cpu(), _tensor_reference(cpu).float())
+                )
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    run()
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    actual = run()
+                cpu.weights.mul_(2)
+                device.weights.copy_(cpu.weights)
+                graph.replay()
+                self.assertTrue(
+                    torch.equal(actual.cpu(), _tensor_reference(cpu).float())
+                )
+
     def test_pages_lengths_head_tiles_and_isolation(self) -> None:
         for length in (1, 63, 64, 65, 2047, 2048, 2049, 4095, 4096, 4097, 16384):
             for heads in (1, 8, 16, 32) if length == 65 else (4,):

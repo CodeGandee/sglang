@@ -16,20 +16,23 @@ class SM80DFlashVerifyLayout:
     ----------
     batch_size : int
         Positive number of requests in the current native verification call.
+    tokens_per_request : int
+        Eight for DFlash, or two for the admitted B1 product DualDecoder call.
     """
 
     batch_size: int
+    tokens_per_request: int = 8
 
     @property
     def query_rows(self) -> int:
-        """Return the actual rows in the linear block-eight layout.
+        """Return the actual rows in the admitted linear layout.
 
         Returns
         -------
         int
             Unpadded query count for the current call.
         """
-        return self.batch_size * 8
+        return self.batch_size * self.tokens_per_request
 
 
 def sm80_paged_mqa_logits(
@@ -60,7 +63,7 @@ def sm80_paged_mqa_logits(
     B : int
         Number of request rows.
     next_n : int
-        Queries per request; one for decode or eight for admitted verification.
+        Queries per request; one for decode, eight for DFlash or two for DDv2.
     is_decode : bool
         Whether the caller is in decode/idle mode.
     indices : torch.Tensor, optional
@@ -79,15 +82,19 @@ def sm80_paged_mqa_logits(
             is_decode
             or type(verify_layout.batch_size) is not int
             or verify_layout.batch_size < 1
+            or type(verify_layout.tokens_per_request) is not int
+            or verify_layout.tokens_per_request not in (2, 8)
+            or verify_layout.tokens_per_request == 2
+            and B != 1
             or B != verify_layout.batch_size
-            or next_n != 8
+            or next_n != verify_layout.tokens_per_request
             or q_offset != verify_layout.query_rows
             or seq_lens.shape != (q_offset,)
             or block_tables.ndim != 2
             or block_tables.shape[0] != q_offset
         ):
             raise ValueError(
-                "SM80 verification requires matching request-major Bx8 rows"
+                "SM80 verification requires matching DFlash Bx8 or product B1x2 rows"
             )
     elif not is_decode or q_offset != B or (B > 0 and next_n != 1):
         raise NotImplementedError(
