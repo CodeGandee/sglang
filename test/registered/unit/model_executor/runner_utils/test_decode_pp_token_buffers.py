@@ -598,6 +598,11 @@ class TestDecodePPTokenBuffers(unittest.TestCase):
                     ),
                     patch.object(
                         verify,
+                        "get_spec",
+                        return_value=SimpleNamespace(speculative_algorithm="DFLASH"),
+                    ),
+                    patch.object(
+                        verify,
                         "get_schedule",
                         return_value=SimpleNamespace(max_running_requests=raw_bs),
                     ),
