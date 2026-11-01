@@ -488,6 +488,11 @@ class TestDecodePPTokenBuffers(unittest.TestCase):
                         verify, "sm80_dflash_any_config_admitted", return_value=True
                     ),
                     patch.object(
+                        verify,
+                        "get_spec",
+                        return_value=SimpleNamespace(speculative_algorithm="DFLASH"),
+                    ),
+                    patch.object(
                         torch.cuda, "get_device_capability", return_value=(8, 0)
                     ),
                 ):
