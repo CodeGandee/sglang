@@ -285,6 +285,7 @@ def _progress_worker(
                     self.grammar_manager = SimpleNamespace(
                         abort_requests=lambda req: None
                     )
+                    self.model_worker = SimpleNamespace()
                     self.tree_cache = SimpleNamespace(
                         cache_finished_req=pending.release_cached
                     )
