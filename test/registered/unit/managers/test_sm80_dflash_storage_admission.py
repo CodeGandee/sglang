@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import torch
-
 from sglang.kernels.ops.attention.dsa import sparse_mla_decode_sm80 as mla
 from sglang.srt.layers.attention.dsa.ragged_mqa_logits_backend import (
     DSARaggedMQALogitsBackend,
@@ -20,6 +19,40 @@ if TYPE_CHECKING:
 
 
 class TestSM80DFlashStorageAdmission(unittest.TestCase):
+    def test_canonical_q2_admission_requires_the_complete_product_recipe(self) -> None:
+        from sglang.srt.arg_groups import hisparse_hook
+        from sglang.srt.arg_groups.overrides import ResolvedView
+
+        args = self._per_layer_arguments()
+        args.speculative_algorithm = "DUALDECODER"
+        args.speculative_num_draft_tokens = 2
+        args.max_running_requests = 1
+        args.disable_cuda_graph = False
+        with (
+            patch.object(hisparse_hook, "_is_hip", return_value=False),
+            patch("sglang.srt.utils.get_device_capability", return_value=(8, 0)),
+        ):
+            self.assertTrue(
+                hisparse_hook._sm80_bf16_dflash_admitted(ResolvedView(args))
+            )
+            hisparse_hook.validate_hisparse_dsa_backend(
+                cast("ServerArgs", args), "dsa_decode_backend", "decode"
+            )
+            for field, value in (
+                ("tp_size", 4),
+                ("pp_size", 2),
+                ("max_running_requests", 2),
+                ("speculative_num_draft_tokens", 8),
+                ("disable_cuda_graph", True),
+            ):
+                original = getattr(args, field)
+                setattr(args, field, value)
+                with self.subTest(field=field):
+                    self.assertFalse(
+                        hisparse_hook._sm80_bf16_dflash_admitted(ResolvedView(args))
+                    )
+                setattr(args, field, original)
+
     @staticmethod
     def _per_layer_arguments(pp_size: int = 1, tp_size: int = 8) -> SimpleNamespace:
         """Carry the frozen serving packet's values without creating CUDA state."""
@@ -240,6 +273,57 @@ class TestSM80DFlashStorageAdmission(unittest.TestCase):
             memory.enable_hisparse = True
             spec.speculative_algorithm = "EAGLE"
             self.assertFalse(verify.sm80_dflash_any_config_admitted())
+
+    def test_canonical_runtime_is_product_only_q2_tp8(self) -> None:
+        from sglang.srt.layers.attention.dsa import sm80_dflash_verify as verify
+
+        spec = SimpleNamespace(
+            speculative_algorithm="DUALDECODER", speculative_num_draft_tokens=2
+        )
+        parallel = SimpleNamespace(
+            tp_size=8, pp_size=1, attn_cp_size=1, attn_dcp_size=1
+        )
+        memory = SimpleNamespace(enable_hisparse=True)
+        kernel = SimpleNamespace(
+            dsa_prefill_backend="tilelang",
+            dsa_decode_backend="triton-sm80",
+            dsa_paged_mqa_logits_backend="triton-sm80",
+            dsa_ragged_mqa_logits_backend="torch-sm80",
+            dsa_topk_backend="torch",
+        )
+        with (
+            patch.object(verify, "get_spec", return_value=spec),
+            patch.object(verify, "get_parallel", return_value=parallel),
+            patch.object(verify, "get_memory", return_value=memory),
+            patch.object(
+                verify,
+                "get_model",
+                return_value=SimpleNamespace(kv_cache_dtype="bfloat16"),
+            ),
+            patch.object(
+                verify, "get_exec", return_value=SimpleNamespace(kernel=kernel)
+            ),
+            patch.object(
+                verify,
+                "get_schedule",
+                return_value=SimpleNamespace(max_running_requests=1),
+            ),
+        ):
+            self.assertTrue(verify.sm80_dflash_offload_config_admitted())
+            self.assertFalse(verify.sm80_dflash_verify_config_admitted())
+            memory.enable_hisparse = False
+            self.assertFalse(verify.sm80_dflash_any_config_admitted())
+            memory.enable_hisparse = True
+            for owner, field, value in (
+                (spec, "speculative_num_draft_tokens", 8),
+                (parallel, "tp_size", 4),
+                (parallel, "pp_size", 2),
+            ):
+                original = getattr(owner, field)
+                setattr(owner, field, value)
+                with self.subTest(field=field):
+                    self.assertFalse(verify.sm80_dflash_any_config_admitted())
+                setattr(owner, field, original)
 
     def check(
         self,

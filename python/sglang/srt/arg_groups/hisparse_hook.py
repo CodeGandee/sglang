@@ -44,7 +44,7 @@ def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
 
 
 def _sm80_bf16_dflash_admitted(view: ResolvedView) -> bool:
-    """Admit the resolved fixed-wait BF16 DFlash storage composition.
+    """Admit resolved fixed-wait BF16 linear speculative storage.
 
     Parameters
     ----------
@@ -88,11 +88,28 @@ def _sm80_bf16_dflash_admitted(view: ResolvedView) -> bool:
     if budget is not None and (type(budget) is not int or budget <= 0):
         return False
     initial = config.get("initial_device_tokens", view.max_total_tokens)
+    canonical = view.speculative_algorithm == "DUALDECODER"
+    if canonical and not (
+        view.tp_size == 8
+        and view.pp_size == 1
+        and view.max_running_requests == 1
+        and view.speculative_num_draft_tokens == 2
+        and not view.disable_cuda_graph
+        and config.get("storage_mode", "per-layer") == "per-layer"
+        and type(config.get("device_buffer_size", 4096)) is int
+        and config.get("device_buffer_size", 4096) == 4096
+    ):
+        return False
     if not (
-        view.speculative_algorithm == "DFLASH"
-        and view.speculative_dflash_implementation == "ours"
-        and view.speculative_num_draft_tokens == 8
-        and view.speculative_dflash_block_size in (None, 8)
+        (
+            canonical
+            or (
+                view.speculative_algorithm == "DFLASH"
+                and view.speculative_dflash_implementation == "ours"
+                and view.speculative_num_draft_tokens == 8
+                and view.speculative_dflash_block_size in (None, 8)
+            )
+        )
         and view.pp_async_batch_depth == 0
         and view.disable_overlap_schedule == (view.pp_size > 1)
         and type(config.get("top_k", 2048)) is int
@@ -183,7 +200,7 @@ def validate_hisparse_dsa_backend(
                 "SM80 HiSparse requires BF16 tilelang prefill, "
                 "triton-sm80 decode and paged logits, torch-sm80 ragged logits "
                 "and torch top-k, with ordinary decoding or admitted fixed-wait "
-                "DFlash speculation, without context parallelism."
+                "linear DFlash-family speculation, without context parallelism."
             )
         hf_config = view.get_model_config().hf_config
         if hf_config.architectures != ["GlmMoeDsaForCausalLM"]:

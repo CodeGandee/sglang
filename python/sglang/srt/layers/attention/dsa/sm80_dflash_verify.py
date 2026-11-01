@@ -21,23 +21,34 @@ if TYPE_CHECKING:
 
 
 def _sm80_dflash_common_recipe() -> bool:
-    """Identify the common BF16 recipe for resident and grouped target storage.
+    """Identify the BF16 recipe for supported linear speculative consumers.
 
     Returns
     -------
     bool
-        Whether resolved native configuration matches DFlash/ours block eight,
-        the BF16 TileLang/SM80/Torch recipe, and execution without CP.
-        Separate storage predicates establish resident or grouped ownership.
+        Whether configuration matches DFlash/ours Q8 or product DualDecoder Q2,
+        the BF16 TileLang/SM80/Torch recipe, and execution without CP. Separate
+        storage predicates establish resident or product-owned execution.
     """
     spec = get_spec()
     parallel = get_parallel()
     kernel = get_exec().kernel
-    return bool(
+    canonical = spec.speculative_algorithm == "DUALDECODER"
+    linear_recipe = (
+        canonical
+        and spec.speculative_num_draft_tokens == 2
+        and parallel.tp_size == 8
+        and parallel.pp_size == 1
+        and get_schedule().max_running_requests == 1
+        and get_memory().enable_hisparse
+    ) or (
         spec.speculative_algorithm == "DFLASH"
         and spec.speculative_dflash_implementation == "ours"
         and spec.speculative_num_draft_tokens == 8
         and spec.speculative_dflash_block_size in (None, 8)
+    )
+    return bool(
+        linear_recipe
         and parallel.attn_cp_size == 1
         and parallel.attn_dcp_size == 1
         and get_model().kv_cache_dtype == "bfloat16"
@@ -51,7 +62,11 @@ def _sm80_dflash_common_recipe() -> bool:
 
 def sm80_dflash_verify_config_admitted() -> bool:
     """Return whether the resolved common recipe uses resident target storage."""
-    return _sm80_dflash_common_recipe() and not get_memory().enable_hisparse
+    return (
+        get_spec().speculative_algorithm == "DFLASH"
+        and _sm80_dflash_common_recipe()
+        and not get_memory().enable_hisparse
+    )
 
 
 def sm80_dflash_offload_config_admitted() -> bool:
@@ -61,6 +76,8 @@ def sm80_dflash_offload_config_admitted() -> bool:
     -----
     Native HiSparse admission and product policy validate fixed-wait bounds.
     The attention call separately verifies the genuine target transaction.
+    Canonical DualDecoder Q2 is admitted only through its product owner; it
+    does not acquire the resident DFlash Q8 execution path.
     """
     return _sm80_dflash_common_recipe() and get_memory().enable_hisparse
 
