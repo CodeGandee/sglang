@@ -29,6 +29,7 @@ import zmq
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -159,6 +160,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             [
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
+                (AbortReq, self.handle_abort_req),
                 (FreezeGCReq, self.handle_freeze_gc_req),
                 (ConfigureLoggingReq, self.handle_configure_logging_req),
             ]
@@ -208,6 +210,22 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOutput):
         # If it is embedding model, no detokenization is needed.
+        return recv_obj
+
+    def handle_abort_req(self, recv_obj: AbortReq) -> AbortReq:
+        """Retire incremental text before acknowledging a staged cancellation.
+
+        Parameters
+        ----------
+        recv_obj : AbortReq
+            Scheduler acknowledgement naming one retired request.
+
+        Returns
+        -------
+        AbortReq
+            Original acknowledgement, retaining its frontend route.
+        """
+        self.decode_status.pop(recv_obj.rid, None)
         return recv_obj
 
     @staticmethod

@@ -4612,7 +4612,9 @@ class Scheduler(
                 # either handoff policy. Mark retained batch history terminal
                 # only after its transfer, storage and native KV are released.
                 req.finished_reason = FINISH_ABORT()
-                self.ipc_channels.send_to_tokenizer.send_output(
+                # Prefill may already have streamed text. Retire detokenizer
+                # state on the output FIFO before the frontend can reuse RID.
+                self.ipc_channels.send_to_detokenizer.send_output(
                     AbortReq(rid=req.rid), req
                 )
                 aborted_staged_req_ids.add(id(req))

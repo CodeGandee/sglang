@@ -9,11 +9,19 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.managers.detokenizer_manager import (  # noqa: E402
+    DetokenizerManager,
+    LimitedCapacityDict,
+)
 from sglang.srt.managers.hisparse_coordinator import (  # noqa: E402
     HiSparseAct,
     HiSparseCoordinator,
 )
-from sglang.srt.managers.io_struct import AbortReq, ShutdownReq  # noqa: E402
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    AbortReq,
+    BatchTokenIDOutput,
+    ShutdownReq,
+)
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     FINISH_LENGTH,
     Req,
@@ -21,8 +29,38 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.scheduler_components.output_streamer import (  # noqa: E402
+    _GenerationStreamAccumulator,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+class _CharacterTokenizer:
+    is_fast = True
+
+    def batch_decode(self, rows: list[list[int]], **_kwargs: bool) -> list[str]:
+        return ["".join(chr(token) for token in row) for row in rows]
+
+
+def _token_payload(req: Req) -> BatchTokenIDOutput:
+    accumulator = _GenerationStreamAccumulator(
+        return_logprob=False,
+        return_hidden_states=False,
+        return_routed_experts=False,
+        return_indexer_topk=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        disaggregation_mode=DisaggregationMode.NULL,
+        default_stream_interval=1,
+        default_force_stream_interval=1,
+        get_cached_tokens_details=lambda _req: None,
+    )
+    accumulator.accept(req=req)
+    payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+    assert payload is not None
+    return payload
 
 
 def _scheduler_for_abort(staged_req: object, *, duplicate_in_last_batch: bool):
@@ -58,6 +96,73 @@ def _scheduler_for_admission(*, hisparse: bool, staged_reqs: tuple[object, ...])
 
 
 class TestSchedulerHiSparseAbort(unittest.TestCase):
+    def test_staged_abort_retires_text_before_same_rid_reuse(self) -> None:
+        """A staged abort must clear incremental text before frontend reuse."""
+        detokenizer = DetokenizerManager.__new__(DetokenizerManager)
+        detokenizer.decode_status = LimitedCapacityDict(capacity=8)
+        detokenizer.vocab_size = 256
+        detokenizer.tokenizer = _CharacterTokenizer()
+        detokenizer.disable_tokenizer_batch_decode = False
+        detokenizer.is_tool_call_parser_gpt_oss = False
+        detokenizer.init_request_dispatcher()
+
+        def request(rid: str) -> Req:
+            return Req(
+                rid=rid,
+                origin_input_text="Answer:",
+                origin_input_ids=list(map(ord, "Answer:")),
+                sampling_params=SamplingParams(),
+                stream=True,
+                http_worker_ipc="ipc:///tokenizer-worker",
+            )
+
+        staged = request("reused")
+        staged.output_ids = [ord("O")]
+        first = detokenizer._request_dispatcher(_token_payload(staged))
+        self.assertEqual(first.output_strs, ["O"])
+        self.assertIn(staged.rid, detokenizer.decode_status)
+        unrelated = request("other")
+        unrelated.output_ids = [ord("U")]
+        detokenizer._request_dispatcher(_token_payload(unrelated))
+
+        scheduler = _scheduler_for_abort(staged, duplicate_in_last_batch=True)
+        acknowledgements: list[AbortReq] = []
+
+        def through_detokenizer(message: AbortReq, _request: Req) -> None:
+            acknowledgement = detokenizer._request_dispatcher(message)
+            self.assertIs(acknowledgement, message)
+            self.assertNotIn(staged.rid, detokenizer.decode_status)
+            acknowledgements.append(acknowledgement)
+
+        scheduler.ipc_channels.send_to_detokenizer.send_output.side_effect = (
+            through_detokenizer
+        )
+        with patch("sglang.srt.managers.scheduler.release_kv_cache"):
+            scheduler.abort_request(AbortReq(rid=staged.rid, exact_match=True))
+        self.assertEqual(len(acknowledgements), 1)
+        self.assertEqual(acknowledgements[0].rid, staged.rid)
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        self.assertIn(unrelated.rid, detokenizer.decode_status)
+
+        # A repeated acknowledgement has no state to retire and must not clear
+        # the unrelated request or mutate the message's frontend route.
+        acknowledgement = acknowledgements[0]
+        acknowledgement.http_worker_ipc = staged.http_worker_ipc
+        self.assertIs(detokenizer._request_dispatcher(acknowledgement), acknowledgement)
+        self.assertEqual(acknowledgement.http_worker_ipc, staged.http_worker_ipc)
+        self.assertIn(unrelated.rid, detokenizer.decode_status)
+
+        reused = request(staged.rid)
+        reused.output_ids = [ord("N")]
+        first_reused = detokenizer._request_dispatcher(_token_payload(reused))
+        self.assertEqual(first_reused.output_strs, ["N"])
+        reused.output_ids.append(ord("W"))
+        reused.finished_reason = FINISH_LENGTH(2)
+        last_reused = detokenizer._request_dispatcher(_token_payload(reused))
+        self.assertEqual(last_reused.output_strs, ["W"])
+        self.assertNotIn(reused.rid, detokenizer.decode_status)
+        self.assertIn(unrelated.rid, detokenizer.decode_status)
+
     def test_coordinated_prefix_exact_and_all_abort_pending_owners_once(self):
         for selection, expected in (
             ("prefix", {"request", "request-child"}),
@@ -101,7 +206,7 @@ class TestSchedulerHiSparseAbort(unittest.TestCase):
                         ("retire-storage", req.rid)
                     )
                 )
-                owner.ipc_channels.send_to_tokenizer.send_output.side_effect = (
+                owner.ipc_channels.send_to_detokenizer.send_output.side_effect = (
                     lambda abort, req, recorded=events: recorded.append(
                         ("terminal", req.rid)
                     )
@@ -139,7 +244,7 @@ class TestSchedulerHiSparseAbort(unittest.TestCase):
                 self.assertEqual(
                     [
                         call.args[0].rid
-                        for call in owner.ipc_channels.send_to_tokenizer.send_output.call_args_list
+                        for call in owner.ipc_channels.send_to_detokenizer.send_output.call_args_list
                     ],
                     [req.rid for req, _ in requests if req.rid in expected],
                 )
@@ -154,7 +259,7 @@ class TestSchedulerHiSparseAbort(unittest.TestCase):
         scheduler.hisparse_coordinator.retract_req.side_effect = lambda _req: (
             order.append("retract")
         )
-        scheduler.ipc_channels.send_to_tokenizer.send_output.side_effect = (
+        scheduler.ipc_channels.send_to_detokenizer.send_output.side_effect = (
             lambda *_args: order.append("notify")
         )
 
@@ -182,7 +287,7 @@ class TestSchedulerHiSparseAbort(unittest.TestCase):
         release.assert_called_once()
         self.assertIsNone(req.to_finish)
         self.assertEqual(
-            scheduler.ipc_channels.send_to_tokenizer.send_output.call_count,
+            scheduler.ipc_channels.send_to_detokenizer.send_output.call_count,
             1,
         )
 
@@ -219,7 +324,9 @@ class TestSchedulerHiSparseAbort(unittest.TestCase):
         self.assertEqual(calls, [("invalidate", target), ("retire-storage", target)])
         release.assert_called_once()
         self.assertIsNone(target.to_finish)
-        self.assertEqual(owner.ipc_channels.send_to_tokenizer.send_output.call_count, 1)
+        self.assertEqual(
+            owner.ipc_channels.send_to_detokenizer.send_output.call_count, 1
+        )
 
     def test_queued_exact_abort_leaves_staging_owner_untouched(self):
         staged = MagicMock(rid="active")

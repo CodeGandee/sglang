@@ -291,7 +291,10 @@ def _progress_worker(
                     self.ipc_channels = SimpleNamespace(
                         send_to_tokenizer=SimpleNamespace(
                             send_output=lambda message, req: pending.aborted.append(req)
-                        )
+                        ),
+                        send_to_detokenizer=SimpleNamespace(
+                            send_output=lambda message, req: pending.aborted.append(req)
+                        ),
                     )
 
             def requests(self) -> list[object]:
